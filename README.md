@@ -87,6 +87,6 @@ export COINGECKO_PRO_API="your-api-key"
 export HELIUS_API="your-api-key"
 
 📌 Notes
-- token_monitor.py should run continuously in the background to keep overlap data updated.
-- bot.py depends on the overlap results and user data, so both services complement each other.
-- The system is designed for 24/7 monitoring and alerting.
+- **token_monitor.py should run continuously in the background to keep overlap data updated.**
+- **bot.py depends on the overlap results and user data, so both services complement each other.**
+- **The system is designed for 24/7 monitoring and alerting.**
