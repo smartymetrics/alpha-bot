@@ -35,8 +35,6 @@ from telegram.ext import (
     Defaults,
 )
 
-# Add this to the top of your unified_bot_corrected.py after the imports
-debug = False
 import platform
 
 # Detect if running on Railway
@@ -99,7 +97,12 @@ if not BOT_TOKEN:
 # ----------------------
 # Logging
 # ----------------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+# logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+# ----------------------
+# Disable ALL logging
+# ----------------------
+logging.disable(logging.CRITICAL)  # Disable all logging
+logging.getLogger().setLevel(logging.CRITICAL + 1)  # Set to higher than CRITICAL
 
 # ----------------------
 # Thread-safe joblib file access
@@ -1142,4 +1145,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    debug = False
