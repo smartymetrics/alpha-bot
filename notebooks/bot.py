@@ -36,7 +36,7 @@ from telegram.ext import (
 )
 
 # Add this to the top of your unified_bot_corrected.py after the imports
-
+debug = False
 import platform
 
 # Detect if running on Railway
@@ -1142,3 +1142,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    debug = False
