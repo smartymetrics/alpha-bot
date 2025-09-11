@@ -548,7 +548,7 @@ async def send_alert_to_subscribers(
     first_alert_at: Optional[str] = None
 ):
     """
-    Send an alert to every active user who subscribes to this grade.
+    Send an alert to every active, subscribed user who subscribes to this grade.
     """
     active_users = user_manager.get_active_users()
     if not active_users:
@@ -565,6 +565,12 @@ async def send_alert_to_subscribers(
     )
 
     for chat_id, prefs in active_users.items():
+        # 🔍 1. Skip if subscription is invalid
+        if not is_subscribed(chat_id):
+            logging.debug(f"Skipping alert for {chat_id}: not subscribed or expired")
+            continue
+
+        # 🔍 2. Check if user wants this grade
         subscribed_grades = prefs.get("grades", ALL_GRADES.copy())
         if isinstance(subscribed_grades, (list, tuple)):
             if grade not in subscribed_grades:
@@ -573,6 +579,7 @@ async def send_alert_to_subscribers(
             if grade not in ALL_GRADES:
                 continue
 
+        # ✅ 3. Send the alert
         try:
             await app.bot.send_message(
                 chat_id=int(chat_id),
@@ -584,8 +591,9 @@ async def send_alert_to_subscribers(
         except Exception as e:
             logging.warning("Failed to send alert to %s: %s", chat_id, e)
 
-        # small delay to avoid hitting rate limits
+        # 🕒 Small delay to avoid rate limits
         await asyncio.sleep(0.1)
+
 
 async def monthly_expiry_notifier(app: Application):
     """Notify expired users once per month."""
@@ -658,6 +666,15 @@ def is_subscribed(chat_id: str) -> bool:
 async def background_loop(app: Application):
     logging.info("Background alert loop started...")
     alerts_state = safe_load(ALERTS_STATE_FILE, {})
+    # 🔥 Try downloading the latest alerts_state from Supabase on restart
+    if USE_SUPABASE and download_file:
+        try:
+            download_file(str(ALERTS_STATE_FILE), os.path.basename(ALERTS_STATE_FILE), bucket=BUCKET_NAME)
+            alerts_state = safe_load(ALERTS_STATE_FILE, alerts_state)
+            logging.info("✅ Downloaded latest alerts_state from Supabase")
+        except Exception as e:
+            logging.warning("⚠️ Could not fetch alerts_state from Supabase: %s", e)
+
     first_run = True
     while True:
         try:
@@ -688,6 +705,17 @@ async def background_loop(app: Application):
                             "initial_fdv": fdv,
                             "first_alert_at": datetime.utcnow().isoformat() + "Z"
                         }
+
+                        # Persist immediately after capturing initial state for new tokens
+                        safe_save(ALERTS_STATE_FILE, alerts_state)
+                        if USE_SUPABASE and upload_file:
+                            try:
+                                upload_file(str(ALERTS_STATE_FILE), bucket=BUCKET_NAME)
+                                logging.info("✅ Uploaded alerts_state incrementally after new alert")
+                            except Exception as e:
+                                logging.warning("⚠️ Failed incremental upload of alerts_state: %s", e)
+
+
                         logging.info("Captured initial market data for %s: MC=%s, FDV=%s",
                                      token_id, format_marketcap_display(mc), format_marketcap_display(fdv))
                     else:
@@ -705,8 +733,15 @@ async def background_loop(app: Application):
                         first_alert_at=state.get("first_alert_at")
                     )
 
-            # Persist alerts_state locally only (no Supabase upload in loop)
+            # ✅ Persist alerts_state locally AND upload to Supabase
             safe_save(ALERTS_STATE_FILE, alerts_state)
+            try:
+                if USE_SUPABASE and upload_file:
+                    upload_file(str(ALERTS_STATE_FILE), bucket=BUCKET_NAME)
+                    logging.info("✅ Synced alerts_state to Supabase")
+            except Exception as e:
+                logging.warning("⚠️ Failed to upload alerts_state to Supabase: %s", e)
+
 
         except Exception as e:
             logging.exception("Error in background loop: %s", e)
