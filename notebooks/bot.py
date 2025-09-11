@@ -665,7 +665,10 @@ def is_subscribed(chat_id: str) -> bool:
 # ----------------------
 async def background_loop(app: Application):
     logging.info("Background alert loop started...")
+
+    # Load local state
     alerts_state = safe_load(ALERTS_STATE_FILE, {})
+
     # 🔥 Try downloading the latest alerts_state from Supabase on restart
     if USE_SUPABASE and download_file:
         try:
@@ -676,9 +679,12 @@ async def background_loop(app: Application):
             logging.warning("⚠️ Could not fetch alerts_state from Supabase: %s", e)
 
     first_run = True
+    VALID_GRADES = ["LOW", "MEDIUM", "HIGH", "CRITICAL"]
+
     while True:
         try:
             tokens = load_latest_tokens_from_overlap()
+
             if first_run:
                 logging.info("DEBUG: Loaded %d tokens from overlap_results.pkl", len(tokens))
                 sample_items = list(tokens.items())[:3]
@@ -689,59 +695,63 @@ async def background_loop(app: Application):
             for token_id, token in tokens.items():
                 grade = token.get("grade")
                 if not grade:
-                    continue
+                    continue  # Skip tokens with no grade
 
                 current_state = alerts_state.get(token_id)
                 last_grade = current_state.get("last_grade") if isinstance(current_state, dict) else None
 
+                # Only proceed if grade changed
                 if grade != last_grade:
                     logging.info("New/changed grade for %s: %s -> %s", token_id, last_grade, grade)
 
-                    if last_grade is None:
-                        mc, fdv, _ = fetch_marketcap_and_fdv(token_id)
-                        alerts_state[token_id] = {
-                            "last_grade": grade,
-                            "initial_marketcap": mc,
-                            "initial_fdv": fdv,
-                            "first_alert_at": datetime.utcnow().isoformat() + "Z"
-                        }
+                    if grade in VALID_GRADES:
+                        # First time alert for this token
+                        if last_grade is None:
+                            mc, fdv, _ = fetch_marketcap_and_fdv(token_id)
+                            alerts_state[token_id] = {
+                                "last_grade": grade,
+                                "initial_marketcap": mc,
+                                "initial_fdv": fdv,
+                                "first_alert_at": datetime.utcnow().isoformat() + "Z"
+                            }
 
-                        # Persist immediately after capturing initial state for new tokens
-                        safe_save(ALERTS_STATE_FILE, alerts_state)
-                        if USE_SUPABASE and upload_file:
-                            try:
-                                upload_file(str(ALERTS_STATE_FILE), bucket=BUCKET_NAME)
-                                logging.info("✅ Uploaded alerts_state incrementally after new alert")
-                            except Exception as e:
-                                logging.warning("⚠️ Failed incremental upload of alerts_state: %s", e)
+                            # Save + Upload immediately
+                            safe_save(ALERTS_STATE_FILE, alerts_state)
+                            if USE_SUPABASE and upload_file:
+                                try:
+                                    upload_file(str(ALERTS_STATE_FILE), bucket=BUCKET_NAME)
+                                    logging.info("✅ Uploaded alerts_state incrementally after new alert")
+                                except Exception as e:
+                                    logging.warning("⚠️ Failed incremental upload of alerts_state: %s", e)
 
+                            logging.info("Captured initial market data for %s: MC=%s, FDV=%s",
+                                         token_id, format_marketcap_display(mc), format_marketcap_display(fdv))
+                        else:
+                            alerts_state[token_id]["last_grade"] = grade
 
-                        logging.info("Captured initial market data for %s: MC=%s, FDV=%s",
-                                     token_id, format_marketcap_display(mc), format_marketcap_display(fdv))
+                        # Send alert
+                        state = alerts_state.get(token_id, {})
+                        await send_alert_to_subscribers(
+                            app,
+                            token,
+                            grade,
+                            previous_grade=last_grade,
+                            initial_mc=state.get("initial_marketcap"),
+                            initial_fdv=state.get("initial_fdv"),
+                            first_alert_at=state.get("first_alert_at")
+                        )
                     else:
-                        alerts_state[token_id]["last_grade"] = grade
+                        logging.debug(f"Skipping alert save/upload for {token_id} with grade {grade}")
 
-                    # use the up-to-date state for sending alert
-                    state = alerts_state.get(token_id, {})
-                    await send_alert_to_subscribers(
-                        app,
-                        token,
-                        grade,
-                        previous_grade=last_grade,
-                        initial_mc=state.get("initial_marketcap"),
-                        initial_fdv=state.get("initial_fdv"),
-                        first_alert_at=state.get("first_alert_at")
-                    )
-
-            # ✅ Persist alerts_state locally AND upload to Supabase
-            safe_save(ALERTS_STATE_FILE, alerts_state)
-            try:
-                if USE_SUPABASE and upload_file:
-                    upload_file(str(ALERTS_STATE_FILE), bucket=BUCKET_NAME)
-                    logging.info("✅ Synced alerts_state to Supabase")
-            except Exception as e:
-                logging.warning("⚠️ Failed to upload alerts_state to Supabase: %s", e)
-
+            # ✅ Always persist full state after processing
+            if any(entry.get("last_grade") in VALID_GRADES for entry in alerts_state.values()):
+                safe_save(ALERTS_STATE_FILE, alerts_state)
+                try:
+                    if USE_SUPABASE and upload_file:
+                        upload_file(str(ALERTS_STATE_FILE), bucket=BUCKET_NAME)
+                        logging.info("✅ Synced alerts_state to Supabase")
+                except Exception as e:
+                    logging.warning("⚠️ Failed to upload alerts_state to Supabase: %s", e)
 
         except Exception as e:
             logging.exception("Error in background loop: %s", e)
