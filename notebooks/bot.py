@@ -326,6 +326,14 @@ class UserManager:
             "active": True,
             "subscribed": True
         })
+        
+        # Save the updated preferences to file
+        safe_save(self.prefs_file, prefs)
+        
+        # Optional: upload to Supabase if enabled
+        upload_bot_data_to_supabase()
+        
+        logging.info(f"✅ Added/updated user {chat_id} with expiry {expiry_date}")
         return expiry_date
 
     def is_subscription_expired(self, chat_id: str) -> bool:
