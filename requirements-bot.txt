@@ -4,3 +4,4 @@ python-telegram-bot==22.3
 python-dotenv==1.1.1
 supabase==2.18.1
 requests==2.32.4
+joblib==1.5.1
