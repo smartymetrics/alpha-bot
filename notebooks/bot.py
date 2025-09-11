@@ -55,11 +55,6 @@ else:
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-# Log environment info
-logging.info(f"Environment: Railway={IS_RAILWAY}, Local={IS_LOCAL}")
-logging.info(f"Data directory: {DATA_DIR}")
-logging.info(f"Supabase enabled: {USE_SUPABASE}")
-
 # Optional supabase helpers (import safe; functions will only be used when configured)
 try:
     from supabase_utils import (
