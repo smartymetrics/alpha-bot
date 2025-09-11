@@ -212,16 +212,24 @@ class UserManager:
 
     def get_user_prefs(self, chat_id: str) -> Dict[str, Any]:
         prefs = safe_load(self.prefs_file, {})
-        return prefs.get(chat_id, {
+        user = prefs.get(chat_id)
+        if user:
+            return user
+
+        # If not found, just create a stub but don't force subscribed=False
+        prefs[chat_id] = {
             "grades": [],
             "created_at": self.now_iso(),
             "updated_at": self.now_iso(),
-            "active": False,             # not active until admin adds them
-            "subscribed": False,         # new flag
+            "active": False,
+            "subscribed": None,  # None = not set yet
             "total_alerts_received": 0,
             "last_alert_at": None,
             "expires_at": None
-        })
+        }
+        safe_save(self.prefs_file, prefs)
+        return prefs[chat_id]
+
 
 
     def update_user_prefs(self, chat_id: str, updates: Dict[str, Any]) -> bool:
@@ -617,24 +625,29 @@ def is_subscribed(chat_id: str) -> bool:
     ADMIN_USER_ID = os.getenv("ADMIN_USER_ID")
     if ADMIN_USER_ID and str(chat_id) == ADMIN_USER_ID:
         return True  # admin bypasses subscription
-    
+
     prefs = safe_load(USER_PREFS_FILE, {})
     user = prefs.get(str(chat_id))  # Ensure chat_id is string
-    
+
     if not user:
         logging.debug(f"User {chat_id} not found in preferences")
         return False
-    
-    # Check if user has subscribed flag
+
+    # If subscription status is not set
+    if user.get("subscribed") is None:
+        logging.debug(f"User {chat_id} subscription status not set")
+        return False
+
+    # If explicitly not subscribed
     if not user.get("subscribed", False):
         logging.debug(f"User {chat_id} not subscribed: {user.get('subscribed', False)}")
         return False
-    
-    # Check if subscription has expired
+
+    # If subscription expired
     if user_manager.is_subscription_expired(str(chat_id)):
         logging.debug(f"User {chat_id} subscription expired")
         return False
-    
+
     logging.debug(f"User {chat_id} subscription valid")
     return True
 
