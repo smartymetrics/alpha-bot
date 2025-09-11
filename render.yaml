@@ -4,7 +4,7 @@ services:
     env: python
     plan: free
     buildCommand: pip install --no-cache-dir -r requirements-bot.txt
-    startCommand: python bot.py
+    startCommand: python notebooks/bot.py
     autoDeploy: true
     envVars:
       - key: TELEGRAM_TOKEN
