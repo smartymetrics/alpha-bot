@@ -35,6 +35,31 @@ from telegram.ext import (
     Defaults,
 )
 
+# Add this to the top of your unified_bot_corrected.py after the imports
+
+import platform
+
+# Detect if running on Railway
+IS_RAILWAY = os.getenv('RAILWAY_ENVIRONMENT') is not None
+IS_LOCAL = platform.system() in ['Windows', 'Darwin'] and not IS_RAILWAY
+
+# Configure data directory based on environment
+if IS_RAILWAY:
+    # Railway persistent volume mount point
+    DATA_DIR = Path("/data")
+    POLL_INTERVAL_SECS = int(os.getenv("POLL_INTERVAL_SECS", "300"))  # 5 min for Railway
+else:
+    # Local development
+    DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
+    POLL_INTERVAL_SECS = int(os.getenv("POLL_INTERVAL_SECS", "60"))
+
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+# Log environment info
+logging.info(f"Environment: Railway={IS_RAILWAY}, Local={IS_LOCAL}")
+logging.info(f"Data directory: {DATA_DIR}")
+logging.info(f"Supabase enabled: {USE_SUPABASE}")
+
 # Optional supabase helpers (import safe; functions will only be used when configured)
 try:
     from supabase_utils import (
