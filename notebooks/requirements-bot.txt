@@ -1,0 +1,6 @@
+aiohttp==3.12.15
+async-timeout==5.0.1
+python-telegram-bot==22.3
+python-dotenv==1.1.1
+supabase==2.18.1
+requests==2.32.4

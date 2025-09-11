@@ -3,7 +3,7 @@ services:
     name: telegram-bot
     env: python
     plan: free
-    buildCommand: pip install --no-cache-dir -r requirements.txt
+    buildCommand: pip install --no-cache-dir -r requirements-bot.txt
     startCommand: python bot.py
     autoDeploy: true
     envVars:
