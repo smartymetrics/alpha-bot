@@ -3,8 +3,8 @@ services:
     name: telegram-bot
     env: python
     plan: free
-    buildCommand: ""
-    startCommand: "python bot.py"
+    buildCommand: pip install --no-cache-dir -r requirements.txt
+    startCommand: python bot.py
     autoDeploy: true
     envVars:
       - key: TELEGRAM_TOKEN
@@ -13,3 +13,5 @@ services:
         sync: false
       - key: SUPABASE_KEY
         sync: false
+    envVarsOverrides:
+      PYTHON_VERSION: 3.11.9
