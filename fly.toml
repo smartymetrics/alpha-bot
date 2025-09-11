@@ -1,0 +1,13 @@
+app = "token-monitor-app"
+
+[build]
+  builder = "paketobuildpacks/builder:base"
+
+[env]
+  PYTHONUNBUFFERED = "1"
+
+[processes]
+  app = "python token_monitor.py"
+
+[experimental]
+  auto_rollback = true
