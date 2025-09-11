@@ -309,32 +309,47 @@ class UserManager:
             upload_bot_data_to_supabase()
 
     def add_user_with_expiry(self, chat_id: str, days_valid: int):
-        prefs = safe_load(self.prefs_file, {})
-        now = self.now_iso()
-        expiry_date = (datetime.utcnow() + timedelta(days=days_valid)).replace(microsecond=0).isoformat() + "Z"
+        """Add or update a user with subscription expiry."""
+        try:
+            chat_id = str(chat_id)  # Ensure string
+            prefs = safe_load(self.prefs_file, {})
+            now = self.now_iso()
+            expiry_date = (datetime.utcnow() + timedelta(days=days_valid)).replace(microsecond=0).isoformat() + "Z"
 
-        if chat_id not in prefs:
-            prefs[chat_id] = {
-                "grades": ALL_GRADES.copy(),
-                "created_at": now,
-                "total_alerts_received": 0
-            }
+            if chat_id not in prefs:
+                prefs[chat_id] = {
+                    "grades": ALL_GRADES.copy(),
+                    "created_at": now,
+                    "total_alerts_received": 0
+                }
 
-        prefs[chat_id].update({
-            "updated_at": now,
-            "expires_at": expiry_date,
-            "active": True,
-            "subscribed": True
-        })
-        
-        # Save the updated preferences to file
-        safe_save(self.prefs_file, prefs)
-        
-        # Optional: upload to Supabase if enabled
-        upload_bot_data_to_supabase()
-        
-        logging.info(f"✅ Added/updated user {chat_id} with expiry {expiry_date}")
-        return expiry_date
+            # Update user data
+            prefs[chat_id].update({
+                "updated_at": now,
+                "expires_at": expiry_date,
+                "active": True,
+                "subscribed": True  # This is key!
+            })
+            
+            # Save to file immediately
+            safe_save(self.prefs_file, prefs)
+            logging.info(f"✅ Saved user {chat_id} to file with subscribed=True, expires_at={expiry_date}")
+            
+            # Verify the save worked
+            verify_prefs = safe_load(self.prefs_file, {})
+            verify_user = verify_prefs.get(chat_id, {})
+            logging.info(f"🔍 Verification - User {chat_id}: subscribed={verify_user.get('subscribed')}, active={verify_user.get('active')}")
+            
+            # Optional: upload to Supabase if enabled
+            if USE_SUPABASE:
+                upload_bot_data_to_supabase()
+            
+            return expiry_date
+            
+        except Exception as e:
+            logging.exception(f"❌ Error in add_user_with_expiry for {chat_id}: {e}")
+            raise
+
 
     def is_subscription_expired(self, chat_id: str) -> bool:
         """Check if a user's subscription has expired (admin never expires)."""
@@ -602,9 +617,26 @@ def is_subscribed(chat_id: str) -> bool:
     ADMIN_USER_ID = os.getenv("ADMIN_USER_ID")
     if ADMIN_USER_ID and str(chat_id) == ADMIN_USER_ID:
         return True  # admin bypasses subscription
+    
     prefs = safe_load(USER_PREFS_FILE, {})
-    user = prefs.get(chat_id)
-    return bool(user and user.get("subscribed", False) and not user_manager.is_subscription_expired(chat_id))
+    user = prefs.get(str(chat_id))  # Ensure chat_id is string
+    
+    if not user:
+        logging.debug(f"User {chat_id} not found in preferences")
+        return False
+    
+    # Check if user has subscribed flag
+    if not user.get("subscribed", False):
+        logging.debug(f"User {chat_id} not subscribed: {user.get('subscribed', False)}")
+        return False
+    
+    # Check if subscription has expired
+    if user_manager.is_subscription_expired(str(chat_id)):
+        logging.debug(f"User {chat_id} subscription expired")
+        return False
+    
+    logging.debug(f"User {chat_id} subscription valid")
+    return True
 
 
 # ----------------------
@@ -673,13 +705,40 @@ async def background_loop(app: Application):
 # ----------------------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
-    user_prefs = user_manager.get_user_prefs(chat_id)
-
-    if not user_prefs.get("subscribed", False):
+    
+    logging.info(f"🚀 User {chat_id} started bot")
+    
+    # Debug: check subscription status step by step
+    prefs = safe_load(USER_PREFS_FILE, {})
+    user_data = prefs.get(chat_id, {})
+    
+    logging.info(f"🔍 Debug user {chat_id}:")
+    logging.info(f"  - Found in prefs: {chat_id in prefs}")
+    logging.info(f"  - subscribed: {user_data.get('subscribed', False)}")
+    logging.info(f"  - active: {user_data.get('active', False)}")
+    logging.info(f"  - expires_at: {user_data.get('expires_at')}")
+    
+    is_sub = is_subscribed(chat_id)
+    is_expired = user_manager.is_subscription_expired(chat_id)
+    
+    logging.info(f"  - is_subscribed(): {is_sub}")
+    logging.info(f"  - is_subscription_expired(): {is_expired}")
+    
+    if not is_sub:
         await update.message.reply_html(
-            "👋 Welcome!\n\nYou are not subscribed to alerts.\nPlease contact the admin to activate your subscription."
+            f"👋 Welcome!\n\n"
+            f"❌ You are not subscribed to alerts.\n"
+            f"Please contact the admin to activate your subscription.\n\n"
+            f"🔍 <b>Debug info:</b>\n"
+            f"• User found: {chat_id in prefs}\n"
+            f"• Subscribed: {user_data.get('subscribed', False)}\n"
+            f"• Active: {user_data.get('active', False)}\n"
+            f"• Expired: {is_expired}"
         )
         return
+
+    # Rest of start command...
+    user_prefs = user_manager.get_user_prefs(chat_id)
 
     if not user_prefs.get("created_at"):
         user_manager.update_user_prefs(chat_id, {
@@ -942,13 +1001,59 @@ async def adduser_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     try:
-        chat_id = context.args[0]
+        chat_id = str(context.args[0])  # Ensure string
         days = int(context.args[1])
+        
+        logging.info(f"🔧 Admin adding user {chat_id} with {days} days validity")
+        
+        # Add user with expiry
         expiry_date = user_manager.add_user_with_expiry(chat_id, days)
-        await update.message.reply_text(f"✅ User {chat_id} added/updated with expiry {expiry_date}")
+        
+        # Immediately test the subscription status
+        is_sub_after = is_subscribed(chat_id)
+        
+        await update.message.reply_text(
+            f"✅ User {chat_id} added/updated with expiry {expiry_date}\n"
+            f"🔍 Subscription check: {is_sub_after}\n"
+            f"📝 Tell user to try /start now"
+        )
+        
     except Exception as e:
-        logging.exception("Error in /adduser:")
+        logging.exception("❌ Error in /adduser:")
         await update.message.reply_text(f"❌ Failed to add user: {e}")
+
+async def debug_user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Debug command to check user status."""
+    if not is_admin_update(update):
+        await update.message.reply_text("⛔ Access denied. Admins only.")
+        return
+        
+    if not context.args:
+        chat_id = str(update.effective_chat.id)
+    else:
+        chat_id = str(context.args[0])
+    
+    prefs = safe_load(USER_PREFS_FILE, {})
+    user_data = prefs.get(chat_id, {})
+    
+    is_sub = is_subscribed(chat_id)
+    is_expired = user_manager.is_subscription_expired(chat_id)
+    
+    debug_msg = (
+        f"🔍 <b>Debug User {chat_id}</b>\n\n"
+        f"<b>Raw data:</b>\n"
+        f"• Found in prefs: {chat_id in prefs}\n"
+        f"• subscribed: {user_data.get('subscribed', 'NOT SET')}\n"
+        f"• active: {user_data.get('active', 'NOT SET')}\n"
+        f"• expires_at: {user_data.get('expires_at', 'NOT SET')}\n\n"
+        f"<b>Function results:</b>\n"
+        f"• is_subscribed(): {is_sub}\n"
+        f"• is_subscription_expired(): {is_expired}\n\n"
+        f"<b>All user data:</b>\n"
+        f"<code>{user_data}</code>"
+    )
+    
+    await update.message.reply_html(debug_msg)
 
 # ----------------------
 # Main
@@ -969,6 +1074,7 @@ def main():
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(CommandHandler("testalert", testalert_cmd))
     app.add_handler(CommandHandler("adduser", adduser_cmd))
+    app.add_handler(CommandHandler("debuguser", debug_user_cmd))
 
     # set startup hook
     app.post_init = on_startup
