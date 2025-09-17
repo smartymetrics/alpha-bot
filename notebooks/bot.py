@@ -476,7 +476,7 @@ def format_alert_html(
 
     lines.append("")
     if mint:
-        lines.append(f'<a href="https://solscan.io/token/{mint}">Solscan</a> | <a href="https://gmgn.ai/sol/token/{mint}">GMGN</a>')
+        lines.append(f'<a href="https://solscan.io/token/{mint}">Solscan</a> | <a href="https://gmgn.ai/sol/token/{mint}">GMGN</a> | <a href="https://dexscreener.com/solana/{mint}">DexScreener</a>')
 
     return "\n".join(lines)
 
