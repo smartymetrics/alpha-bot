@@ -199,8 +199,9 @@ def fetch_marketcap_and_fdv(mint: str) -> Tuple[Optional[float], Optional[float]
             return None, None, "N/A"
         mc = pairs[0].get("marketCap")
         fdv = pairs[0].get("fdv")
+        lqd = pairs[0]["liquidity"].get("usd")
         display = format_marketcap_display(mc if mc else fdv)
-        return mc, fdv, display
+        return mc, fdv, lqd
     except Exception as e:
         logging.error(f"Error fetching marketcap for {mint}: {e}")
         return None, None, "N/A"
@@ -452,7 +453,7 @@ def format_alert_html(
     grade = token_data.get("grade", "NONE")
     mint = token_meta.get("mint", "") or token_data.get("token", "")
 
-    current_mc, current_fdv, current_display = fetch_marketcap_and_fdv(mint)
+    current_mc, current_fdv, current_liquidity = fetch_marketcap_and_fdv(mint)
 
     # Build Market Cap / FDV line based on alert_type
     mc_line = ""
@@ -484,7 +485,8 @@ def format_alert_html(
         f"<b>{name}</b> ({symbol})" if symbol else f"<b>{name}</b>",
         f"<b>Grade:</b> {grade}" + (f" (was {previous_grade})" if previous_grade and alert_type == "CHANGE" else ""),
         mc_line,
-        f"<b>Overlap:</b> {token_data.get('overlap_percentage')}%",
+        f"💧 <b>Liquidity:</b> {format_marketcap_display(current_liquidity)}" if current_liquidity else "💧 <b>Liquidity:</b> Unknown",
+        # f"<b>Overlap:</b> {token_data.get('overlap_percentage')}%",
         f"<b>Concentration:</b> {token_data.get('concentration')}%"
     ]
 
@@ -731,11 +733,12 @@ async def background_loop(app: Application):
                     if grade in VALID_GRADES:
                         # First time alert for this token
                         if last_grade is None:
-                            mc, fdv, _ = fetch_marketcap_and_fdv(token_id)
+                            mc, fdv, lqd = fetch_marketcap_and_fdv(token_id)
                             alerts_state[token_id] = {
                                 "last_grade": grade,
                                 "initial_marketcap": mc,
                                 "initial_fdv": fdv,
+                                "initial_liquidity": lqd,
                                 "first_alert_at": datetime.utcnow().isoformat() + "Z"
                             }
 
