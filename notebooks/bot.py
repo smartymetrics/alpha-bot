@@ -199,7 +199,8 @@ def fetch_marketcap_and_fdv(mint: str) -> Tuple[Optional[float], Optional[float]
             return None, None, "N/A"
         mc = pairs[0].get("marketCap")
         fdv = pairs[0].get("fdv")
-        lqd = pairs[0]["liquidity"].get("usd")
+        liquidity = pairs[0].get("liquidity", {})
+        lqd = liquidity.get("usd")
         display = format_marketcap_display(mc if mc else fdv)
         return mc, fdv, lqd
     except Exception as e:
@@ -485,7 +486,7 @@ def format_alert_html(
         f"<b>{name}</b> ({symbol})" if symbol else f"<b>{name}</b>",
         f"<b>Grade:</b> {grade}" + (f" (was {previous_grade})" if previous_grade and alert_type == "CHANGE" else ""),
         mc_line,
-        f"💧 <b>Liquidity:</b> {current_liquidity}" if current_liquidity else "💧 <b>Liquidity:</b> Unknown",
+        f"💧 <b>Liquidity:</b> {format_marketcap_display(current_liquidity)}" if current_liquidity else "💧 <b>Liquidity:</b> Unknown",
         # f"<b>Overlap:</b> {token_data.get('overlap_percentage')}%",
         f"<b>Concentration:</b> {token_data.get('concentration')}%"
     ]
