@@ -454,14 +454,31 @@ def format_alert_html(
 
     current_mc, current_fdv, current_display = fetch_marketcap_and_fdv(mint)
 
-    # Only include "was ..." if NOT the first alert (i.e., CHANGE alerts)
-    if alert_type == "CHANGE" and current_mc is not None:
-        mc_line = f"💰 <b>Market Cap:</b> {format_marketcap_display(current_mc)} (was {format_marketcap_display(current_mc)})"
-    elif alert_type == "CHANGE" and current_fdv is not None and initial_fdv is not None:
-        mc_line = f"🏷️ <b>FDV:</b> {format_marketcap_display(current_fdv)} (was {format_marketcap_display(initial_fdv)})"
-    else:
-        mc_line = f"💰 <b>Market Cap/FDV:</b> {current_display}"
+    # Build Market Cap / FDV line based on alert_type
+    mc_line = ""
+    if alert_type == "NEW":
+        if current_mc is not None:
+            mc_line = f"💰 <b>Market Cap:</b> {format_marketcap_display(current_mc)}"
+        elif current_fdv is not None:
+            mc_line = f"🏷️ <b>FDV:</b> {format_marketcap_display(current_fdv)}"
+        else:
+            mc_line = "💰 <b>Market Cap/FDV:</b> Unknown"
 
+    elif alert_type == "CHANGE":
+        if current_mc is not None:
+            if initial_mc is not None:
+                mc_line = f"💰 <b>Market Cap:</b> {format_marketcap_display(current_mc)} (was {format_marketcap_display(initial_mc)})"
+            else:
+                mc_line = f"💰 <b>Market Cap:</b> {format_marketcap_display(current_mc)}"
+        elif current_fdv is not None:
+            if initial_fdv is not None:
+                mc_line = f"🏷️ <b>FDV:</b> {format_marketcap_display(current_fdv)} (was {format_marketcap_display(initial_fdv)})"
+            else:
+                mc_line = f"🏷️ <b>FDV:</b> {format_marketcap_display(current_fdv)}"
+        else:
+            mc_line = "💰 <b>Market Cap/FDV:</b> Unknown"
+
+    # Build the full alert
     lines = [
         "🚀 <b>New Token Detected</b>" if alert_type == "NEW" else "🔁 <b>Grade Changed</b>",
         f"<b>{name}</b> ({symbol})" if symbol else f"<b>{name}</b>",
@@ -476,7 +493,11 @@ def format_alert_html(
 
     lines.append("")
     if mint:
-        lines.append(f'<a href="https://solscan.io/token/{mint}">Solscan</a> | <a href="https://gmgn.ai/sol/token/{mint}">GMGN</a> | <a href="https://dexscreener.com/solana/{mint}">DexScreener</a>')
+        lines.append(
+            f'<a href="https://solscan.io/token/{mint}">Solscan</a> | '
+            f'<a href="https://gmgn.ai/sol/token/{mint}">GMGN</a> | '
+            f'<a href="https://dexscreener.com/solana/{mint}">DexScreener</a>'
+        )
 
     return "\n".join(lines)
 
