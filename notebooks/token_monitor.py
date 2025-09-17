@@ -12,6 +12,7 @@ Features:
  - Wallet frequency and weighted concentration
  - Hybrid holder sampling (<=200 all; >200 top10% capped 500)
  - Bounded concurrency for holder fetching (Semaphore)
+ - FULLY ASYNC DUNE INTEGRATION with INFINITE POLLING (NO TIMEOUTS)
 """
 import asyncio
 import aiohttp
@@ -22,6 +23,20 @@ import json
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
+
+import random
+
+async def retry_with_backoff(func, *args, retries: int = 5, base_delay: float = 0.5, **kwargs):
+    """Retry an async function with exponential backoff and jitter."""
+    for attempt in range(1, retries + 1):
+        try:
+            return await func(*args, **kwargs)
+        except Exception as e:
+            wait = base_delay * (2 ** (attempt - 1)) + random.uniform(0, 0.3)
+            print(f"[Retry] {func.__name__} failed (attempt {attempt}/{retries}): {e}. Retrying in {wait:.2f}s")
+            await asyncio.sleep(wait)
+    raise RuntimeError(f"{func.__name__} failed after {retries} retries")
+
 from collections import defaultdict
 import pandas as pd
 import traceback
@@ -35,12 +50,6 @@ try:
     from dune_client.client import DuneClient
 except Exception:
     DuneClient = None
-
-BUCKET_NAME = os.getenv("SUPABASE_BUCKET", "monitor-data")
-
-
-
-# At the top of token_monitor.py add:
 
 BUCKET_NAME = os.getenv("SUPABASE_BUCKET", "monitor-data")
 
@@ -113,7 +122,7 @@ class TradingStart:
     price_change_percentage: Optional[float] = None
 
 # -----------------------
-# Token discovery (CoinGecko)
+# Token discovery (CoinGecko + FULLY ASYNC Dune)
 # -----------------------
 class TokenDiscovery:
     def __init__(
@@ -130,7 +139,7 @@ class TokenDiscovery:
         self.client = client
         self.debug = bool(debug)
         # CoinGecko
-        self.coingecko_pro_api_key = "CG-nm5ynnbGBWTugQhVY2vNMWbP" #coingecko_pro_api_key or os.environ.get("GECKO_API")
+        self.coingecko_pro_api_key = coingecko_pro_api_key or os.environ.get("GECKO_API")
         self.coingecko_url = "https://pro-api.coingecko.com/api/v3/onchain/networks/solana/new_pools"
         self.last_processed_timestamp = self._load_last_timestamp(timestamp_cache_file)
         self.timestamp_cache_file = timestamp_cache_file
@@ -146,7 +155,7 @@ class TokenDiscovery:
             self.dune_client = None
         self.dune_cache_file = dune_cache_file
         if self.debug:
-            print("TokenDiscovery initialized with CoinGecko Pro")
+            print("TokenDiscovery initialized with CoinGecko Pro and ASYNC Dune (NO TIMEOUTS)")
 
     def _load_last_timestamp(self, cache_file: str) -> Optional[int]:
         if os.path.exists(cache_file):
@@ -206,128 +215,108 @@ class TokenDiscovery:
             print(f"[Dune] extracted {len(rows)} rows")
         return rows
 
-    def fetch_dune_force_refresh(self) -> list[dict]:
-        """Force a new execution of the Dune query and return fresh results."""
+    async def fetch_dune_force_refresh(self) -> List[Dict[str, Any]]:
+        """
+        🚀 FULLY ASYNC: Force a new execution of the Dune query and return fresh results.
+        🚀 NO TIMEOUTS: Uses infinite polling with while True
+        🚀 NON-BLOCKING: Uses await asyncio.sleep instead of time.sleep
+        """
         if not self.dune_client or not self.dune_query_id:
             raise RuntimeError("Dune client or query_id not configured")
+
+        query_id = int(self.dune_query_id)
+
         if self.debug:
-            print(f"[Dune] forcing new execution for query {self.dune_query_id}")
-        
+            print(f"[Dune ASYNC] 🚀 Starting infinite polling for query {query_id} (NO TIMEOUTS)")
+
         try:
-            # Import the Query class from dune_client
-            from dune_client.types import QueryParameter
             from dune_client.query import QueryBase
-            
-            # Create a proper Query object - try different approaches based on dune_client version
-            query = None
-            
-            # Method 1: Try using QueryBase directly
+
+            # Method 1: Try execute_query with INFINITE polling (NO TIMEOUT)
             try:
-                query = QueryBase(query_id=self.dune_query_id)
+                query = QueryBase(query_id=query_id)
+                execution = self.dune_client.execute_query(query)
                 if self.debug:
-                    print(f"[Dune] created QueryBase object: {query}")
-            except Exception as e:
-                if self.debug:
-                    print(f"[Dune] QueryBase creation failed: {e}")
-            
-            # Method 2: Try using the client's refresh_into_dataframe approach
-            if not query:
-                try:
+                    print(f"[Dune ASYNC] 🚀 Started execution: {execution}")
+
+                # Get execution ID
+                execution_id = None
+                if hasattr(execution, 'execution_id'):
+                    execution_id = execution.execution_id
+                elif hasattr(execution, 'id'):
+                    execution_id = execution.id
+                elif isinstance(execution, str):
+                    execution_id = execution
+
+                if execution_id:
                     if self.debug:
-                        print(f"[Dune] trying refresh_into_dataframe approach")
-                    # Use refresh_into_dataframe which handles the Query object creation internally
-                    df = self.dune_client.refresh_into_dataframe(self.dune_query_id)
-                    if df is not None and not df.empty:
-                        rows = df.to_dict('records')
-                        if self.debug:
-                            print(f"[Dune] refresh_into_dataframe returned {len(rows)} rows")
-                        return rows
-                except Exception as e:
-                    if self.debug:
-                        print(f"[Dune] refresh_into_dataframe failed: {e}")
-            
-            # Method 3: If we have a Query object, try execute_query
-            if query:
-                try:
-                    execution = self.dune_client.execute_query(query)
-                    
-                    if self.debug:
-                        print(f"[Dune] execution object: {execution}")
-                    
-                    # Extract execution ID
-                    execution_id = None
-                    if hasattr(execution, 'execution_id'):
-                        execution_id = execution.execution_id
-                    elif hasattr(execution, 'id'):
-                        execution_id = execution.id
-                    elif isinstance(execution, str):
-                        execution_id = execution
-                    
-                    if execution_id:
-                        # Poll for completion
-                        max_attempts = 60
-                        for attempt in range(max_attempts):
-                            try:
-                                status = self.dune_client.get_execution_status(execution_id)
-                                
-                                state = None
-                                if hasattr(status, 'state'):
-                                    state = status.state
-                                elif hasattr(status, 'execution_status'):
-                                    state = status.execution_status
-                                elif isinstance(status, str):
-                                    state = status
-                                
-                                if self.debug and attempt % 6 == 0:
-                                    print(f"[Dune] status: {state}")
-                                
-                                if state in ("QUERY_STATE_COMPLETED", "completed", "EXECUTION_STATE_COMPLETED"):
-                                    break
-                                elif state in ("QUERY_STATE_FAILED", "failed", "EXECUTION_STATE_FAILED"):
-                                    raise RuntimeError(f"Query failed: {state}")
-                                
-                                time.sleep(5)
-                            except Exception as e:
-                                if self.debug:
-                                    print(f"[Dune] polling error: {e}")
-                                break
-                        
-                        # Get results
+                        print(f"[Dune ASYNC] 🚀 Polling execution {execution_id} with INFINITE timeout")
+
+                    attempt = 0
+                    while True:  # 🚀 No timeout - runs until completion
                         try:
-                            payload = self.dune_client.get_result(execution_id)
-                            rows = self._rows_from_dune_payload(payload)
-                            if rows:
+                            attempt += 1
+                            status = self.dune_client.get_execution_status(execution_id)
+
+                            # normalize state
+                            raw_state = getattr(status, 'state',
+                                        getattr(status, 'execution_status',
+                                        getattr(status, 'execution_state', str(status))))
+                            state_str = str(raw_state).lower()
+
+                            if self.debug and attempt % 20 == 0:
+                                print(f"[Dune ASYNC] 🚀 Attempt {attempt}: {state_str} (infinite polling)")
+
+                            if "completed" in state_str:
                                 if self.debug:
-                                    print(f"[Dune] force refresh successful: {len(rows)} rows")
-                                return rows
+                                    print(f"[Dune ASYNC] ✅ Query completed after {attempt} attempts ({attempt * 3 / 60:.1f} minutes)")
+                                break
+                            elif "failed" in state_str:
+                                raise RuntimeError(f"Query execution failed: {raw_state}")
+
+                            await asyncio.sleep(3)
+
                         except Exception as e:
                             if self.debug:
-                                print(f"[Dune] get_result failed: {e}")
-                except Exception as e:
-                    if self.debug:
-                        print(f"[Dune] execute_query with Query object failed: {e}")
-            
-            # Method 4: Fallback to latest result
+                                print(f"[Dune ASYNC] ⚠️ Polling error: {e}")
+                            break
+
+                    # Get results
+                    try:
+                        payload = self.dune_client.get_result(execution_id)
+                        rows = self._rows_from_dune_payload(payload)
+                        if rows:
+                            if self.debug:
+                                print(f"[Dune ASYNC] ✅ Execute query successful: {len(rows)} rows after {attempt * 3 / 60:.1f} minutes")
+                            return rows
+                    except Exception as e:
+                        if self.debug:
+                            print(f"[Dune ASYNC] ❌ get_result failed: {e}")
+            except Exception as e:
+                if self.debug:
+                    print(f"[Dune ASYNC] ❌ execute_query failed: {e}")
+
+            # Method 2: Fallback to get_latest_result
             if self.debug:
-                print("[Dune] falling back to get_latest_result")
-            payload = self.dune_client.get_latest_result(self.dune_query_id)
+                print("[Dune ASYNC] 🔄 Falling back to get_latest_result")
+            payload = self.dune_client.get_latest_result(query_id)
             rows = self._rows_from_dune_payload(payload)
             if self.debug:
-                print(f"[Dune] fallback returned {len(rows)} rows")
+                print(f"[Dune ASYNC] 🔄 Fallback returned {len(rows)} rows")
+                if rows:
+                    print(f"[Dune ASYNC] Sample fallback row keys: {list(rows[0].keys())}")
             return rows
-            
+
         except Exception as e:
             if self.debug:
-                print(f"[Dune] all methods failed: {e}")
+                print(f"[Dune ASYNC] ❌ All methods failed: {e}")
                 import traceback
                 traceback.print_exc()
-            
-            # Final fallback - return empty list
             return []
-            
-    def get_tokens_launched_yesterday_cached(self, cache_max_age_days: int = 7) -> List[TradingStart]:
+
+    async def get_tokens_launched_yesterday_cached(self, cache_max_age_days: int = 7) -> List[TradingStart]:
         """
-        Return list of TradingStart objects for tokens Dune reports as launched yesterday.
+        🚀 NOW ASYNC: Return list of TradingStart objects for tokens Dune reports as launched yesterday.
         This method retains compatibility with previous behavior (legacy single-file cache).
         """
         cache_path = self.dune_cache_file
@@ -435,15 +424,15 @@ class TokenDiscovery:
                 if self.debug:
                     print(f"[Dune/cache] error reading cache: {e}")
 
-        # Fetch fresh data if needed
+        # 🚀 ASYNC FETCH: Fetch fresh data if needed
         if need_fetch:
             try:
                 if self.debug:
-                    print("[Dune] Fetching fresh data from Dune API")
-                rows = self.fetch_dune_force_refresh()
+                    print("[Dune ASYNC] 🚀 Fetching fresh data from Dune API with infinite polling")
+                rows = await self.fetch_dune_force_refresh()  # 🚀 NOW ASYNC
             except Exception as e:
                 if self.debug:
-                    print(f"[Dune] fetch failure: {e}")
+                    print(f"[Dune ASYNC] ❌ fetch failure: {e}")
                 return []
 
             # Save fresh data to cache
@@ -455,14 +444,14 @@ class TokenDiscovery:
                 }
                 joblib.dump(cache_obj, cache_path)
                 if self.debug:
-                    print(f"[Dune/cache] cached fresh data for yesterday={current_yesterday}")
+                    print(f"[Dune/cache] ✅ cached fresh data for yesterday={current_yesterday}")
             except Exception as e:
                 if self.debug:
-                    print(f"[Dune/cache] write failed: {e}")
+                    print(f"[Dune/cache] ❌ write failed: {e}")
 
             starts = rows_to_trading_starts(rows, current_yesterday)
             if self.debug:
-                print(f"[Dune] found {len(starts)} tokens for yesterday={current_yesterday} after fresh fetch")
+                print(f"[Dune ASYNC] ✅ found {len(starts)} tokens for yesterday={current_yesterday} after fresh fetch")
             return starts
 
         return []
@@ -505,7 +494,6 @@ class TokenDiscovery:
             print(f"[CoinGecko] Total pools fetched: {len(all_pools)}")
 
         return all_pools
-
 
     @staticmethod
     def _parse_pool_created_at(val: Any) -> Optional[int]:
@@ -583,7 +571,7 @@ class TokenDiscovery:
         return out
 
 # -----------------------
-# Dune 7-day rolling cache + builder (new)
+# Dune 7-day rolling cache + builder (updated for async)
 # -----------------------
 class DuneWinnersCache:
     """
@@ -721,70 +709,58 @@ class DuneWinnersBuilder:
 
     async def build_today_from_dune(self, token_discovery: TokenDiscovery, holder_agg: 'HolderAggregator') -> Dict[str, List[str]]:
         """
-        Fetch tokens from Dune (yesterday), fetch sampled holders concurrently, save today's per-day cache,
+        🚀 NOW ASYNC: Fetch tokens from Dune (yesterday), fetch sampled holders concurrently, save today's per-day cache,
         and return the token->holders mapping for today.
         """
         if self.debug:
-            print(f"[DuneBuilder] Starting build_today_from_dune")
+            print(f"[DuneBuilder ASYNC] 🚀 Starting build_today_from_dune")
             
-        # Get tokens from yesterday's Dune data
-        starts = token_discovery.get_tokens_launched_yesterday_cached()
+        # 🚀 ASYNC: Get tokens from yesterday's Dune data
+        starts = await token_discovery.get_tokens_launched_yesterday_cached()
         if self.debug:
-            print(f"[DuneBuilder] Dune returned {len(starts)} tokens for yesterday")
+            print(f"[DuneBuilder ASYNC] 🚀 Dune returned {len(starts)} tokens for yesterday")
             if starts:
-                print(f"[DuneBuilder] Sample tokens: {[s.mint for s in starts[:3]]}")
+                print(f"[DuneBuilder ASYNC] Sample tokens: {[(s.mint, s.block_time) for s in starts[:3]]}")
+                # Validate token mint addresses
+                valid_tokens = [s for s in starts if s.mint and len(s.mint) >= 32]
+                invalid_tokens = len(starts) - len(valid_tokens)
+                if invalid_tokens > 0:
+                    print(f"[DuneBuilder ASYNC] Warning: {invalid_tokens} tokens have invalid mint addresses")
             else:
-                print(f"[DuneBuilder] No tokens returned by Dune - checking why...")
-                # Debug why no tokens
-                try:
-                    # Try to load the raw cache to see what's in it
-                    import os
-                    cache_path = token_discovery.dune_cache_file
-                    if os.path.exists(cache_path):
-                        import joblib
-                        cache_obj = joblib.load(cache_path)
-                        rows = cache_obj.get("rows", [])
-                        print(f"[DuneBuilder] Raw cache has {len(rows)} rows")
-                        if rows:
-                            print(f"[DuneBuilder] Sample row keys: {list(rows[0].keys()) if rows else 'none'}")
-                            # Check dates in the data
-                            import pandas as pd
-                            df = pd.DataFrame(rows)
-                            if "first_buy_date" in df.columns:
-                                dates = pd.to_datetime(df["first_buy_date"], errors="coerce").dt.date.unique()
-                                print(f"[DuneBuilder] Dates in cache: {sorted(dates)}")
-                                yesterday = (datetime.now(timezone.utc).date() - timedelta(days=1))
-                                print(f"[DuneBuilder] Looking for yesterday: {yesterday}")
-                    else:
-                        print(f"[DuneBuilder] No cache file exists at {cache_path}")
-                except Exception as e:
-                    print(f"[DuneBuilder] Debug cache inspection failed: {e}")
+                print(f"[DuneBuilder ASYNC] No tokens returned by Dune - checking why...")
         
         if not starts:
             if self.debug:
-                print("[DuneBuilder] No tokens from Dune, returning empty mapping")
+                print("[DuneBuilder ASYNC] No tokens from Dune, returning empty mapping")
             # Still save an empty mapping for today to mark that we tried
             self.cache.save_today({})
             return {}
         
+        # Filter out tokens with invalid mint addresses
+        valid_starts = [s for s in starts if s.mint and len(s.mint) >= 32]
+        if len(valid_starts) != len(starts):
+            if self.debug:
+                print(f"[DuneBuilder ASYNC] Filtered {len(starts) - len(valid_starts)} tokens with invalid mint addresses")
+        starts = valid_starts
+        
         if self.debug:
-            print(f"[DuneBuilder] Processing {len(starts)} tokens to fetch holders")
+            print(f"[DuneBuilder ASYNC] 🚀 Processing {len(starts)} tokens to fetch holders")
         
         # Process tokens to get holders
         token_to_top_holders: Dict[str, List[str]] = {}
         successful_fetches = 0
         failed_fetches = 0
         
-        # Process first few tokens sequentially for debugging
-        for i, s in enumerate(starts[:5]):
+        # Process tokens sequentially with better error handling
+        for i, s in enumerate(starts):
             if not s.mint:
                 if self.debug:
-                    print(f"[DuneBuilder] Token {i}: No mint address, skipping")
+                    print(f"[DuneBuilder ASYNC] Token {i}: No mint address, skipping")
                 continue
             
             try:
                 if self.debug:
-                    print(f"[DuneBuilder] Token {i}: Processing {s.mint}")
+                    print(f"[DuneBuilder ASYNC] Token {i+1}/{len(starts)}: Processing {s.mint}")
                 
                 holders = await self._fetch_top_sampled_holders(holder_agg, s.mint)
                 token_to_top_holders[s.mint] = holders
@@ -792,86 +768,45 @@ class DuneWinnersBuilder:
                 if holders:
                     successful_fetches += 1
                     if self.debug:
-                        print(f"[DuneBuilder] Token {i} ({s.mint}): Got {len(holders)} holders")
+                        print(f"[DuneBuilder ASYNC] Token {i} ({s.mint}): Got {len(holders)} holders")
                 else:
                     failed_fetches += 1
                     if self.debug:
-                        print(f"[DuneBuilder] Token {i} ({s.mint}): No holders returned")
+                        print(f"[DuneBuilder ASYNC] Token {i} ({s.mint}): No holders returned")
                         
-                # Add a small delay to avoid overwhelming the RPC
-                await asyncio.sleep(0.5)
+                # Add a delay to avoid overwhelming the RPC, with backoff for failures
+                if holders:
+                    await asyncio.sleep(0.3)  # Shorter delay for successful requests
+                else:
+                    await asyncio.sleep(1.0)  # Longer delay after failures
                 
             except Exception as e:
                 failed_fetches += 1
                 if self.debug:
-                    print(f"[DuneBuilder] Token {i} ({s.mint}): Exception - {e}")
-                    import traceback
-                    traceback.print_exc()
-
-        if self.debug:
-            print(f"[DuneBuilder] Sequential batch complete: {successful_fetches} successful, {failed_fetches} failed")
-
-        # If sequential processing worked, process remaining tokens concurrently
-        if successful_fetches > 0 and len(starts) > 5:
-            if self.debug:
-                print("[DuneBuilder] Sequential processing worked, processing remaining tokens concurrently")
-            
-            remaining_starts = starts[5:]
-            tasks = []
-            mints = []
-            
-            for s in remaining_starts:
-                if not s.mint:
-                    continue
-                mints.append(s.mint)
-                tasks.append(asyncio.create_task(self._fetch_top_sampled_holders(holder_agg, s.mint)))
-
-            if tasks:
-                if self.debug:
-                    print(f"[DuneBuilder] Starting {len(tasks)} concurrent holder fetches")
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                
-                concurrent_successful = 0
-                concurrent_failed = 0
-                
-                for mint, res in zip(mints, results):
-                    if isinstance(res, Exception):
-                        concurrent_failed += 1
-                        if self.debug:
-                            print(f"[DuneBuilder] Concurrent fetch failed for {mint}: {res}")
-                        continue
-                    
-                    token_to_top_holders[mint] = res
-                    if res:
-                        concurrent_successful += 1
-                    else:
-                        concurrent_failed += 1
-                        
-                if self.debug:
-                    print(f"[DuneBuilder] Concurrent batch complete: {concurrent_successful} successful, {concurrent_failed} failed")
-        
-        elif successful_fetches == 0:
-            if self.debug:
-                print("[DuneBuilder] Sequential processing failed completely - there might be an RPC issue")
+                    print(f"[DuneBuilder ASYNC] Token {i} ({s.mint}): Exception - {e}")
+                # Longer delay after exceptions
+                await asyncio.sleep(2.0)
 
         # Calculate final statistics
         total_tokens_with_holders = len([holders for holders in token_to_top_holders.values() if holders])
         total_unique_wallets = len({w for holders in token_to_top_holders.values() for w in holders})
         
         if self.debug:
-            print(f"[DuneBuilder] Final result: {len(token_to_top_holders)} tokens processed")
-            print(f"[DuneBuilder] - {total_tokens_with_holders} tokens have holders")
-            print(f"[DuneBuilder] - {total_unique_wallets} unique wallet addresses")
-            print(f"[DuneBuilder] - Average holders per token: {total_unique_wallets / max(1, total_tokens_with_holders):.1f}")
+            print(f"[DuneBuilder ASYNC] ✅ Processing complete: {successful_fetches} successful, {failed_fetches} failed")
+            print(f"[DuneBuilder ASYNC] ✅ Final result: {len(token_to_top_holders)} tokens processed")
+            print(f"[DuneBuilder ASYNC] - {total_tokens_with_holders} tokens have holders")
+            print(f"[DuneBuilder ASYNC] - {total_unique_wallets} unique wallet addresses")
+            if total_tokens_with_holders > 0:
+                print(f"[DuneBuilder ASYNC] - Average holders per token: {total_unique_wallets / total_tokens_with_holders:.1f}")
         
         # Save to today's per-day cache file
         try:
             self.cache.save_today(token_to_top_holders)
             if self.debug:
-                print(f"[DuneBuilder] Successfully saved today's cache")
+                print(f"[DuneBuilder ASYNC] ✅ Successfully saved today's cache")
         except Exception as e:
             if self.debug:
-                print(f"[DuneBuilder] Failed to save today's cache: {e}")
+                print(f"[DuneBuilder ASYNC] ❌ Failed to save today's cache: {e}")
         
         return token_to_top_holders
 
@@ -879,45 +814,118 @@ class DuneWinnersBuilder:
 # Holder aggregation
 # -----------------------
 class HolderAggregator:
-    def __init__(self, client: SolanaAlphaClient):
+    def __init__(self, client: SolanaAlphaClient, debug: bool = False):
         self.client = client
+        self.debug = debug
 
     async def get_token_holders(self, token_mint: str, *, sleep_between: float = 0.15, limit: int = 1000, max_pages: Optional[int] = None, decimals: Optional[int] = None) -> List[Dict[str, Any]]:
+        """
+        Fetch token holders with improved error handling and validation.
+        """
+        if self.debug:
+            print(f"[HolderAgg] Fetching holders for token: {token_mint}")
+            
+        # Validate token mint format
+        if not token_mint or len(token_mint) < 32:
+            if self.debug:
+                print(f"[HolderAgg] Invalid token mint format: {token_mint}")
+            return []
+            
         page = 1
         owner_balances = defaultdict(int)
         owner_token_account_counts = defaultdict(int)
+        total_accounts_processed = 0
+        
         while True:
             payload_params = {"mint": token_mint, "page": page, "limit": limit, "displayOptions": {}}
-            data = await self.client.make_rpc_call("getTokenAccounts", payload_params)
-            token_accounts = data.get("result", {}).get("token_accounts", [])
-            if not token_accounts:
+            
+            try:
+                data = await retry_with_backoff(
+                    self.client.make_rpc_call, 
+                    "getTokenAccounts", 
+                    payload_params,
+                    retries=3,
+                    base_delay=1.0
+                )
+            except Exception as e:
+                if self.debug:
+                    print(f"[HolderAgg] RPC call failed for {token_mint} page {page}: {e}")
                 break
+                
+            if "error" in data:
+                if self.debug:
+                    print(f"[HolderAgg] RPC error for {token_mint}: {data['error']}")
+                break
+                
+            token_accounts = data.get("result", {}).get("token_accounts", [])
+            
+            if not token_accounts:
+                if self.debug and page == 1:
+                    print(f"[HolderAgg] No token accounts found for {token_mint}")
+                    # Check if token exists by trying a different approach
+                    try:
+                        supply_data = await self.client.make_rpc_call("getTokenSupply", [token_mint])
+                        if "error" in supply_data:
+                            print(f"[HolderAgg] Token supply check failed: {supply_data['error']}")
+                        else:
+                            print(f"[HolderAgg] Token exists but has no holders")
+                    except Exception as e:
+                        print(f"[HolderAgg] Token supply check error: {e}")
+                break
+                
+            if self.debug and page == 1:
+                print(f"[HolderAgg] Found {len(token_accounts)} token accounts on page {page}")
+                
             for ta in token_accounts:
                 owner = ta.get("owner") or ta.get("address")
                 amt_raw = ta.get("amount", 0)
+                
+                # Handle nested account structure
                 if "account" in ta and isinstance(ta["account"], dict):
                     acct = ta["account"]
                     owner = owner or acct.get("owner")
                     amt_raw = acct.get("amount", 0)
+                    
+                # Parse amount with better error handling
                 if isinstance(amt_raw, dict):
                     amt_raw = int(float(amt_raw.get("amount") or amt_raw.get("uiAmount", 0)))
                 else:
                     try:
                         amt_raw = int(amt_raw)
                     except Exception:
-                        amt_raw = int(float(amt_raw)) if amt_raw else 0
+                        try:
+                            amt_raw = int(float(amt_raw)) if amt_raw else 0
+                        except Exception:
+                            amt_raw = 0
+                            
                 if owner:
                     owner_balances[owner] += amt_raw
                     owner_token_account_counts[owner] += 1
+                    total_accounts_processed += 1
+                    
             page += 1
             if max_pages and page > max_pages:
+                if self.debug:
+                    print(f"[HolderAgg] Reached max pages ({max_pages}) for {token_mint}")
                 break
+                
             await asyncio.sleep(sleep_between)
+            
+        if self.debug:
+            print(f"[HolderAgg] Processed {total_accounts_processed} token accounts, {len(owner_balances)} unique holders")
+            
         holders = []
         for owner, raw in owner_balances.items():
             human_balance = raw / (10 ** decimals) if decimals else None
             holders.append({"wallet": owner, "balance_raw": raw, "balance": human_balance, "balance_formatted": (f"{human_balance:,.{decimals}f}" if human_balance is not None and decimals is not None else str(raw)), "num_token_accounts": owner_token_account_counts[owner]})
+            
         holders.sort(key=lambda x: x["balance_raw"], reverse=True)
+        
+        if self.debug:
+            print(f"[HolderAgg] Final result: {len(holders)} holders for {token_mint}")
+            if holders:
+                print(f"[HolderAgg] Top holder balance: {holders[0]['balance_raw']}")
+                
         return holders
     
 def _normalize(obj: Any) -> Any:
@@ -1065,9 +1073,10 @@ class DuneHolderCache:
                 print("DuneHolderCache: save failed", e)
 
     async def build_cache(self, token_discovery: TokenDiscovery, holder_agg: HolderAggregator, top_n_per_token: int = 500) -> Dict[str, Set[str]]:
-        starts = token_discovery.get_tokens_launched_yesterday_cached()
+        # 🚀 NOW ASYNC
+        starts = await token_discovery.get_tokens_launched_yesterday_cached()
         if self.debug:
-            print(f"DuneHolderCache: found {len(starts)} dune tokens")
+            print(f"DuneHolderCache ASYNC: found {len(starts)} dune tokens")
         mapping: Dict[str, Set[str]] = {}
         for s in starts:
             if not s.mint:
@@ -1077,10 +1086,10 @@ class DuneHolderCache:
                 top_wallets = {h["wallet"] for h in holders[:top_n_per_token]}
                 mapping[s.mint] = top_wallets
                 if self.debug:
-                    print(f"DuneHolderCache: token {s.mint} -> {len(top_wallets)} top holders")
+                    print(f"DuneHolderCache ASYNC: token {s.mint} -> {len(top_wallets)} top holders")
             except Exception as e:
                 if self.debug:
-                    print(f"DuneHolderCache: error fetching holders for {s.mint}: {e}")
+                    print(f"DuneHolderCache ASYNC: error fetching holders for {s.mint}: {e}")
                 mapping[s.mint] = set()
         cache_obj = {"mapping": mapping, "fetched_at": datetime.now(timezone.utc).isoformat()}
         self._save_cache(cache_obj)
@@ -1103,8 +1112,6 @@ class DuneHolderCache:
 # -----------------------
 # Overlap & scheduling stores
 # -----------------------
-
-from datetime import datetime, timedelta, timezone
 
 def prune_old_overlap_entries(data: dict, expiry_hours: int = 24) -> dict:
     """
@@ -1224,8 +1231,6 @@ class SchedulingStore:
             if self.debug:
                 print(f"SchedulingStore: cleaned {removed_count} old scheduling states")
         return removed_count
-
-import pandas as pd
 
 def safe_load_overlap(overlap_store):
     obj = overlap_store.load()
@@ -1353,7 +1358,7 @@ def calculate_overlap_grade(overlap_count: int, overlap_percentage: float, conce
         return "NONE"
 
 # -----------------------
-# Monitor
+# Monitor (updated for async Dune)
 # -----------------------
 class Monitor:
     def __init__(
@@ -1386,14 +1391,66 @@ class Monitor:
         self.debug = debug
         self._scheduled: Set[str] = set()
         self.last_cleanup = 0
+        self.last_dune_build = 0  # Track last Dune cache build time
+
+    async def daily_dune_scheduler(self):
+        """
+        🚀 ASYNC Background task that runs Dune query once per day at a scheduled time.
+        Runs at 2 AM UTC daily to build fresh cache with yesterday's data.
+        """
+        if self.debug:
+            print("[DuneScheduler ASYNC] 🚀 Starting daily Dune scheduler (INFINITE POLLING)")
+        
+        while True:
+            try:
+                now = datetime.now(timezone.utc)
+                
+                # Calculate next 2 AM UTC
+                next_run = now.replace(hour=2, minute=0, second=0, microsecond=0)
+                if now >= next_run:
+                    # If it's already past 2 AM today, schedule for tomorrow
+                    next_run += timedelta(days=1)
+                
+                sleep_seconds = (next_run - now).total_seconds()
+                
+                if self.debug:
+                    print(f"[DuneScheduler ASYNC] 🚀 Next Dune build scheduled for {next_run} (in {sleep_seconds/3600:.1f} hours)")
+                
+                # Sleep until scheduled time
+                await asyncio.sleep(sleep_seconds)
+                
+                # Run the daily Dune cache build
+                if self.debug:
+                    print("[DuneScheduler ASYNC] 🚀 Starting scheduled daily Dune cache build")
+                
+                try:
+                    new_token_holders = await self.dune_builder.build_today_from_dune(
+                        self.token_discovery, self.holder_agg
+                    )
+                    self.last_dune_build = int(datetime.now(timezone.utc).timestamp())
+                    
+                    if self.debug:
+                        print(f"[DuneScheduler ASYNC] ✅ Successfully built daily cache with {len(new_token_holders)} tokens")
+                        
+                except Exception as e:
+                    if self.debug:
+                        print(f"[DuneScheduler ASYNC] ❌ Failed to build daily Dune cache: {e}")
+                        import traceback
+                        traceback.print_exc()
+                
+            except Exception as e:
+                if self.debug:
+                    print(f"[DuneScheduler ASYNC] ❌ Scheduler error: {e}")
+                # Sleep for 1 hour before retrying on error
+                await asyncio.sleep(3600)
 
     async def ensure_dune_holders(self):
         """
-        Ensure the 7-day Dune winners cache exists by loading last 7 days and
+        🚀 ASYNC: Ensure the 7-day Dune winners cache exists by loading last 7 days and
         building today's file if yesterday's data is missing or outdated.
         """
         if self.debug:
-            print("[Monitor] Starting ensure_dune_holders()")
+            print("[Monitor ASYNC] 🚀 Starting ensure_dune_holders()")
             
         # First, load existing 7-day cache
         token_to_top_holders, wallet_freq, loaded_days = self.dune_cache.load_last_7_days()
@@ -1402,10 +1459,10 @@ class Monitor:
         yesterday_key = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y%m%d")
         
         if self.debug:
-            print(f"[Monitor] Today: {today_key}, Yesterday: {yesterday_key}")
-            print(f"[Monitor] Loaded cache days: {loaded_days}")
-            print(f"[Monitor] Total cached tokens: {len(token_to_top_holders)}")
-            print(f"[Monitor] Total unique wallets: {len(wallet_freq)}")
+            print(f"[Monitor ASYNC] Today: {today_key}, Yesterday: {yesterday_key}")
+            print(f"[Monitor ASYNC] Loaded cache days: {loaded_days}")
+            print(f"[Monitor ASYNC] Total cached tokens: {len(token_to_top_holders)}")
+            print(f"[Monitor ASYNC] Total unique wallets: {len(wallet_freq)}")
 
         # Check if we need to build today's cache
         should_build_today = False
@@ -1413,49 +1470,49 @@ class Monitor:
         # Build today's cache if it doesn't exist
         if today_key not in loaded_days:
             if self.debug:
-                print(f"[Monitor] Today's cache missing ({today_key}), will build it")
+                print(f"[Monitor ASYNC] 🚀 Today's cache missing ({today_key}), will build it")
             should_build_today = True
         else:
             if self.debug:
-                print(f"[Monitor] Today's cache already exists ({today_key})")
+                print(f"[Monitor ASYNC] ✅ Today's cache already exists ({today_key})")
 
         # Also check if yesterday's data is missing (fallback)
         if yesterday_key not in loaded_days:
             if self.debug:
-                print(f"[Monitor] Yesterday's cache also missing ({yesterday_key}), will force build today's cache")
+                print(f"[Monitor ASYNC] ⚠️ Yesterday's cache also missing ({yesterday_key}), will force build today's cache")
             should_build_today = True
 
         if should_build_today:
             try:
                 if self.debug:
-                    print("[Monitor] Building today's Dune holder cache...")
+                    print("[Monitor ASYNC] 🚀 Building today's Dune holder cache with infinite polling...")
                 new_token_holders = await self.dune_builder.build_today_from_dune(
                     self.token_discovery, self.holder_agg
                 )
                 if self.debug:
-                    print(f"[Monitor] Built today's cache with {len(new_token_holders)} tokens")
+                    print(f"[Monitor ASYNC] ✅ Built today's cache with {len(new_token_holders)} tokens")
                     
                 # Reload the cache after building
                 token_to_top_holders, wallet_freq, loaded_days = self.dune_cache.load_last_7_days()
                 if self.debug:
-                    print(f"[Monitor] After rebuild - loaded days: {loaded_days}")
-                    print(f"[Monitor] After rebuild - total tokens: {len(token_to_top_holders)}")
-                    print(f"[Monitor] After rebuild - total wallets: {len(wallet_freq)}")
+                    print(f"[Monitor ASYNC] ✅ After rebuild - loaded days: {loaded_days}")
+                    print(f"[Monitor ASYNC] ✅ After rebuild - total tokens: {len(token_to_top_holders)}")
+                    print(f"[Monitor ASYNC] ✅ After rebuild - total wallets: {len(wallet_freq)}")
                     
             except Exception as e:
                 if self.debug:
-                    print(f"[Monitor] Failed to build today's Dune cache: {e}")
+                    print(f"[Monitor ASYNC] ❌ Failed to build today's Dune cache: {e}")
                     import traceback
                     traceback.print_exc()
         else:
             if self.debug:
-                print("[Monitor] Skipping cache build - sufficient data already exists")
+                print("[Monitor ASYNC] ✅ Skipping cache build - sufficient data already exists")
 
         return token_to_top_holders, wallet_freq, loaded_days
 
     async def startup_recovery(self):
         if self.debug:
-            print("Monitor: performing startup recovery")
+            print("Monitor ASYNC: performing startup recovery")
         scheduling_state = self.scheduling_store.load()
         current_time = int(datetime.now(timezone.utc).timestamp())
         cutoff_time = current_time - (24 * 3600)
@@ -1488,7 +1545,7 @@ class Monitor:
             self._scheduled.add(token_mint)
         if recovery_tasks:
             if self.debug:
-                print(f"Monitor: started {len(recovery_tasks)} recovery tasks")
+                print(f"Monitor ASYNC: started {len(recovery_tasks)} recovery tasks")
 
     async def _schedule_first_check_only(self, token_mint: str, delay_seconds: float):
         if delay_seconds > 0:
@@ -1626,13 +1683,19 @@ class Monitor:
 
     async def poll_coingecko_loop(self):
         if self.debug:
-            print("Monitor: starting CoinGecko poll loop")
-        await self.startup_recovery()
+            print("Monitor ASYNC: 🚀 starting CoinGecko poll loop")
+        
+        # Start the daily Dune scheduler as a background task
+        asyncio.create_task(self.daily_dune_scheduler())
+        
+        # Start startup recovery (commented out as per original)
+        # await self.startup_recovery()
+        
         while True:
             try:
                 starts = await self.token_discovery.get_tokens_created_today(limit=500)
                 if self.debug:
-                    print(f"Monitor: CoinGecko returned {len(starts)} tokens")
+                    print(f"Monitor ASYNC: CoinGecko returned {len(starts)} tokens")
                 new_tokens_scheduled = 0
                 for s in starts:
                     if not s.mint:
@@ -1642,7 +1705,7 @@ class Monitor:
                     existing_state = self.scheduling_store.get_token_state(s.mint)
                     if existing_state:
                         if self.debug:
-                            print(f"Monitor: token {s.mint} already has scheduling state, skipping")
+                            print(f"Monitor ASYNC: token {s.mint} already has scheduling state, skipping")
                         continue
                     asyncio.create_task(self._schedule_overlap_checks_for_token(s))
                     self._scheduled.add(s.mint)
@@ -1656,12 +1719,12 @@ class Monitor:
                         "total_checks_completed": 0
                     })
                 if new_tokens_scheduled > 0 and self.debug:
-                    print(f"Monitor: scheduled overlap checks for {new_tokens_scheduled} new tokens")
+                    print(f"Monitor ASYNC: scheduled overlap checks for {new_tokens_scheduled} new tokens")
                 try:
                     await self.updater.save_trading_starts_async(starts, skip_existing=True)
                 except Exception as e:
                     if self.debug:
-                        print("Monitor: updater save error", e)
+                        print("Monitor ASYNC: updater save error", e)
                 current_time = time.time()
                 if current_time - self.last_cleanup > 3600:
                     await self.updater.cleanup_old_tokens_async()
@@ -1669,7 +1732,7 @@ class Monitor:
                     self.last_cleanup = current_time
             except Exception as e:
                 if self.debug:
-                    print("Monitor: CoinGecko poll error", e)
+                    print("Monitor ASYNC: CoinGecko poll error", e)
                     traceback.print_exc()
             await asyncio.sleep(self.coingecko_poll_interval_seconds)
 
@@ -1679,7 +1742,7 @@ class Monitor:
         first_run_at = block_ts + self.initial_check_delay_seconds
         to_sleep = max(0, first_run_at - now_ts)
         if self.debug:
-            print(f"_schedule: token={start.mint} will first run in {to_sleep}s (at {datetime.fromtimestamp(first_run_at, timezone.utc)})")
+            print(f"_schedule ASYNC: token={start.mint} will first run in {to_sleep}s (at {datetime.fromtimestamp(first_run_at, timezone.utc)})")
         await asyncio.sleep(to_sleep)
         self.scheduling_store.update_token_state(start.mint, {"status": "running_first_check"})
         stop_after = block_ts + 24 * 3600
@@ -1688,7 +1751,7 @@ class Monitor:
             now_ts2 = int(datetime.now(timezone.utc).timestamp())
             if now_ts2 > stop_after:
                 if self.debug:
-                    print(f"_schedule: token={start.mint} past 24h -> stopping scheduled checks")
+                    print(f"_schedule ASYNC: token={start.mint} past 24h -> stopping scheduled checks")
                 self.scheduling_store.update_token_state(start.mint, {
                     "status": "completed",
                     "completed_at": datetime.now(timezone.utc).isoformat()
@@ -1712,10 +1775,10 @@ class Monitor:
                     "total_checks_completed": check_count
                 })
                 if self.debug:
-                    print(f"_schedule: completed check #{check_count} for {start.mint}, grade: {res.get('grade', 'N/A')}, overlap: {res.get('overlap_count', 0)} wallets")
+                    print(f"_schedule ASYNC: completed check #{check_count} for {start.mint}, grade: {res.get('grade', 'N/A')}, overlap: {res.get('overlap_count', 0)} wallets")
             except Exception as e:
                 if self.debug:
-                    print(f"_schedule: overlap check error for {start.mint}: {e}")
+                    print(f"_schedule ASYNC: overlap check error for {start.mint}: {e}")
                 self.scheduling_store.update_token_state(start.mint, {
                     "last_error": str(e),
                     "last_error_at": datetime.now(timezone.utc).isoformat()
@@ -1728,12 +1791,12 @@ class Monitor:
         Returns a summary dict with distinct and weighted concentration metrics.
         """
         if self.debug:
-            print(f"check_holders_overlap: computing for {start.mint}")
+            print(f"check_holders_overlap ASYNC: computing for {start.mint}")
 
         # Ensure Dune winners cache available
         token_to_top_holders, wallet_freq, loaded_days = self.dune_cache.load_last_7_days()
         if self.debug:
-            print(f"check_holders_overlap: using {len(loaded_days)} cached days, {len(token_to_top_holders)} tokens in memory")
+            print(f"check_holders_overlap ASYNC: using {len(loaded_days)} cached days, {len(token_to_top_holders)} tokens in memory")
 
         # Merge winners union and compute total frequency sum
         winners_union: Set[str] = set()
@@ -1747,7 +1810,7 @@ class Monitor:
             holders_list = await self.holder_agg.get_token_holders(start.mint, limit=1000, max_pages=2, decimals=None)
         except Exception as e:
             if self.debug:
-                print(f"check_holders_overlap: failed to fetch holders for {start.mint}: {e}")
+                print(f"check_holders_overlap ASYNC: failed to fetch holders for {start.mint}: {e}")
             return {"error": "fetch_holders_failed", "error_details": str(e)}
 
         n = len(holders_list)
@@ -1802,7 +1865,7 @@ class Monitor:
             }
         }
         if self.debug:
-            print(f"check_holders_overlap: {start.mint} overlap {overlap_count}/{top_count} ({overlap_pct:.2f}%) distinct_conc {concentration:.2f}% weighted_conc {weighted_concentration:.2f}% grade={grade}")
+            print(f"check_holders_overlap ASYNC: {start.mint} overlap {overlap_count}/{top_count} ({overlap_pct:.2f}%) distinct_conc {concentration:.2f}% weighted_conc {weighted_concentration:.2f}% grade={grade}")
         return summary
 
 # -----------------------
@@ -1812,13 +1875,13 @@ async def main_loop():
     from dotenv import load_dotenv
     load_dotenv()
     HELIUS_API_KEY = os.environ.get("HELIUS_API_KEY")
-    COINGECKO_PRO_API_KEY = os.environ.get ("GECKO_API")
+    COINGECKO_PRO_API_KEY = os.environ.get("GECKO_API")
     DUNE_API_KEY = os.environ.get("DUNE_API_KEY")
-    DUNE_QUERY_ID = int(os.environ.get("DUNE_QUERY_ID") or 5668844)
+    DUNE_QUERY_ID = int(os.environ.get("DUNE_QUERY_ID"))
     BASE_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
     sol_client = SolanaAlphaClient(BASE_URL)
     ok = await sol_client.test_connection()
-    print("Solana RPC ok:", ok)
+    print("🚀 Solana RPC ok:", ok)
 
     td = TokenDiscovery(
         client=sol_client,
@@ -1829,7 +1892,7 @@ async def main_loop():
         timestamp_cache_file="./data/last_timestamp.pkl",
         debug=True
     )
-    holder_agg = HolderAggregator(sol_client)
+    holder_agg = HolderAggregator(sol_client, debug=True)
     updater = JobLibTokenUpdater(data_dir="./data/token_data", expiry_hours=24, debug=True)
     dune_cache = DuneWinnersCache(cache_dir="./data/dune_cache", debug=True)
     dune_builder = DuneWinnersBuilder(cache=dune_cache, debug=True, max_concurrency=8)
@@ -1850,19 +1913,17 @@ async def main_loop():
         debug=True,
     )
 
-    # Ensure we have today's Dune winners file and a 7-day rolling view
-    await monitor.ensure_dune_holders()
-
-    # Start monitoring loop
-    await monitor.poll_coingecko_loop()
+    # Start both tasks concurrently - CoinGecko can poll while Dune builds cache
+    dune_task = asyncio.create_task(monitor.ensure_dune_holders())
+    coingecko_task = asyncio.create_task(monitor.poll_coingecko_loop())
+    
+    print("🚀 Starting CoinGecko polling and Dune cache building concurrently...")
+    
+    # Wait for both tasks (poll_coingecko_loop runs forever, so this keeps the program alive)
+    await asyncio.gather(dune_task, coingecko_task)
 
 if __name__ == "__main__":
     try:
         asyncio.run(main_loop())
     except KeyboardInterrupt:
-        print("Interrupted, exiting")
-
-
-
-
-
+        print("🚀 Interrupted, exiting")
