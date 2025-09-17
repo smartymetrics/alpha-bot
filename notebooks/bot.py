@@ -455,8 +455,8 @@ def format_alert_html(
     current_mc, current_fdv, current_display = fetch_marketcap_and_fdv(mint)
 
     # Only include "was ..." if NOT the first alert (i.e., CHANGE alerts)
-    if alert_type == "CHANGE" and current_mc is not None and initial_mc is not None:
-        mc_line = f"💰 <b>Market Cap:</b> {format_marketcap_display(current_mc)} (was {format_marketcap_display(initial_mc)})"
+    if alert_type == "CHANGE" and current_mc is not None:
+        mc_line = f"💰 <b>Market Cap:</b> {format_marketcap_display(current_mc)} (was {format_marketcap_display(current_mc)})"
     elif alert_type == "CHANGE" and current_fdv is not None and initial_fdv is not None:
         mc_line = f"🏷️ <b>FDV:</b> {format_marketcap_display(current_fdv)} (was {format_marketcap_display(initial_fdv)})"
     else:
