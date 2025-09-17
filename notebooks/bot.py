@@ -495,7 +495,7 @@ def format_alert_html(
         f"<b>{name}</b> ({symbol})" if symbol else f"<b>{name}</b>",
         f"<b>Grade:</b> {grade}" + (f" (was {previous_grade})" if previous_grade and alert_type == "CHANGE" else ""),
         mc_line,
-        f"💧 <b>Liquidity:</b> {current_liquidity}" if current_liquidity else "💧 <b>Liquidity:</b> Unknown",
+        f"💧 <b>Liquidity:</b> {format_marketcap_display(current_liquidity)}" if current_liquidity else "💧 <b>Liquidity:</b> Unknown",
         # f"<b>Overlap:</b> {token_data.get('overlap_percentage')}%",
         f"<b>Concentration:</b> {token_data.get('concentration')}%"
     ]
