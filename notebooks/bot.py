@@ -176,36 +176,45 @@ async def daily_supabase_sync():
 def format_marketcap_display(value: Optional[float]) -> str:
     if value is None:
         return "N/A"
-    if value >= 1_000_000_000:
-        return f"${value/1_000_000_000:.2f}B"
-    elif value >= 1_000_000:
-        return f"${value/1_000_000:.2f}M"
-    elif value >= 1_000:
-        return f"${value/1_000:.0f}K"
+    if value >= 1e9:
+        return f"${value / 1e9:.2f}B"
+    elif value >= 1e6:
+        return f"${value / 1e6:.2f}M"
+    elif value >= 1e3:
+        return f"${value / 1e3:.2f}K"
     else:
-        return f"${value:,.0f}"
+        return f"${value:.2f}"
 
-def fetch_marketcap_and_fdv(mint: str) -> Tuple[Optional[float], Optional[float], str]:
+def fetch_marketcap_and_fdv(mint: str) -> Tuple[Optional[float], Optional[float], Optional[float]]:
     try:
         if not mint:
-            return None, None, "N/A"
+            return None, None, None
+
         url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
         resp = requests.get(url, timeout=10)
+
         if resp.status_code != 200:
-            return None, None, "N/A"
+            return None, None, None
+
         data = resp.json()
         pairs = data.get("pairs", [])
         if not pairs:
-            return None, None, "N/A"
-        mc = pairs[0].get("marketCap")
-        fdv = pairs[0].get("fdv")
-        liquidity = pairs[0].get("liquidity", {})
+            return None, None, None
+
+        pair = pairs[0]
+        mc = pair.get("marketCap")
+        fdv = pair.get("fdv")
+
+        # Safely extract liquidity
+        liquidity = pair.get("liquidity", {})
         lqd = liquidity.get("usd")
-        display = format_marketcap_display(mc if mc else fdv)
-        return mc, fdv, lqd
+        lqd_float = float(lqd) if lqd is not None else None
+
+        return mc, fdv, lqd_float
+
     except Exception as e:
         logging.error(f"Error fetching marketcap for {mint}: {e}")
-        return None, None, "N/A"
+        return None, None, None
 
 # ----------------------
 # User Manager
@@ -486,7 +495,7 @@ def format_alert_html(
         f"<b>{name}</b> ({symbol})" if symbol else f"<b>{name}</b>",
         f"<b>Grade:</b> {grade}" + (f" (was {previous_grade})" if previous_grade and alert_type == "CHANGE" else ""),
         mc_line,
-        f"💧 <b>Liquidity:</b> {format_marketcap_display(current_liquidity)}" if current_liquidity else "💧 <b>Liquidity:</b> Unknown",
+        f"💧 <b>Liquidity:</b> {current_liquidity}" if current_liquidity else "💧 <b>Liquidity:</b> Unknown",
         # f"<b>Overlap:</b> {token_data.get('overlap_percentage')}%",
         f"<b>Concentration:</b> {token_data.get('concentration')}%"
     ]
