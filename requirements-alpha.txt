@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+pydantic
+pandas
+numpy
+joblib
+aiohttp
+python-dotenv
+requests
+supabase

@@ -1,0 +1,27 @@
+{
+  "generated_at": "2025-09-20T14:49:21.424201+00:00",
+  "tokens": [
+    "Dubi7kzMAL1eawuDCMQhYNqmV9kBWYpHSvH9MtcRpump"
+  ],
+  "params": {
+    "early_trading_window_hours": 6,
+    "minimum_initial_buy_usd": 100.0,
+    "min_profitable_trades": 1
+  },
+  "records": [
+    {
+      "trader_id": "GHedWB5NTzsxYcQUCswRyssAgyyYzRdxx7piLWhX6VZh",
+      "overall_total_usd_spent": 14664.95184142728,
+      "overall_total_sales_revenue": 0.0,
+      "overall_realized_profit_usd": 0.0,
+      "overall_estimated_unrealised_pnl": 1245.9459263429087,
+      "overall_current_value_of_holdings_usd": 1832.5439999999999,
+      "overall_total_pnl": 1245.9459263429087,
+      "num_unique_tokens_traded": 1,
+      "num_tokens_in_profit": 1,
+      "ROI": 0.08496079222184788,
+      "win_rate": 1.0,
+      "number_of_trades": 1
+    }
+  ]
+}
