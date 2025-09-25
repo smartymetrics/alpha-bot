@@ -6,7 +6,7 @@ import datetime
 import os
 import json
 
-# If you want Supabase integration for history
+# Supabase integration for history
 from supabase import create_client, Client
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")

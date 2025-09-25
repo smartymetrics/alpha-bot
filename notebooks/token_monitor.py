@@ -575,17 +575,14 @@ class TokenDiscovery:
 # -----------------------
 class DuneWinnersCache:
     """
-    Rolling, per-day cache of Dune "winner" token holders.
-    Files are stored under: ./data/dune_cache/dune_cache_YYYYMMDD.pkl
-
-    load_last_7_days() returns:
-      token_to_top_holders: dict[str, list[str]]
-      wallet_freq: dict[str, int]  (how many times a wallet appeared across day/token slices)
-      fetched_days: list[str]      (YYYYMMDD loaded)
+    Rolling, per-day cache of Dune "winner" token holders with Supabase sync.
+    Files are stored locally under: ./data/dune_cache/dune_cache_YYYYMMDD.pkl
+    And synced to Supabase storage bucket in dune_cache/ folder.
     """
-    def __init__(self, cache_dir: str = "./data/dune_cache", debug: bool = False):
+    def __init__(self, cache_dir: str = "./data/dune_cache", debug: bool = False, supabase_bucket: str = "monitor-data"):
         self.cache_dir = cache_dir
         self.debug = debug
+        self.supabase_bucket = supabase_bucket
         os.makedirs(self.cache_dir, exist_ok=True)
 
     def _today_key(self) -> str:
@@ -595,28 +592,63 @@ class DuneWinnersCache:
         return os.path.join(self.cache_dir, f"dune_cache_{yyyymmdd}.pkl")
 
     def save_today(self, token_to_top_holders: Dict[str, List[str]]):
-        """Save today's token->holders snapshot to a per-day file."""
+        """Save today's token->holders snapshot to a per-day file and upload to Supabase."""
         y = self._today_key()
         obj = {
             "token_to_top_holders": _sanitize_maybe(token_to_top_holders),
             "saved_at": datetime.now(timezone.utc).isoformat(),
             "day": y,
         }
+        
+        local_path = self._path_for(y)
         try:
-            joblib.dump(obj, self._path_for(y))
+            joblib.dump(obj, local_path)
             if self.debug:
                 tot_wallets = len({w for v in token_to_top_holders.values() for w in v})
                 print(f"[DuneCache] saved {len(token_to_top_holders)} tokens, ~{tot_wallets} unique wallets for {y}")
+            
+            # Upload to Supabase dune_cache folder
+            try:
+                from supabase_utils import upload_dune_cache_file
+                upload_dune_cache_file(local_path, self.supabase_bucket)
+                if self.debug:
+                    print(f"[DuneCache] uploaded {y} to Supabase dune_cache folder")
+            except Exception as e:
+                if self.debug:
+                    print(f"[DuneCache] Supabase upload failed for {y}: {e}")
+                    
         except Exception as e:
             if self.debug:
                 print(f"[DuneCache] save_today failed: {e}")
 
+    def _download_from_supabase(self, yyyymmdd: str) -> bool:
+        """Download a cache file from Supabase dune_cache folder if it doesn't exist locally."""
+        local_path = self._path_for(yyyymmdd)
+        if os.path.exists(local_path):
+            return True
+            
+        try:
+            from supabase_utils import download_dune_cache_file
+            file_name = f"dune_cache_{yyyymmdd}.pkl"
+            success = download_dune_cache_file(local_path, file_name, self.supabase_bucket)
+            if success and self.debug:
+                print(f"[DuneCache] downloaded {yyyymmdd} from Supabase dune_cache folder")
+            return success
+        except Exception as e:
+            if self.debug:
+                print(f"[DuneCache] download from Supabase failed for {yyyymmdd}: {e}")
+            return False
+
     def load_last_7_days(self) -> Tuple[Dict[str, List[str]], Dict[str, int], List[str]]:
-        """Load and merge per-day files for the past 7 UTC dates. Deletes files older than 7 days."""
+        """Load and merge per-day files for the past 7 UTC dates. Downloads from Supabase if needed."""
         days = [(datetime.now(timezone.utc) - timedelta(days=i)).strftime("%Y%m%d") for i in range(7)]
         token_to_top_holders: Dict[str, List[str]] = {}
         wallet_freq: Dict[str, int] = defaultdict(int)
         loaded_days: List[str] = []
+
+        # Try to download missing files from Supabase first
+        for d in days:
+            self._download_from_supabase(d)
 
         # merge from oldest -> newest so newest day's holders can overwrite if needed
         for d in reversed(days):
@@ -636,25 +668,59 @@ class DuneWinnersCache:
                 if self.debug:
                     print(f"[DuneCache] failed to load {path}: {e}")
 
-        # cleanup older files
-        for fname in os.listdir(self.cache_dir):
-            if not fname.startswith("dune_cache_") or not fname.endswith(".pkl"):
-                continue
-            ymd = fname[len("dune_cache_"):-4]
-            if ymd not in days:
-                try:
-                    os.remove(os.path.join(self.cache_dir, fname))
-                    if self.debug:
-                        print(f"[DuneCache] removed old cache file {fname}")
-                except Exception as e:
-                    if self.debug:
-                        print(f"[DuneCache] cleanup failed for {fname}: {e}")
+        # cleanup older files (both local and Supabase)
+        self._cleanup_old_files(days)
 
         if self.debug:
             uniq_wallets = len(wallet_freq)
             print(f"[DuneCache] Loaded {len(loaded_days)} days: {len(token_to_top_holders)} tokens, {uniq_wallets} unique wallets")
 
         return token_to_top_holders, dict(wallet_freq), loaded_days
+
+    def _cleanup_old_files(self, keep_days: List[str]):
+        """Clean up old cache files locally and optionally from Supabase."""
+        # Local cleanup
+        try:
+            for fname in os.listdir(self.cache_dir):
+                if not fname.startswith("dune_cache_") or not fname.endswith(".pkl"):
+                    continue
+                ymd = fname[len("dune_cache_"):-4]
+                if ymd not in keep_days:
+                    try:
+                        os.remove(os.path.join(self.cache_dir, fname))
+                        if self.debug:
+                            print(f"[DuneCache] removed old local cache file {fname}")
+                    except Exception as e:
+                        if self.debug:
+                            print(f"[DuneCache] local cleanup failed for {fname}: {e}")
+        except Exception as e:
+            if self.debug:
+                print(f"[DuneCache] local cleanup scan failed: {e}")
+
+        # Note: Supabase cleanup could be implemented here if you have a list_files function
+        # For now, old Supabase files will remain but won't be downloaded
+
+    def sync_to_supabase(self):
+        """Manually sync all local cache files to Supabase dune_cache folder."""
+        try:
+            for fname in os.listdir(self.cache_dir):
+                if not fname.startswith("dune_cache_") or not fname.endswith(".pkl"):
+                    continue
+                    
+                local_path = os.path.join(self.cache_dir, fname)
+                
+                try:
+                    from supabase_utils import upload_dune_cache_file
+                    upload_dune_cache_file(local_path, self.supabase_bucket)
+                    if self.debug:
+                        print(f"[DuneCache] synced {fname} to Supabase dune_cache folder")
+                except Exception as e:
+                    if self.debug:
+                        print(f"[DuneCache] sync failed for {fname}: {e}")
+                        
+        except Exception as e:
+            if self.debug:
+                print(f"[DuneCache] sync_to_supabase failed: {e}")
 
 class DuneWinnersBuilder:
     """
@@ -1392,6 +1458,284 @@ class Monitor:
         self._scheduled: Set[str] = set()
         self.last_cleanup = 0
         self.last_dune_build = 0  # Track last Dune cache build time
+        # Probation / risky tokens (for GoPlus + Dexscreener gating)
+        self.pending_risky_tokens: Dict[str, Dict[str, Any]] = {}  # mint -> {first_seen, last_checked, attempts, reasons, overlap_result}
+        self._probation_tasks: Dict[str, asyncio.Task] = {}  # mint -> asyncio.Task
+        # HTTP session (shared)
+        self._http_session: Optional[aiohttp.ClientSession] = None
+        # concurrency guard for external API calls
+        self._api_sema = asyncio.Semaphore(8)
+
+    async def _get_http_session(self) -> aiohttp.ClientSession:
+        if not self._http_session or self._http_session.closed:
+            self._http_session = aiohttp.ClientSession()
+        return self._http_session
+
+    async def _close_http_session(self):
+        if self._http_session and not self._http_session.closed:
+            await self._http_session.close()
+
+    async def _run_goplus_check(self, mint: str) -> Dict[str, Any]:
+        url = f"https://api.gopluslabs.io/api/v1/solana/token_security?contract_addresses={mint}"
+        session = await self._get_http_session()
+        async with self._api_sema:
+            try:
+                async with session.get(url, timeout=15) as resp:
+                    if resp.status != 200:
+                        text = await resp.text()
+                        return {"ok": False, "error": f"goplus_status_{resp.status}", "error_text": text}
+                    data = await resp.json()
+            except Exception as e:
+                return {"ok": False, "error": "goplus_exception", "error_text": str(e)}
+
+        result = data.get("result", {}) or {}
+        entry = result.get(mint) or {}
+        authority_fields = [
+            "mintable", "freezable", "closable", "balance_mutable_authority",
+            "default_account_state_upgradable", "transfer_fee_upgradable", "transfer_hook_upgradable"
+        ]
+        hard_flags = []
+        for f in authority_fields:
+            fv = entry.get(f, {})
+            if isinstance(fv, dict) and fv.get("status") == "1":
+                hard_flags.append(f)
+        holders = entry.get("holders", []) or []
+        try:
+            holder_count = int(entry.get("holder_count") or len(holders) or 0)
+        except Exception:
+            holder_count = len(holders or [])
+        trusted_token = int(entry.get("trusted_token") or 0)
+        return {
+            "ok": True,
+            "hard_flags": hard_flags,
+            "holders": holders,
+            "holder_count": holder_count,
+            "trusted_token": trusted_token,
+            "raw": entry
+        }
+
+    async def _run_dexscreener_check(self, mint: str) -> Dict[str, Any]:
+        url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
+        session = await self._get_http_session()
+        async with self._api_sema:
+            try:
+                async with session.get(url, timeout=12) as resp:
+                    if resp.status != 200:
+                        text = await resp.text()
+                        return {"ok": False, "error": f"dexscreener_status_{resp.status}", "error_text": text}
+                    data = await resp.json()
+            except Exception as e:
+                return {"ok": False, "error": "dexscreener_exception", "error_text": str(e)}
+
+        pairs = data.get("pairs") or []
+        if not pairs:
+            return {"ok": True, "pair_exists": False, "liquidity_usd": 0.0, "raw": data}
+        p0 = pairs[0]
+        liquidity = p0.get("liquidity", {}).get("usd") or 0.0
+        try:
+            liquidity = float(liquidity)
+        except Exception:
+            liquidity = 0.0
+        return {"ok": True, "pair_exists": True, "liquidity_usd": liquidity, "raw": p0}
+
+    async def _start_or_update_probation(self, mint: str, start: Any, overlap_result: Dict[str, Any], reasons: List[str]):
+        now_iso = datetime.now(timezone.utc).isoformat()
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        if mint not in self.pending_risky_tokens:
+            self.pending_risky_tokens[mint] = {
+                "first_seen": now_iso,
+                "first_seen_ts": now_ts,
+                "last_checked": now_iso,
+                "attempts": 1,
+                "reasons": reasons.copy(),
+                "overlap_result": overlap_result
+            }
+        else:
+            entry = self.pending_risky_tokens[mint]
+            entry["last_checked"] = now_iso
+            entry["attempts"] = entry.get("attempts", 0) + 1
+            entry["reasons"] = list(dict.fromkeys(entry.get("reasons", []) + reasons))
+
+        # persist into scheduling store
+        try:
+            self.scheduling_store.update_token_state(mint, {
+                "status": "probation",
+                "probation_first_seen": self.pending_risky_tokens[mint]["first_seen"],
+                "probation_last_checked": self.pending_risky_tokens[mint]["last_checked"],
+                "probation_attempts": self.pending_risky_tokens[mint]["attempts"],
+                "probation_reasons": self.pending_risky_tokens[mint]["reasons"],
+                "launch_time": getattr(start, "block_time", int(datetime.now(timezone.utc).timestamp()))
+            })
+        except Exception:
+            # scheduling store might not be critical; continue
+            pass
+
+        # ensure a single probation task per mint
+        if mint in self._probation_tasks and not self._probation_tasks[mint].done():
+            if self.debug:
+                print(f"Probation: updated existing probation for {mint}; reasons={reasons}")
+            return
+
+        task = asyncio.create_task(self._probation_recheck_loop(mint, start))
+        self._probation_tasks[mint] = task
+        if self.debug:
+            print(f"Probation: started probation for {mint}; reasons={reasons}")
+
+    async def _probation_recheck_loop(self, mint: str, start: Any):
+        first_seen_ts = int(self.pending_risky_tokens.get(mint, {}).get("first_seen_ts", int(datetime.now(timezone.utc).timestamp())))
+        deadline = first_seen_ts + 24 * 3600
+        interval = 30 * 60  # 30 minutes
+
+        while True:
+            now_ts = int(datetime.now(timezone.utc).timestamp())
+            if now_ts >= deadline:
+                if self.debug:
+                    print(f"Probation: {mint} exceeded 24h probation -> dropping")
+                self.pending_risky_tokens.pop(mint, None)
+                try:
+                    self.scheduling_store.update_token_state(mint, {
+                        "status": "dropped",
+                        "dropped_at": datetime.now(timezone.utc).isoformat(),
+                        "probation_final": True
+                    })
+                except Exception:
+                    pass
+                break
+            # run a security-only check by calling the orchestrator but reuse overlap_result
+            try:
+                # prepare a minimal object for overlap store usage
+                obj = safe_load_overlap(self.overlap_store)
+                await self._security_gate_and_route(start, self.pending_risky_tokens[mint]["overlap_result"], obj)
+                if mint not in self.pending_risky_tokens:
+                    if self.debug:
+                        print(f"Probation: {mint} passed during probation -> exiting probation loop")
+                    break
+            except Exception as e:
+                if self.debug:
+                    print(f"Probation: error during recheck for {mint}: {e}")
+                entry = self.pending_risky_tokens.get(mint)
+                if entry:
+                    entry["last_checked"] = datetime.now(timezone.utc).isoformat()
+                    entry["attempts"] = entry.get("attempts", 0) + 1
+                    try:
+                        self.scheduling_store.update_token_state(mint, {
+                            "probation_last_checked": entry["last_checked"],
+                            "probation_attempts": entry["attempts"],
+                            "last_error": str(e),
+                        })
+                    except Exception:
+                        pass
+            await asyncio.sleep(interval)
+
+    async def _security_gate_and_route(self, start: Any, overlap_result: Dict[str, Any], overlap_store_obj: Dict[str, Any]):
+        mint = getattr(start, "mint", None) or (overlap_result or {}).get("mint")
+        grade = (overlap_result or {}).get("grade", "NONE")
+        if grade == "NONE":
+            overlap_store_obj.setdefault(mint, []).append({
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "result": overlap_result,
+                "security": "skipped_grade_none"
+            })
+            try:
+                self.overlap_store.save(overlap_store_obj)
+            except Exception:
+                pass
+            return
+
+        # Run GoPlus
+        g = await retry_with_backoff(self._run_goplus_check, mint, retries=2, base_delay=0.8)
+        reasons = []
+        if not g.get("ok"):
+            reasons.append(f"goplus_error:{g.get('error')}")
+            await self._start_or_update_probation(mint, start, overlap_result, reasons)
+            return
+
+        hard = g.get("hard_flags", []) or []
+        if hard:
+            reasons.append("goplus_hard_flags:" + ",".join(hard))
+            await self._start_or_update_probation(mint, start, overlap_result, reasons)
+            return
+
+        holders = g.get("holders", []) or []
+        top1_percent = 0.0
+        if holders:
+            pstr = holders[0].get("percent") if holders[0].get("percent") is not None else None
+            if pstr is not None:
+                try:
+                    p = float(str(pstr))
+                    if p <= 1.0:
+                        top1_percent = p * 100.0
+                    else:
+                        top1_percent = p
+                except Exception:
+                    top1_percent = 0.0
+        holder_count = int(g.get("holder_count", 0) or 0)
+
+        now = int(datetime.now(timezone.utc).timestamp())
+        launch_ts = int(getattr(start, "block_time", now) or now)
+        age_seconds = max(0, now - launch_ts)
+        age_h = age_seconds / 3600.0
+
+        def top1_threshold_pass(top1_pct, age_h):
+            if age_h < 4:
+                return top1_pct <= 70.0
+            if age_h < 8:
+                return top1_pct <= 60.0
+            if age_h < 16:
+                return top1_pct <= 50.0
+            return top1_pct <= 60.0
+
+        def holder_count_pass(count, age_h):
+            if age_h < 4:
+                return count >= 20
+            if age_h < 8:
+                return count >= 50
+            if age_h < 16:
+                return count >= 100
+            return count >= 200
+
+        if not top1_threshold_pass(top1_percent, age_h):
+            reasons.append(f"top1_pct:{top1_percent:.2f}")
+        if not holder_count_pass(holder_count, age_h):
+            reasons.append(f"holder_count:{holder_count}")
+
+        if reasons:
+            await self._start_or_update_probation(mint, start, overlap_result, reasons)
+            return
+
+        d = await retry_with_backoff(self._run_dexscreener_check, mint, retries=2, base_delay=0.8)
+        if not d.get("ok"):
+            reasons.append(f"dexscreener_error:{d.get('error')}")
+            await self._start_or_update_probation(mint, start, overlap_result, reasons)
+            return
+
+        if not d.get("pair_exists") or (float(d.get("liquidity_usd", 0.0)) < 5000.0):
+            reasons.append(f"liquidity_usd:{d.get('liquidity_usd',0.0)}")
+            await self._start_or_update_probation(mint, start, overlap_result, reasons)
+            return
+
+        # Passed all checks -> save
+        overlap_store_obj.setdefault(mint, []).append({
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "result": overlap_result,
+            "security": "passed",
+            "goplus": {"top1": top1_percent, "holder_count": holder_count},
+            "dexscreener": {"liquidity_usd": d.get("liquidity_usd")}
+        })
+        try:
+            self.overlap_store.save(overlap_store_obj)
+        except Exception:
+            pass
+        if mint in self.pending_risky_tokens:
+            self.pending_risky_tokens.pop(mint, None)
+        try:
+            self.scheduling_store.update_token_state(mint, {
+                "status": "completed",
+                "promoted_at": datetime.now(timezone.utc).isoformat(),
+                "security_passed": True
+            })
+        except Exception:
+            pass
 
     async def daily_dune_scheduler(self):
         """
@@ -1542,6 +1886,26 @@ class Monitor:
                     print(f"Recovery: scheduling repeat check for {token_mint} in {delay}s")
                 task = asyncio.create_task(self._schedule_repeat_check_only(token_mint, delay))
                 recovery_tasks.append(task)
+            elif status == "probation":
+                # recreate minimal TradingStart and rehydrate probation loop
+                try:
+                    from_dataclass = globals().get("TradingStart")
+                    start_obj = None
+                    if from_dataclass:
+                        start_obj = from_dataclass(mint=token_mint, block_time=state.get("launch_time"))
+                    else:
+                        # fallback minimal object
+                        class _S: pass
+                        start_obj = _S()
+                        start_obj.mint = token_mint
+                        start_obj.block_time = state.get("launch_time")
+                    if self.debug:
+                        print(f"Recovery: rehydrating probation for {token_mint}")
+                    task = asyncio.create_task(self._probation_recheck_loop(token_mint, start_obj))
+                    recovery_tasks.append(task)
+                except Exception:
+                    if self.debug:
+                        print(f"Recovery: failed to rehydrate probation for {token_mint}")
             self._scheduled.add(token_mint)
         if recovery_tasks:
             if self.debug:
@@ -1563,12 +1927,8 @@ class Monitor:
         try:
             res = await self.check_holders_overlap(token_start)
             obj = safe_load_overlap(self.overlap_store)
-            obj.setdefault(token_start.mint, []).append({
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "result": res,
-                "check_type": "first_check"
-            })
-            self.overlap_store.save(obj)
+            # Route through security gate; it will save if passed or start probation otherwise
+            await self._security_gate_and_route(token_start, res, obj)
             current_time = int(datetime.now(timezone.utc).timestamp())
             next_check = current_time + self.repeat_interval_seconds
             self.scheduling_store.update_token_state(token_mint, {
@@ -1761,12 +2121,8 @@ class Monitor:
                 res = await self.check_holders_overlap(start)
                 check_count += 1
                 obj = safe_load_overlap(self.overlap_store)
-                obj.setdefault(start.mint, []).append({
-                    "ts": datetime.now(timezone.utc).isoformat(),
-                    "result": res,
-                    "check_type": "first_check" if check_count == 1 else "repeat_check"
-                })
-                self.overlap_store.save(obj)
+                # Route through security gate; it will save if passed or start probation otherwise
+                await self._security_gate_and_route(start, res, obj)
                 next_check_time = now_ts2 + self.repeat_interval_seconds
                 self.scheduling_store.update_token_state(start.mint, {
                     "status": "active",

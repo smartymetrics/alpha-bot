@@ -4,6 +4,7 @@ supabase_utils.py
 Utility functions for uploading/downloading files to/from Supabase Storage.
 Uploads both .pkl and .json versions of overlap results.
 Overwrites existing files (no upsert).
+Updated to support folder paths for dune cache files.
 """
 
 import os
@@ -22,11 +23,10 @@ def get_supabase_client() -> Client:
     """Create and return a Supabase client. Raises if credentials are missing."""
     SUPABASE_URL = os.getenv("SUPABASE_URL")
     SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-    
+  
     if not SUPABASE_URL or not SUPABASE_KEY:
         raise RuntimeError("❌ Missing SUPABASE_URL or SUPABASE_KEY in environment variables")
     return create_client(SUPABASE_URL, SUPABASE_KEY)
-
 
 def prepare_json_from_pkl(pkl_path: str) -> bytes:
     """Load pickle, filter NONE grades, and drop oldest tokens until file <1.7 MB."""
@@ -64,16 +64,20 @@ def prepare_json_from_pkl(pkl_path: str) -> bytes:
     print(f"✅ Final JSON size: {len(json_bytes)/(1024*1024):.2f} MB, {len(pruned)} tokens kept")
     return json_bytes
 
-
-
-def upload_file(file_path: str, bucket: str = BUCKET_NAME):
-    """Upload a .pkl file and also generate/upload a .json version (cleaned)."""
+def upload_file(file_path: str, bucket: str = BUCKET_NAME, remote_path: str = None):
+    """Upload a file with optional custom remote path (supports folders)."""
     supabase = get_supabase_client()
-    file_name = os.path.basename(file_path)
+    
+    # Use custom remote path or default to just filename
+    if remote_path:
+        file_name = remote_path
+    else:
+        file_name = os.path.basename(file_path)
 
     # ✅ Delete old version of the file
     try:
         supabase.storage.from_(bucket).remove([file_name])
+        # Special handling for overlap results JSON
         if file_name == OVERLAP_FILE_NAME:
             supabase.storage.from_(bucket).remove([OVERLAP_JSON_NAME])
     except Exception:
@@ -85,8 +89,8 @@ def upload_file(file_path: str, bucket: str = BUCKET_NAME):
         supabase.storage.from_(bucket).upload(file_name, file_data)
     print(f"✅ Uploaded {file_name} ({len(file_data)/1024:.2f} KB) to bucket '{bucket}'")
 
-    # ✅ If it's overlap_results.pkl, also upload JSON
-    if file_name == OVERLAP_FILE_NAME:
+    # ✅ If it's overlap_results.pkl, also upload JSON (only for root level overlap files)
+    if os.path.basename(file_path) == OVERLAP_FILE_NAME and not remote_path:
         try:
             json_bytes = prepare_json_from_pkl(file_path)
             supabase.storage.from_(bucket).upload(
@@ -102,11 +106,20 @@ def download_file(save_path: str, file_name: str, bucket: str = BUCKET_NAME):
     try:
         supabase = get_supabase_client()
         res = supabase.storage.from_(bucket).download(file_name)
+        
+        # Ensure local directory exists
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        
         with open(save_path, "wb") as f:
             f.write(res)
         print(f"✅ Downloaded '{file_name}' from Supabase to '{save_path}'")
+        return True
     except Exception as e:
-        print(f"⚠️ Could not download '{file_name}': {e}")
+        # Suppress 404 errors for missing cache files (they're expected)
+        error_msg = str(e).lower()
+        if "404" not in error_msg and "not_found" not in error_msg and "not found" not in error_msg:
+            print(f"⚠️ Could not download '{file_name}': {e}")
+        return False
 
 
 def upload_overlap_results(file_path: str, bucket: str = BUCKET_NAME):
@@ -119,10 +132,24 @@ def download_overlap_results(save_path: str, bucket: str = BUCKET_NAME):
     download_file(save_path, OVERLAP_FILE_NAME, bucket)
 
 
+# New functions for dune cache management
+def upload_dune_cache_file(file_path: str, bucket: str = BUCKET_NAME):
+    """Upload a dune cache file to the dune_cache folder."""
+    filename = os.path.basename(file_path)
+    remote_path = f"dune_cache/{filename}"
+    upload_file(file_path, bucket, remote_path)
+
+
+def download_dune_cache_file(save_path: str, filename: str, bucket: str = BUCKET_NAME):
+    """Download a dune cache file from the dune_cache folder."""
+    remote_path = f"dune_cache/{filename}"
+    return download_file(save_path, remote_path, bucket)
+
+
 if __name__ == "__main__":
     # Example usage:
-    test_pkl_path = r"C:\Users\HP USER\Documents\Data Analyst\degen smart\data\overlap_results.pkl"  
-    upload_overlap_results(test_pkl_path)
+    test_pkl_path = r"C:\Users\HP USER\Documents\Data Analyst\degen smart\data\dune_cache\dune_cache_20250925.pkl"  
+    upload_dune_cache_file(test_pkl_path)
 
     download_path = "downloaded_overlap_results.pkl"
-    download_overlap_results(download_path)
+    # download_overlap_results(download_path)
