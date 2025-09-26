@@ -64,6 +64,7 @@ async def root():
         "uptime_start": service_status["started_at"]
     }
 
+@app.head("/health")
 @app.get("/health")
 async def health():
     """Health check endpoint for UptimeRobot"""
