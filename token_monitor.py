@@ -1500,8 +1500,8 @@ class Monitor:
         scheduling_store: SchedulingStore,
         *,
         coingecko_poll_interval_seconds: int = 30,
-        initial_check_delay_seconds: int = 2 * 3600,
-        repeat_interval_seconds: int = 6 * 3600,
+        initial_check_delay_seconds: int = 3600,
+        repeat_interval_seconds: int = 2 * 3600,
         debug: bool = False,
     ):
         self.sol_client = sol_client
@@ -1775,18 +1775,42 @@ class Monitor:
             await self._start_or_update_probation(mint, start, overlap_result, reasons)
             return
 
-        # Passed all checks -> save
-        overlap_store_obj.setdefault(mint, []).append({
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "result": overlap_result,
-            "security": "passed",
-            "goplus": {"top1": top1_percent, "holder_count": holder_count},
-            "dexscreener": {"liquidity_usd": d.get("liquidity_usd")}
-        })
+        # ✅ Token passed all security checks - get fresh overlap before saving
+        try:
+            if self.debug:
+                print(f"Security passed for {mint}, getting fresh overlap analysis...")
+            fresh_overlap_result = await self.check_holders_overlap(start)
+            
+            overlap_store_obj.setdefault(mint, []).append({
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "result": fresh_overlap_result,  # Use fresh result instead of old one
+                "security": "passed",
+                "goplus": {"top1": top1_percent, "holder_count": holder_count},
+                "dexscreener": {"liquidity_usd": d.get("liquidity_usd")}
+            })
+            
+            if self.debug:
+                old_grade = overlap_result.get("grade", "NONE")
+                new_grade = fresh_overlap_result.get("grade", "NONE")
+                print(f"Grade update for {mint}: {old_grade} -> {new_grade}")
+                
+        except Exception as e:
+            if self.debug:
+                print(f"Fresh overlap check failed for {mint}, using original: {e}")
+            # Fallback to original overlap result if fresh check fails
+            overlap_store_obj.setdefault(mint, []).append({
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "result": overlap_result,
+                "security": "passed",
+                "goplus": {"top1": top1_percent, "holder_count": holder_count},
+                "dexscreener": {"liquidity_usd": d.get("liquidity_usd")}
+            })
+
         try:
             self.overlap_store.save(overlap_store_obj)
         except Exception:
             pass
+        
         if mint in self.pending_risky_tokens:
             self.pending_risky_tokens.pop(mint, None)
         try:
