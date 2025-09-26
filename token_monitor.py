@@ -23,8 +23,50 @@ import json
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
+from collections import defaultdict
+import pandas as pd
+import traceback
+import math
+from supabase_utils import upload_overlap_results
+from supabase_utils import upload_file
+import threading
+from dotenv import load_dotenv
 
 import random
+
+from typing import List, Set
+
+load_dotenv()
+
+COINGECKO_PRO_API_KEY = os.environ.get("GECKO_API")
+DUNE_API_KEY = os.environ.get("DUNE_API_KEY")
+DUNE_QUERY_ID = int(os.environ.get("DUNE_QUERY_ID"))
+
+def _load_keys_list(env_name: str) -> List[str]:
+    """Load comma-separated API keys from environment variable"""
+    value = os.getenv(env_name, "")
+    if not value:
+        return []
+    return [k.strip() for k in value.split(",") if k.strip()]
+
+# Load Helius keys
+HELIUS_KEYS = _load_keys_list("HELIUS_API_KEY")
+if not HELIUS_KEYS:
+    raise RuntimeError("No Helius API keys found in HELIUS_KEYS or HELIUS_API_KEY")
+
+_helius_idx = 0
+_bad_helius_keys: Set[str] = set()
+
+def _next_helius_key() -> str:
+    """Round-robin through valid Helius keys"""
+    global _helius_idx
+    valid = [k for k in HELIUS_KEYS if k not in _bad_helius_keys]
+    if not valid:
+        _bad_helius_keys.clear()  # Reset if all keys exhausted
+        valid = HELIUS_KEYS
+    key = valid[_helius_idx % len(valid)]
+    _helius_idx += 1
+    return key
 
 async def retry_with_backoff(func, *args, retries: int = 5, base_delay: float = 0.5, **kwargs):
     """Retry an async function with exponential backoff and jitter."""
@@ -36,14 +78,6 @@ async def retry_with_backoff(func, *args, retries: int = 5, base_delay: float = 
             print(f"[Retry] {func.__name__} failed (attempt {attempt}/{retries}): {e}. Retrying in {wait:.2f}s")
             await asyncio.sleep(wait)
     raise RuntimeError(f"{func.__name__} failed after {retries} retries")
-
-from collections import defaultdict
-import pandas as pd
-import traceback
-import math
-from supabase_utils import upload_overlap_results
-from supabase_utils import upload_file
-import threading
 
 # NOTE: keep dune_client import guarded
 try:
@@ -88,19 +122,46 @@ def _sanitize_maybe(obj: Any) -> Any:
 # Solana RPC client
 # -----------------------
 class SolanaAlphaClient:
-    def __init__(self, rpc_url: str):
-        self.rpc_url = rpc_url
+    def __init__(self):
         self.headers = {"Content-Type": "application/json"}
+
+    def _get_url(self):
+        """Get URL with next available key"""
+        key = _next_helius_key()
+        return f"https://mainnet.helius-rpc.com/?api-key={key}"
 
     async def make_rpc_call(self, method: str, params: List[Any]) -> Dict[str, Any]:
         payload = {"jsonrpc": "2.0", "id": "1", "method": method, "params": params}
-        async with aiohttp.ClientSession() as session:
-            try:
-                async with session.post(self.rpc_url, json=payload, headers=self.headers, timeout=40) as resp:
-                    resp.raise_for_status()
-                    return await resp.json()
-            except Exception as e:
-                return {"error": str(e)}
+        
+        max_attempts = min(len(HELIUS_KEYS) * 2, 10)
+        
+        for attempt in range(max_attempts):
+            url = self._get_url()
+            async with aiohttp.ClientSession() as session:
+                try:
+                    async with session.post(url, json=payload, headers=self.headers, timeout=40) as resp:
+                        if resp.status == 429:
+                            print(f"[Helius] Rate limited, rotating key (attempt {attempt+1})")
+                            await asyncio.sleep(1)
+                            continue
+                        if resp.status == 401:
+                            current_key = url.split("api-key=")[-1]
+                            _bad_helius_keys.add(current_key)
+                            print(f"[Helius] Key unauthorized, blacklisting and rotating")
+                            continue
+                        resp.raise_for_status()
+                        return await resp.json()
+                except asyncio.TimeoutError:
+                    print(f"[Helius] Timeout on attempt {attempt+1}, rotating key")
+                    await asyncio.sleep(0.5)
+                    continue
+                except Exception as e:
+                    if attempt < max_attempts - 1:
+                        await asyncio.sleep(0.5)
+                        continue
+                    return {"error": str(e)}
+        
+        return {"error": "All Helius keys exhausted or rate limited"}
 
     async def test_connection(self) -> bool:
         r = await self.make_rpc_call("getHealth", [])
@@ -2228,14 +2289,7 @@ class Monitor:
 # Main loop wiring
 # -----------------------
 async def main_loop():
-    from dotenv import load_dotenv
-    load_dotenv()
-    HELIUS_API_KEY = os.environ.get("HELIUS_API_KEY")
-    COINGECKO_PRO_API_KEY = os.environ.get("GECKO_API")
-    DUNE_API_KEY = os.environ.get("DUNE_API_KEY")
-    DUNE_QUERY_ID = int(os.environ.get("DUNE_QUERY_ID"))
-    BASE_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
-    sol_client = SolanaAlphaClient(BASE_URL)
+    sol_client = SolanaAlphaClient()
     ok = await sol_client.test_connection()
     print("🚀 Solana RPC ok:", ok)
 
