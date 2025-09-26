@@ -1500,8 +1500,8 @@ class Monitor:
         scheduling_store: SchedulingStore,
         *,
         coingecko_poll_interval_seconds: int = 30,
-        initial_check_delay_seconds: int = 3600,
-        repeat_interval_seconds: int = 2 * 3600,
+        initial_check_delay_seconds: int = 3600, # Adjusted to 1 hour
+        repeat_interval_seconds: int = 7200, # Adjusted to 2 hours
         debug: bool = False,
     ):
         self.sol_client = sol_client
@@ -1765,6 +1765,14 @@ class Monitor:
             return
 
         d = await retry_with_backoff(self._run_dexscreener_check, mint, retries=2, base_delay=0.8)
+        
+        current_price_usd = None
+        if d.get("ok") and d.get("pair_exists"):
+            try:
+                current_price_usd = float(d.get("raw", {}).get("priceUsd", 0.0))
+            except (ValueError, TypeError):
+                current_price_usd = 0.0
+
         if not d.get("ok"):
             reasons.append(f"dexscreener_error:{d.get('error')}")
             await self._start_or_update_probation(mint, start, overlap_result, reasons)
@@ -1786,7 +1794,7 @@ class Monitor:
                 "result": fresh_overlap_result,  # Use fresh result instead of old one
                 "security": "passed",
                 "goplus": {"top1": top1_percent, "holder_count": holder_count},
-                "dexscreener": {"liquidity_usd": d.get("liquidity_usd")}
+                "dexscreener": {"liquidity_usd": d.get("liquidity_usd"), "current_price_usd": current_price_usd}
             })
             
             if self.debug:
@@ -1803,7 +1811,7 @@ class Monitor:
                 "result": overlap_result,
                 "security": "passed",
                 "goplus": {"top1": top1_percent, "holder_count": holder_count},
-                "dexscreener": {"liquidity_usd": d.get("liquidity_usd")}
+                "dexscreener": {"liquidity_usd": d.get("liquidity_usd"), "current_price_usd": current_price_usd}
             })
 
         try:
@@ -2342,8 +2350,8 @@ async def main_loop():
         overlap_store=overlap_store,
         scheduling_store=scheduling_store,
         coingecko_poll_interval_seconds=30,
-        initial_check_delay_seconds=2 * 3600,
-        repeat_interval_seconds=6 * 3600,
+        initial_check_delay_seconds=1 * 3600, # Adjusted
+        repeat_interval_seconds=2 * 3600, # Adjusted
         debug=True,
     )
 
@@ -2361,3 +2369,4 @@ if __name__ == "__main__":
         asyncio.run(main_loop())
     except KeyboardInterrupt:
         print("🚀 Interrupted, exiting")
+
