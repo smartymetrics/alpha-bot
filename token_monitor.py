@@ -1325,8 +1325,6 @@ def prune_old_overlap_entries(data: dict, expiry_hours: int = 24) -> dict:
 
     return pruned
 
-
-
 class OverlapStore:
     def __init__(self, filepath: str = "./data/overlap_results.pkl", debug: bool = False):
         self.filepath = filepath
@@ -1348,16 +1346,20 @@ class OverlapStore:
     def save(self, obj: Dict[str, Any], expiry_hours: int = 24):
         """
         Save overlap results to disk and periodically upload to Supabase.
-        Robustly normalizes incoming 'obj' (handles DataFrame-like shapes) before pruning.
+        Always filters NONE grades before uploading.
         """
         now = time.time()
         with self._lock:  # ensure only one thread saves at a time
             try:
                 # Normalize input into mapping mint -> list[entries]
                 try:
-                    normalized = safe_load_overlap(obj) if not isinstance(obj, dict) or any(not isinstance(v, list) for v in obj.values()) else obj
+                    normalized = (
+                        safe_load_overlap(obj)
+                        if not isinstance(obj, dict) or any(not isinstance(v, list) for v in obj.values())
+                        else obj
+                    )
                 except Exception:
-                    # Fallback: attempt to coerce using safe_load_overlap by wrapping obj
+                    # Fallback: attempt to coerce using safe_load_overlap
                     normalized = safe_load_overlap(obj)
 
                 # prune old entries before saving (safe, fail-open)
@@ -1372,23 +1374,20 @@ class OverlapStore:
                         print("OverlapStore: save throttled (recent upload). Local save completed.")
                     return
 
-                # Prefer specialized uploader if available
-                try:
-                    # upload_overlap_results expects (local_path, bucket) in supabase_utils if implemented
-                    upload_overlap_results(self.filepath, BUCKET_NAME)
-                except Exception:
-                    # Fallback generic upload
-                    upload_file(self.filepath, BUCKET_NAME)
+                # Use specialized uploader (will skip if only NONE grades)
+                success = upload_overlap_results(self.filepath, BUCKET_NAME, debug=self.debug)
 
-                self._last_upload = now
-
-                if self.debug:
-                    print(f"OverlapStore: saved and uploaded at {time.ctime(now)}")
+                if success:
+                    self._last_upload = now
+                    if self.debug:
+                        print(f"OverlapStore: saved and uploaded at {time.ctime(now)}")
+                else:
+                    if self.debug:
+                        print("OverlapStore: upload skipped (empty or NONE-only data)")
 
             except Exception as e:
                 if self.debug:
                     print("OverlapStore: save failed", e)
-
 
 class SchedulingStore:
     def __init__(self, filepath: str = "./data/scheduling_state.pkl", debug: bool = False):
