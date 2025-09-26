@@ -1240,32 +1240,92 @@ class DuneHolderCache:
 # Overlap & scheduling stores
 # -----------------------
 
+
 def prune_old_overlap_entries(data: dict, expiry_hours: int = 24) -> dict:
     """
-    Removes individual overlap check entries older than expiry_hours.
-    Keeps tokens if they have at least one recent check.
+    Robust pruning of overlap entries.
+    - Accepts several input shapes (mapping mint->list, DataFrame-like dicts, lists).
+    - Treats entries without a parsable timestamp as recent (keeps them).
+    - Supports ts as ISO string, numeric epoch seconds, or datetime.
     """
+    if not data:
+        return {}
     cutoff = datetime.now(timezone.utc) - timedelta(hours=expiry_hours)
     pruned = {}
 
-    for mint, entries in data.items():
+    for mint, entries in (data or {}).items():
+        # Normalize entries into a list of dicts
+        if isinstance(entries, dict):
+            # Possibly DataFrame-orient='list' mapping: convert to list of rows
+            lists = entries
+            try:
+                # determine max length among lists
+                lengths = [len(v) for v in lists.values() if isinstance(v, (list, tuple))]
+                length = max(lengths) if lengths else 0
+                rows = []
+                for i in range(length):
+                    row = {}
+                    for k, v in lists.items():
+                        try:
+                            row[k] = v[i]
+                        except Exception:
+                            row[k] = None
+                    rows.append(row)
+                entries = rows
+            except Exception:
+                # Fallback: wrap the dict as single entry
+                entries = [entries]
+        elif not isinstance(entries, list):
+            # Unknown shape -> wrap
+            entries = [entries]
+
         new_entries = []
         for entry in entries:
-            ts_str = entry.get("ts")
-            try:
-                ts = datetime.fromisoformat(ts_str)
-                if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=timezone.utc)
-            except Exception:
-                ts = None
+            ts_val = None
+            if isinstance(entry, dict):
+                # prefer 'ts' but accept several common names
+                ts_val = entry.get("ts") or entry.get("timestamp") or entry.get("saved_at") or entry.get("fetched_at") or entry.get("created_at")
+            else:
+                ts_val = entry
 
-            if ts and ts > cutoff:
+            # If no timestamp available, keep the entry (safer)
+            if ts_val is None:
+                new_entries.append(entry)
+                continue
+
+            try:
+                if isinstance(ts_val, (int, float)):
+                    ts = datetime.fromtimestamp(int(ts_val), tz=timezone.utc)
+                elif isinstance(ts_val, datetime):
+                    ts = ts_val
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=timezone.utc)
+                elif isinstance(ts_val, str):
+                    # try ISO parse; support both 'Z' and offset forms
+                    s = ts_val
+                    if s.endswith("Z"):
+                        s = s.replace("Z", "+00:00")
+                    ts = datetime.fromisoformat(s)
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=timezone.utc)
+                else:
+                    # Unknown type -> keep entry
+                    new_entries.append(entry)
+                    continue
+
+                # Keep entry if it's newer than cutoff
+                if ts and ts > cutoff:
+                    new_entries.append(entry)
+            except Exception:
+                # Parsing failed -> keep entry (fail-open)
                 new_entries.append(entry)
 
         if new_entries:
             pruned[mint] = new_entries
 
     return pruned
+
+
 
 class OverlapStore:
     def __init__(self, filepath: str = "./data/overlap_results.pkl", debug: bool = False):
@@ -1285,22 +1345,41 @@ class OverlapStore:
                     print("OverlapStore: load failed", e)
         return {}
 
-    def save(self, obj: Dict[str, Any]):
-        """Save overlap results to disk and periodically upload to Supabase."""
+    def save(self, obj: Dict[str, Any], expiry_hours: int = 24):
+        """
+        Save overlap results to disk and periodically upload to Supabase.
+        Robustly normalizes incoming 'obj' (handles DataFrame-like shapes) before pruning.
+        """
         now = time.time()
         with self._lock:  # ensure only one thread saves at a time
             try:
-                # prune old entries before saving
-                obj = prune_old_overlap_entries(obj, expiry_hours=24)
+                # Normalize input into mapping mint -> list[entries]
+                try:
+                    normalized = safe_load_overlap(obj) if not isinstance(obj, dict) or any(not isinstance(v, list) for v in obj.values()) else obj
+                except Exception:
+                    # Fallback: attempt to coerce using safe_load_overlap by wrapping obj
+                    normalized = safe_load_overlap(obj)
 
-                # always save locally
-                joblib.dump(_sanitize_maybe(obj), self.filepath)
+                # prune old entries before saving (safe, fail-open)
+                pruned = prune_old_overlap_entries(normalized, expiry_hours=expiry_hours)
+
+                # Always save the pruned, normalized object locally
+                joblib.dump(_sanitize_maybe(pruned), self.filepath)
 
                 # throttle uploads to Supabase (once every 2 minutes)
                 if now - self._last_upload < 120:
+                    if self.debug:
+                        print("OverlapStore: save throttled (recent upload). Local save completed.")
                     return
 
-                upload_file(self.filepath, BUCKET_NAME)
+                # Prefer specialized uploader if available
+                try:
+                    # upload_overlap_results expects (local_path, bucket) in supabase_utils if implemented
+                    upload_overlap_results(self.filepath, BUCKET_NAME)
+                except Exception:
+                    # Fallback generic upload
+                    upload_file(self.filepath, BUCKET_NAME)
+
                 self._last_upload = now
 
                 if self.debug:
@@ -1309,6 +1388,7 @@ class OverlapStore:
             except Exception as e:
                 if self.debug:
                     print("OverlapStore: save failed", e)
+
 
 class SchedulingStore:
     def __init__(self, filepath: str = "./data/scheduling_state.pkl", debug: bool = False):
@@ -1359,16 +1439,78 @@ class SchedulingStore:
                 print(f"SchedulingStore: cleaned {removed_count} old scheduling states")
         return removed_count
 
+
 def safe_load_overlap(overlap_store):
-    obj = overlap_store.load()
-    if obj is None:
+    """
+    Load and normalize overlap store contents into a mapping: mint -> list[entries].
+    Handles:
+      - joblib-saved dict mapping mint->list[dict]
+      - DataFrame objects
+      - DataFrame-like dicts (orient='list')
+      - Unexpected shapes (attempts best-effort normalization)
+    """
+    obj = overlap_store.load() if hasattr(overlap_store, "load") else overlap_store
+    if not obj:
         return {}
+    # If it's a DataFrame, convert to records then group by mint
     if isinstance(obj, pd.DataFrame):
-        # Convert DataFrame to a dict with token_mint as keys
-        return obj.to_dict(orient="list")
-    if not isinstance(obj, dict):
-        return {}
-    return obj
+        try:
+            rows = obj.to_dict(orient="records")
+        except Exception:
+            rows = []
+        mapping = {}
+        for r in rows:
+            mint = r.get("mint") or r.get("token") or r.get("token_mint") or "_unknown"
+            mapping.setdefault(mint, []).append(r)
+        return mapping
+
+    # If it's already a mapping mint -> list[dict], validate and return
+    if isinstance(obj, dict):
+        # Quick check: are values lists of dicts?
+        is_good = True
+        for v in obj.values():
+            if not isinstance(v, list):
+                is_good = False
+                break
+            if v and not isinstance(v[0], dict):
+                # Could still be DataFrame-like (orient='list')
+                is_good = False
+                break
+        if is_good:
+            return obj
+
+        # If it's a dict of column lists (DataFrame orient='list'), rebuild rows then group
+        list_lengths = [len(v) for v in obj.values() if isinstance(v, (list, tuple))]
+        if list_lengths:
+            length = max(list_lengths)
+            keys = list(obj.keys())
+            rows = []
+            for i in range(length):
+                row = {}
+                for k in keys:
+                    try:
+                        row[k] = obj[k][i]
+                    except Exception:
+                        row[k] = None
+                rows.append(row)
+            mapping = {}
+            for r in rows:
+                mint = r.get("mint") or r.get("token") or r.get("token_mint") or "_unknown"
+                mapping.setdefault(mint, []).append(r)
+            return mapping
+
+    # If none of the above worked, try to coerce a sensible mapping:
+    # - if it's a list: assume each item has 'mint'
+    if isinstance(obj, list):
+        mapping = {}
+        for item in obj:
+            if isinstance(item, dict):
+                mint = item.get("mint") or item.get("token") or item.get("token_mint") or "_unknown"
+                mapping.setdefault(mint, []).append(item)
+        return mapping
+
+    return {}
+
 
 # -----------------------
 # Grading logic
