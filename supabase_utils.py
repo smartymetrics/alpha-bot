@@ -234,6 +234,7 @@ def upload_overlap_results(file_path: str, bucket: str = BUCKET_NAME, debug: boo
     # Upload JSON
     try:
         supabase = get_supabase_client()
+        supabase.storage.from_(bucket).remove([OVERLAP_JSON_NAME])  # 🔥 delete old JSON first
         supabase.storage.from_(bucket).upload(
             OVERLAP_JSON_NAME, json_bytes, {"content-type": "application/json"}
         )
