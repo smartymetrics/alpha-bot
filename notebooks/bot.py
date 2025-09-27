@@ -721,14 +721,25 @@ async def background_loop(app: Application):
         try:
             tokens = load_latest_tokens_from_overlap()
 
+            # ✅ Define start-of-today UTC
+            today = datetime.utcnow().date()
+
+            # ✅ Filter only today's tokens
+            fresh_tokens = {
+                tid: t for tid, t in tokens.items()
+                if t.get("checked_at") and datetime.fromisoformat(
+                    t["checked_at"].rstrip("Z")
+                ).date() >= today
+            }
+
             if first_run:
-                logging.info("DEBUG: Loaded %d tokens from overlap_results.pkl", len(tokens))
-                sample_items = list(tokens.items())[:3]
+                logging.info("DEBUG: Loaded %d tokens (today only: %d)", len(tokens), len(fresh_tokens))
+                sample_items = list(fresh_tokens.items())[:3]
                 for tid, info in sample_items:
                     logging.info("DEBUG sample token: %s grade=%s checked_at=%s", tid, info.get("grade"), info.get("checked_at"))
                 first_run = False
 
-            for token_id, token in tokens.items():
+            for token_id, token in fresh_tokens.items():
                 grade = token.get("grade")
                 if not grade:
                     continue  # Skip tokens with no grade
@@ -1064,26 +1075,20 @@ async def on_startup(app: Application):
         if DOWNLOAD_OVERLAP_ON_STARTUP and download_overlap_results is not None:
             try:
                 download_overlap_results(str(OVERLAP_FILE), bucket=BUCKET_NAME)
-                logging.info("Downloaded overlap_results.pkl at startup (opt-in).")
+                logging.info("✅ Downloaded overlap_results.pkl at startup (opt-in).")
             except Exception as e:
                 logging.debug("Startup overlap download failed: %s", e)
 
-    # Start background loop (no supabase I/O in the loop)
-    try:
-        app.create_task(background_loop(app))
-        app.create_task(monthly_expiry_notifier(app))
-    except Exception:
-        asyncio.create_task(background_loop(app))
+    # ✅ Start background loops with asyncio.create_task (no PTB warnings)
+    asyncio.create_task(background_loop(app))
+    asyncio.create_task(monthly_expiry_notifier(app))
 
-    # Start daily supabase sync task only if both USE_SUPABASE and SUPABASE_DAILY_SYNC are true
+    # ✅ Start daily supabase sync & overlap refresh if enabled
     if USE_SUPABASE and SUPABASE_DAILY_SYNC:
-        try:
-            app.create_task(daily_supabase_sync())
-            app.create_task(periodic_overlap_download())
-        except Exception:
-            asyncio.create_task(daily_supabase_sync())
+        asyncio.create_task(daily_supabase_sync())
+        asyncio.create_task(periodic_overlap_download())
 
-    logging.info("Bot startup complete. Monitoring for token alerts...")
+    logging.info("🚀 Bot startup complete. Monitoring for token alerts...")
 
 async def adduser_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin command: add a user with expiry in days."""
