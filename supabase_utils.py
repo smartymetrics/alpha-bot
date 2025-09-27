@@ -26,7 +26,7 @@ MAX_SIZE_MB = 1.7
 def get_supabase_client() -> Client:
     """Create and return a Supabase client. Uses env vars with local fallback."""
     SUPABASE_URL = os.getenv("SUPABASE_URL", "https://ldraroaloinsesjoayxc.supabase.co")
-    SUPABASE_KEY = os.getenv("SUPABASE_KEY", "your-local-dev-key-here")
+    SUPABASE_KEY = os.getenv("SUPABASE_KEY", "SUPABASE_KEY")
 
     if not SUPABASE_URL or not SUPABASE_KEY:
         raise RuntimeError("❌ Missing SUPABASE_URL or SUPABASE_KEY in environment variables")
@@ -291,6 +291,6 @@ def download_dune_cache_file(save_path: str, filename: str, bucket: str = BUCKET
 # Script Runner
 # -------------------
 if __name__ == "__main__":
-    test_pkl_path = "./overlap_results.pkl"
+    test_pkl_path = r"C:\Users\HP USER\Documents\Data Analyst\degen smart\overlap_results (3).pkl"
     upload_overlap_results(test_pkl_path)
     download_overlap_results("./downloaded_overlap_results.pkl")

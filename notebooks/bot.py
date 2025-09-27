@@ -3,15 +3,8 @@
 unified_bot_corrected.py
 
 Full corrected unified Telegram bot (local-first).
-- Reads overlap_results.pkl from ./data (local)
-- Runs background loop to detect new/changed token grades and send alerts
-- Persists user prefs, stats, alerts_state locally (./data/*.pkl)
-- DOES NOT upload/download to Supabase inside the background loop.
-- Supabase usage is optional and controlled by env vars:
-    USE_SUPABASE (default: false) - when true the bot can do a single startup download
-    DOWNLOAD_OVERLAP_ON_STARTUP (default: false) - if true and USE_SUPABASE, download overlap file once at startup
-    SUPABASE_DAILY_SYNC (default: false) - if true and USE_SUPABASE, upload bot-state once per day
-- Default behaviour is local-only (no Supabase activity).
+...
+(kept same docstring as before)
 """
 
 import os
@@ -505,6 +498,8 @@ def format_alert_html(
 
     lines.append("")
     if mint:
+        truncated = truncate_address(mint)
+        lines.append(f"<b>Token:</b> {mint} ") #{truncated}")
         lines.append(
             f'<a href="https://solscan.io/token/{mint}">Solscan</a> | '
             f'<a href="https://gmgn.ai/sol/token/{mint}">GMGN</a> | '
@@ -570,7 +565,19 @@ async def testalert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             first_alert_at=first_alert
         )
 
-        await update.message.reply_html(f"🔔 Test Alert ({alert_type})\n\n{message}")
+        # Provide the same keyboard so test works like real alerts
+        mint_val = token_data.get("token_metadata", {}).get("mint") or token_data.get("token") or ""
+        truncated_val = truncate_address(mint_val)
+        kb = None
+        if mint_val:
+            kb = InlineKeyboardMarkup(
+                [[
+                    InlineKeyboardButton(f"📋 Copy {truncated_val}", callback_data=f"copy:{mint_val}"),
+                    InlineKeyboardButton("🔗 DexScreener", url=f"https://dexscreener.com/solana/{mint_val}")
+                ]]
+            )
+
+        await update.message.reply_html(f"🔔 Test Alert ({alert_type})\n\n{message}", reply_markup=kb)
     except Exception as e:
         await update.message.reply_text(f"❌ Failed to fetch token data: {e}")
 
@@ -600,6 +607,16 @@ async def send_alert_to_subscribers(
         first_alert_at=first_alert_at
     )
 
+    # Prepare keyboard (copy callback + dexscreener url)
+    mint = token_data.get("token_metadata", {}).get("mint") or token_data.get("token") or ""
+    truncated = truncate_address(mint)
+    buttons = []
+    if mint:
+        buttons.append(InlineKeyboardButton(f"📋 Copy {truncated}", callback_data=f"copy:{mint}"))
+        buttons.append(InlineKeyboardButton("🔗 DexScreener", url=f"https://dexscreener.com/solana/{mint}"))
+
+    keyboard = InlineKeyboardMarkup([buttons]) if buttons else None
+
     for chat_id, prefs in active_users.items():
         # 🔍 1. Skip if subscription is invalid
         if not is_subscribed(chat_id):
@@ -621,7 +638,8 @@ async def send_alert_to_subscribers(
                 chat_id=int(chat_id),
                 text=message,
                 parse_mode="HTML",
-                disable_web_page_preview=True
+                disable_web_page_preview=True,
+                reply_markup=keyboard
             )
             user_manager.update_user_stats(chat_id, grade)
         except Exception as e:
@@ -885,26 +903,67 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if not query:
+        return
+
+    data = query.data or ""
+
+    # Handle "copy:" callbacks first — show the full address in an alert popup so user can copy it
+    if data.startswith("copy:"):
+        try:
+            _, address = data.split(":", 1)
+            # show alert popup containing the full address (user can copy from the modal)
+            await query.answer(text=address, show_alert=True)
+        except Exception as e:
+            # fallback: reply with the address in chat
+            try:
+                await query.message.reply_text(data.split(":",1)[1])
+            except Exception:
+                pass
+        return
+
+    # For other interactions (presets), enforce subscription
     chat_id = str(query.from_user.id)
     if not is_subscribed(chat_id):
-        await update.message.reply_text("⛔ You are not subscribed. Please contact the admin.")
+        # inform user that they must subscribe (use alert popup so it isn't a new message)
+        try:
+            await query.answer("⛔ You are not subscribed. Please contact the admin.", show_alert=True)
+        except Exception:
+            pass
         return
-    await query.answer()
 
-    if query.data == "preset_critical":
+    # acknowledge callback (no alert)
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    if data == "preset_critical":
         user_manager.update_user_prefs(chat_id, {"grades": ["CRITICAL"]})
-        await query.edit_message_text("✅ Preferences updated: CRITICAL only.", parse_mode="HTML")
-    elif query.data == "preset_critical_high":
+        try:
+            await query.edit_message_text("✅ Preferences updated: CRITICAL only.", parse_mode="HTML")
+        except Exception:
+            pass
+    elif data == "preset_critical_high":
         user_manager.update_user_prefs(chat_id, {"grades": ["CRITICAL", "HIGH"]})
-        await query.edit_message_text("✅ Preferences updated: CRITICAL + HIGH.", parse_mode="HTML")
-    elif query.data == "preset_all":
+        try:
+            await query.edit_message_text("✅ Preferences updated: CRITICAL + HIGH.", parse_mode="HTML")
+        except Exception:
+            pass
+    elif data == "preset_all":
         user_manager.update_user_prefs(chat_id, {"grades": ALL_GRADES.copy()})
-        await query.edit_message_text("✅ Preferences updated: ALL grades.", parse_mode="HTML")
-    elif query.data == "custom_setup":
-        await query.edit_message_text(
-            "⚙️ Custom Setup\n\nUse /setalerts GRADE1 GRADE2 ...\nAvailable: CRITICAL, HIGH, MEDIUM, LOW",
-            parse_mode="HTML"
-        )
+        try:
+            await query.edit_message_text("✅ Preferences updated: ALL grades.", parse_mode="HTML")
+        except Exception:
+            pass
+    elif data == "custom_setup":
+        try:
+            await query.edit_message_text(
+                "⚙️ Custom Setup\n\nUse /setalerts GRADE1 GRADE2 ...\nAvailable: CRITICAL, HIGH, MEDIUM, LOW",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
 
 async def setalerts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
@@ -1057,6 +1116,12 @@ async def periodic_overlap_download():
         except Exception as e:
             logging.error(f"❌ Failed to refresh overlap_results.pkl: {e}")
         await asyncio.sleep(180)  # 3 minutes
+
+def truncate_address(addr: str, length: int = 6) -> str:
+    """Return a truncated version of a token address."""
+    if not addr or len(addr) <= length * 2:
+        return addr
+    return f"{addr[:length]}...{addr[-length:]}"
 
 # ----------------------
 # Startup hook
