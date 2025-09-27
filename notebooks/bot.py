@@ -2,9 +2,7 @@
 """
 unified_bot_corrected.py
 
-Full corrected unified Telegram bot (local-first).
-...
-(kept same docstring as before)
+Full corrected unified Telegram bot (local-first) with improved copy functionality.
 """
 
 import os
