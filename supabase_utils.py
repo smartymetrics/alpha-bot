@@ -221,11 +221,11 @@ def upload_overlap_results(file_path: str, bucket: str = BUCKET_NAME, debug: boo
     except Exception:
         json_obj = {}
 
-    if not json_obj:
-        if debug:
-            print("🚫 Filtered JSON empty, removing remote files")
-        get_supabase_client().storage.from_(bucket).remove([OVERLAP_FILE_NAME, OVERLAP_JSON_NAME])
-        return False
+    # if not json_obj:
+    #     if debug:
+    #         print("🚫 Filtered JSON empty, removing remote files")
+    #         get_supabase_client().storage.from_(bucket).remove([OVERLAP_FILE_NAME, OVERLAP_JSON_NAME])
+    #     return False
 
     # Upload PKL
     if not upload_file(file_path, bucket, OVERLAP_FILE_NAME, debug=debug):
