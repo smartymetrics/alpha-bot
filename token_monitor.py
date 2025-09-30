@@ -1687,6 +1687,8 @@ class Monitor:
         """
         url = "https://api.dexscreener.com/token-boosts/latest/v1"
         session = await self._get_http_session()
+          # Initial stagger: wait 15s before first call
+        await asyncio.sleep(61)
 
         while True:
             try:
