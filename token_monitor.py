@@ -1684,15 +1684,24 @@ class Monitor:
         """
         Poll Dexscreener token-boosts endpoint once every 61 seconds
         and integrate boosted tokens into the monitoring pipeline.
+        Uses exponential backoff for rate limits.
         """
         url = "https://api.dexscreener.com/token-boosts/latest/v1"
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        }
         session = await self._get_http_session()
-          # Initial stagger: wait 15s before first call
+        
+        # Initial stagger: wait 61s before first call
         await asyncio.sleep(61)
-
+        
+        retry_delay = 60  # Start with 60 seconds
+        max_retry_delay = 300  # Max 5 minutes
+        
         while True:
             try:
-                async with session.get(url, timeout=15) as resp:
+                async with session.get(url, headers=headers, timeout=15) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         entries = data if isinstance(data, list) else data.get("boosts", [])
@@ -1736,13 +1745,28 @@ class Monitor:
 
                     else:
                         text = await resp.text()
-                        if self.debug:
-                            print(f"[Dexscreener] ❌ Status {resp.status}: {text}")
+                        if resp.status == 429:  # Rate limit
+                            if self.debug:
+                                print(f"[Dexscreener] Rate limited. Waiting {retry_delay}s")
+                            await asyncio.sleep(retry_delay)
+                            # Increase backoff up to max
+                            retry_delay = min(retry_delay * 1.5, max_retry_delay)
+                        else:
+                            if self.debug:
+                                print(f"[Dexscreener] ❌ Status {resp.status}: {text}")
+                            # Reset retry delay on non-rate-limit errors
+                            retry_delay = 60
+                            await asyncio.sleep(random.uniform(60, 65))
             except Exception as e:
                 if self.debug:
                     print(f"[Dexscreener] ⚠️ Error fetching boosts: {e}")
+                await asyncio.sleep(random.uniform(60, 65))
+                retry_delay = 60  # Reset on error
 
-            await asyncio.sleep(random.uniform(0, 5) + 62)
+            # On success, wait 60s with small jitter and reset retry delay
+            if resp.status == 200:
+                retry_delay = 60
+                await asyncio.sleep(random.uniform(60, 65))
 
     # ----------------- HTTP session helpers -----------------
     async def _get_http_session(self) -> aiohttp.ClientSession:
