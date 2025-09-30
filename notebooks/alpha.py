@@ -174,7 +174,7 @@ def get_supabase_client() -> Client:
 def _supabase_path(folder: str, filename: str) -> str:
     return f"{folder.rstrip('/')}/{filename}"
 
-def save_to_supabase(df: pd.DataFrame, tokens: List[str], params: Dict[str, Any]):
+def save_to_supabase(df: pd.DataFrame, tokens: List[str], params: Dict[str, Any], job_id: str="unknown"):
     ensure_keys_present(require_supabase=True)
     supabase = get_supabase_client()
 
@@ -182,7 +182,7 @@ def save_to_supabase(df: pd.DataFrame, tokens: List[str], params: Dict[str, Any]
     folder = "recent_analyses"
     os.makedirs(folder, exist_ok=True)
 
-    base_name = f"analysis_{ts}"
+    base_name = f"analysis_{ts}_{job_id}"
     pkl_file_local = os.path.join(folder, f"{base_name}.pkl")
     json_file_local = os.path.join(folder, f"{base_name}.json")
 
@@ -393,7 +393,46 @@ def get_solana_dex_trades(token_addresses: List[str], limit: int = 100) -> pd.Da
 
             trades = []
             if isinstance(data, dict):
-                trades = data.get("result", []) or data.get("result", {}).get("data", []) or data.get("result", []) or []
+                # Handle different Moralis API response formats
+                result = data.get("result")
+
+                if isinstance(result, list):
+                    # Case 1: API returned trades directly as a list
+                    trades = result
+                elif isinstance(result, dict):
+                    # Case 2: API returned a dict, trades might be in "data" field  
+                    trades = result.get("data", [])
+                else:
+                    # Case 3: result is None or unexpected type, try fallback
+                    trades = []
+                    
+                    # Try some alternative response structures as fallback
+                    if "data" in data and isinstance(data["data"], list):
+                        trades = data["data"]
+                    elif "trades" in data and isinstance(data["trades"], list):
+                        trades = data["trades"]
+
+                    if not trades:
+                        break
+                    # Validate that trades are actually for the token we requested
+                    valid_trades = []
+                    for t in trades:
+                        bought = t.get("bought") or {}
+                        sold = t.get("sold") or {}
+                        bought_addr = (bought.get("address") or "").strip()
+                        sold_addr = (sold.get("address") or "").strip()
+                        
+                        # At least one address should match our target token
+                        if addr in [bought_addr, sold_addr]:
+                            valid_trades.append(t)
+                        else:
+                            logger.warning(f"Skipping invalid trade for {addr}: bought={bought_addr}, sold={sold_addr}")
+
+                    trades = valid_trades
+
+                # Ensure trades is always a list
+                if not isinstance(trades, list):
+                    trades = []
             elif isinstance(data, list):
                 trades = data
             else:
@@ -489,24 +528,66 @@ def get_solana_dex_trades(token_addresses: List[str], limit: int = 100) -> pd.Da
 # Price builder (per-minute OHLC + vwap)
 # --------------------
 def build_minute_prices_from_trades(trades_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build OHLCV + VWAP minute-level candlesticks for tokens from trade data.
+
+    Args:
+        trades_df: DataFrame with at least:
+            - block_time (datetime)
+            - mint_address (str)
+            - price_usd_at_trade or derived_price
+            - amount_usd (float)
+
+    Returns:
+        DataFrame with columns:
+            mint_address, minute, open, high, low, close, vwap, volume_usd
+    """
     if trades_df.empty:
-        return pd.DataFrame(columns=["mint_address","minute","open","high","low","close","vwap","volume_usd"])
+        return pd.DataFrame(
+            columns=[
+                "mint_address",
+                "minute",
+                "open",
+                "high",
+                "low",
+                "close",
+                "vwap",
+                "volume_usd",
+            ]
+        )
 
     df = trades_df.copy()
-    df["price_for_price_series"] = df["price_usd_at_trade"].fillna(df["derived_price"])
+
+    # Ensure datetime
+    df["block_time"] = pd.to_datetime(df["block_time"])
+
+    # Prefer price_usd_at_trade, fallback to derived_price
+    if "price_usd_at_trade" in df.columns:
+        df["price_for_price_series"] = df["price_usd_at_trade"].fillna(
+            df.get("derived_price")
+        )
+    else:
+        df["price_for_price_series"] = df.get("derived_price")
+
+    # Round down to the nearest minute
     df["minute"] = df["block_time"].dt.floor("min")
-    grouped = df.groupby(["token_bought_mint_address", "minute"], sort=True)
+
+    # Group by token mint + minute
+    grouped = df.groupby(["mint_address", "minute"], sort=True)
 
     rows = []
     for (mint, minute), g in grouped:
         prices = g["price_for_price_series"].dropna()
         if prices.empty:
             continue
+
         open_p = prices.iloc[0]
         high_p = prices.max()
         low_p = prices.min()
         close_p = prices.iloc[-1]
-        if g["amount_usd"].notna().any():
+
+        # VWAP calculation with division-by-zero guard
+        if "amount_usd" in g.columns and g["amount_usd"].notna().any():
             weights = g["amount_usd"].fillna(0.0)
             denom = weights.sum()
             if denom > 0:
@@ -515,21 +596,29 @@ def build_minute_prices_from_trades(trades_df: pd.DataFrame) -> pd.DataFrame:
                 vwap = prices.mean()
         else:
             vwap = prices.mean()
-        volume_usd = g["amount_usd"].fillna(0.0).sum()
-        rows.append({
-            "mint_address": mint,
-            "minute": minute,
-            "open": open_p,
-            "high": high_p,
-            "low": low_p,
-            "close": close_p,
-            "vwap": vwap,
-            "volume_usd": volume_usd
-        })
+
+        # Total traded volume (in USD terms)
+        volume_usd = g.get("amount_usd", pd.Series(dtype=float)).fillna(0.0).sum()
+
+        rows.append(
+            {
+                "mint_address": mint,
+                "minute": minute,
+                "open": open_p,
+                "high": high_p,
+                "low": low_p,
+                "close": close_p,
+                "vwap": vwap,
+                "volume_usd": volume_usd,
+            }
+        )
 
     price_df = pd.DataFrame(rows)
     if not price_df.empty:
-        price_df = price_df.sort_values(["mint_address","minute"]).reset_index(drop=True)
+        price_df = price_df.sort_values(["mint_address", "minute"]).reset_index(
+            drop=True
+        )
+
     return price_df
 
 # --------------------
@@ -686,7 +775,8 @@ async def get_current_balances_and_prices(traders: List[str], token_mints: List[
 def run_pipeline(tokens: List[str],
                  early_trading_window_hours: Optional[int] = None,
                  minimum_initial_buy_usd: Optional[float] = None,
-                 min_profitable_trades: int = DEFAULT_MIN_PROFITABLE_TRADES):
+                 min_profitable_trades: int = DEFAULT_MIN_PROFITABLE_TRADES, 
+                 job_id: str = "unknown") -> Optional[pd.DataFrame]:
     ensure_keys_present()
     tokens = [t.strip() for t in tokens]
     if len(tokens) == 0:
@@ -701,6 +791,20 @@ def run_pipeline(tokens: List[str],
     if trades_df.empty:
         logger.info("No trades returned from Moralis.")
         return
+
+    # ADD THIS VALIDATION:
+    unique_tokens = trades_df['mint_address'].unique()
+    logger.info(f"[Pipeline] Unique tokens in trades_df: {unique_tokens}")
+    logger.info(f"[Pipeline] Expected tokens: {tokens}")
+
+    # Check if we got unexpected tokens
+    unexpected_tokens = [t for t in unique_tokens if t not in tokens]
+    if unexpected_tokens:
+        logger.warning(f"[Pipeline] Found unexpected tokens: {unexpected_tokens}")
+        # Filter to only requested tokens
+        trades_df = trades_df[trades_df['mint_address'].isin(tokens)]
+        logger.info(f"[Pipeline] After filtering: {len(trades_df)} trades remaining")
+
 
     minute_price_df = build_minute_prices_from_trades(trades_df)
 
@@ -757,6 +861,7 @@ def run_pipeline(tokens: List[str],
         return
 
     cohort_trades_df = trades_df[trades_df["trader_id"].isin(early_traders_cohort)].copy()
+    cohort_trades_df = cohort_trades_df[cohort_trades_df["mint_address"].isin(tokens)].copy()
 
     # -------------------------
     # BUYS: normalized path
@@ -833,7 +938,8 @@ def run_pipeline(tokens: List[str],
         how="left"
     ).fillna({"total_sales_revenue_usd": 0.0, "realized_profit_usd": 0.0})
 
-    token_mints_to_fetch = trader_token_metrics["mint_address"].dropna().unique().tolist()
+    # token_mints_to_fetch = trader_token_metrics["mint_address"].dropna().unique().tolist()
+    token_mints_to_fetch = tokens  # Only fetch balances for specified tokens
     balances_df = asyncio.run(get_current_balances_and_prices(list(early_traders_cohort), token_mints_to_fetch))
 
     if balances_df.empty:
@@ -879,7 +985,16 @@ def run_pipeline(tokens: List[str],
     trade_counts = cohort_trades_df.groupby("trader_id").size().reset_index(name="number_of_trades")
     final_summary = pd.merge(final_summary, trade_counts, on="trader_id", how="left").fillna(0)
 
-    final_summary = final_summary[final_summary["num_tokens_in_profit"] >= min_profitable_trades]
+    # final_summary = final_summary[final_summary["num_tokens_in_profit"] >= min_profitable_trades]
+    if min_profitable_trades > 0:
+        # Count profitable tokens only among the tokens we're analyzing
+        specified_token_profits = trader_token_metrics[trader_token_metrics["mint_address"].isin(tokens)]
+        profitable_by_trader = specified_token_profits.groupby("trader_id")["is_token_profitable"].sum()
+        qualified_traders = profitable_by_trader[profitable_by_trader >= min_profitable_trades].index
+        final_summary = final_summary[final_summary["trader_id"].isin(qualified_traders)]
+    else:
+        # If min_profitable_trades is 0, include all traders
+        pass
     final_summary = final_summary.sort_values(by=["ROI", "overall_total_usd_spent"], ascending=[False, False]).reset_index(drop=True)
 
     display_cols = [
@@ -903,7 +1018,7 @@ def run_pipeline(tokens: List[str],
         "min_profitable_trades": min_profitable_trades
     }
     try:
-        save_to_supabase(final_summary, tokens, params)
+        save_to_supabase(final_summary, tokens, params, job_id)
     except Exception as e:
         logger.warning("Failed to save/upload to Supabase: %s", e)
 

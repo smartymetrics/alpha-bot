@@ -1631,18 +1631,18 @@ def calculate_overlap_grade(overlap_count: int, overlap_percentage: float, conce
 class Monitor:
     def __init__(
         self,
-        sol_client: SolanaAlphaClient,
-        token_discovery: TokenDiscovery,
-        holder_agg: HolderAggregator,
-        updater: JobLibTokenUpdater,
-        dune_cache: DuneWinnersCache,
-        dune_builder: DuneWinnersBuilder,
-        overlap_store: OverlapStore,
-        scheduling_store: SchedulingStore,
+        sol_client: Any,
+        token_discovery: Any,
+        holder_agg: Any,
+        updater: Any,
+        dune_cache: Any,
+        dune_builder: Any,
+        overlap_store: Any,
+        scheduling_store: Any,
         *,
         coingecko_poll_interval_seconds: int = 30,
-        initial_check_delay_seconds: int = 3600, # Adjusted to 1 hour
-        repeat_interval_seconds: int = 7200, # Adjusted to 2 hours
+        initial_check_delay_seconds: int = 3600,  # 1 hour
+        repeat_interval_seconds: int = 7200,      # 2 hours
         debug: bool = False,
     ):
         self.sol_client = sol_client
@@ -1657,17 +1657,20 @@ class Monitor:
         self.initial_check_delay_seconds = initial_check_delay_seconds
         self.repeat_interval_seconds = repeat_interval_seconds
         self.debug = debug
+
+        # runtime state
         self._scheduled: Set[str] = set()
         self.last_cleanup = 0
-        self.last_dune_build = 0  # Track last Dune cache build time
-        # Probation / risky tokens (for GoPlus + Dexscreener gating)
-        self.pending_risky_tokens: Dict[str, Dict[str, Any]] = {}  # mint -> {first_seen, last_checked, attempts, reasons, overlap_result}
-        self._probation_tasks: Dict[str, asyncio.Task] = {}  # mint -> asyncio.Task
-        # HTTP session (shared)
+        self.last_dune_build = 0
+        self.pending_risky_tokens: Dict[str, Dict[str, Any]] = {}
+        self._probation_tasks: Dict[str, asyncio.Task] = {}
         self._http_session: Optional[aiohttp.ClientSession] = None
-        # concurrency guard for external API calls
         self._api_sema = asyncio.Semaphore(8)
 
+        # Chains to consider when pulling Dexscreener boosts (tweak as needed)
+        self.monitored_chains: Set[str] = {"solana"}
+
+    # ----------------- HTTP session helpers -----------------
     async def _get_http_session(self) -> aiohttp.ClientSession:
         if not self._http_session or self._http_session.closed:
             self._http_session = aiohttp.ClientSession()
@@ -1677,6 +1680,7 @@ class Monitor:
         if self._http_session and not self._http_session.closed:
             await self._http_session.close()
 
+    # ----------------- External checks (unchanged) -----------------
     async def _run_goplus_check(self, mint: str) -> Dict[str, Any]:
         url = f"https://api.gopluslabs.io/api/v1/solana/token_security?contract_addresses={mint}"
         session = await self._get_http_session()
@@ -1740,6 +1744,7 @@ class Monitor:
             liquidity = 0.0
         return {"ok": True, "pair_exists": True, "liquidity_usd": liquidity, "raw": p0}
 
+    # ----------------- Probation & security (unchanged) -----------------
     async def _start_or_update_probation(self, mint: str, start: Any, overlap_result: Dict[str, Any], reasons: List[str]):
         now_iso = datetime.now(timezone.utc).isoformat()
         now_ts = int(datetime.now(timezone.utc).timestamp())
@@ -1758,7 +1763,6 @@ class Monitor:
             entry["attempts"] = entry.get("attempts", 0) + 1
             entry["reasons"] = list(dict.fromkeys(entry.get("reasons", []) + reasons))
 
-        # persist into scheduling store
         try:
             self.scheduling_store.update_token_state(mint, {
                 "status": "probation",
@@ -1769,10 +1773,8 @@ class Monitor:
                 "launch_time": getattr(start, "block_time", int(datetime.now(timezone.utc).timestamp()))
             })
         except Exception:
-            # scheduling store might not be critical; continue
             pass
 
-        # ensure a single probation task per mint
         if mint in self._probation_tasks and not self._probation_tasks[mint].done():
             if self.debug:
                 print(f"Probation: updated existing probation for {mint}; reasons={reasons}")
@@ -1803,9 +1805,7 @@ class Monitor:
                 except Exception:
                     pass
                 break
-            # run a security-only check by calling the orchestrator but reuse overlap_result
             try:
-                # prepare a minimal object for overlap store usage
                 obj = safe_load_overlap(self.overlap_store)
                 await self._security_gate_and_route(start, self.pending_risky_tokens[mint]["overlap_result"], obj)
                 if mint not in self.pending_risky_tokens:
@@ -1844,7 +1844,6 @@ class Monitor:
                 pass
             return
 
-        # Run GoPlus
         g = await retry_with_backoff(self._run_goplus_check, mint, retries=2, base_delay=0.8)
         reasons = []
         if not g.get("ok"):
@@ -1924,7 +1923,7 @@ class Monitor:
             await self._start_or_update_probation(mint, start, overlap_result, reasons)
             return
 
-        # ✅ Token passed all security checks - get fresh overlap before saving
+        # Passed security checks - fetch fresh overlap before saving
         try:
             if self.debug:
                 print(f"Security passed for {mint}, getting fresh overlap analysis...")
@@ -1946,7 +1945,6 @@ class Monitor:
         except Exception as e:
             if self.debug:
                 print(f"Fresh overlap check failed for {mint}, using original: {e}")
-            # Fallback to original overlap result if fresh check fails
             overlap_store_obj.setdefault(mint, []).append({
                 "ts": datetime.now(timezone.utc).isoformat(),
                 "result": overlap_result,
@@ -1971,90 +1969,57 @@ class Monitor:
         except Exception:
             pass
 
+    # ----------------- Dune scheduler & ensure cache (unchanged) -----------------
     async def daily_dune_scheduler(self):
-        """
-        🚀 ASYNC Background task that runs Dune query once per day at a scheduled time.
-        Runs at 2 AM UTC daily to build fresh cache with yesterday's data.
-        """
         if self.debug:
             print("[DuneScheduler ASYNC] 🚀 Starting daily Dune scheduler (INFINITE POLLING)")
         
         while True:
             try:
                 now = datetime.now(timezone.utc)
-                
-                # Calculate next 2 AM UTC
                 next_run = now.replace(hour=2, minute=0, second=0, microsecond=0)
                 if now >= next_run:
-                    # If it's already past 2 AM today, schedule for tomorrow
                     next_run += timedelta(days=1)
-                
                 sleep_seconds = (next_run - now).total_seconds()
-                
                 if self.debug:
-                    print(f"[DuneScheduler ASYNC] 🚀 Next Dune build scheduled for {next_run} (in {sleep_seconds/3600:.1f} hours)")
-                
-                # Sleep until scheduled time
+                    print(f"[DuneScheduler ASYNC] Next Dune build scheduled for {next_run} (in {sleep_seconds/3600:.1f} hours)")
                 await asyncio.sleep(sleep_seconds)
-                
-                # Run the daily Dune cache build
-                if self.debug:
-                    print("[DuneScheduler ASYNC] 🚀 Starting scheduled daily Dune cache build")
-                
+
                 try:
                     new_token_holders = await self.dune_builder.build_today_from_dune(
                         self.token_discovery, self.holder_agg
                     )
                     self.last_dune_build = int(datetime.now(timezone.utc).timestamp())
-                    
                     if self.debug:
                         print(f"[DuneScheduler ASYNC] ✅ Successfully built daily cache with {len(new_token_holders)} tokens")
-                        
                 except Exception as e:
                     if self.debug:
                         print(f"[DuneScheduler ASYNC] ❌ Failed to build daily Dune cache: {e}")
-                        import traceback
                         traceback.print_exc()
-                
             except Exception as e:
                 if self.debug:
                     print(f"[DuneScheduler ASYNC] ❌ Scheduler error: {e}")
-                # Sleep for 1 hour before retrying on error
                 await asyncio.sleep(3600)
 
     async def ensure_dune_holders(self):
-        """
-        🚀 ASYNC: Ensure the 7-day Dune winners cache exists by loading last 7 days and
-        building today's file if yesterday's data is missing or outdated.
-        """
         if self.debug:
             print("[Monitor ASYNC] 🚀 Starting ensure_dune_holders()")
             
-        # First, load existing 7-day cache
         token_to_top_holders, wallet_freq, loaded_days = self.dune_cache.load_last_7_days()
-        
         today_key = datetime.now(timezone.utc).strftime("%Y%m%d")
         yesterday_key = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y%m%d")
-        
+
         if self.debug:
             print(f"[Monitor ASYNC] Today: {today_key}, Yesterday: {yesterday_key}")
             print(f"[Monitor ASYNC] Loaded cache days: {loaded_days}")
             print(f"[Monitor ASYNC] Total cached tokens: {len(token_to_top_holders)}")
             print(f"[Monitor ASYNC] Total unique wallets: {len(wallet_freq)}")
 
-        # Check if we need to build today's cache
         should_build_today = False
-        
-        # Build today's cache if it doesn't exist
         if today_key not in loaded_days:
             if self.debug:
                 print(f"[Monitor ASYNC] 🚀 Today's cache missing ({today_key}), will build it")
             should_build_today = True
-        else:
-            if self.debug:
-                print(f"[Monitor ASYNC] ✅ Today's cache already exists ({today_key})")
-
-        # Also check if yesterday's data is missing (fallback)
         if yesterday_key not in loaded_days:
             if self.debug:
                 print(f"[Monitor ASYNC] ⚠️ Yesterday's cache also missing ({yesterday_key}), will force build today's cache")
@@ -2069,18 +2034,14 @@ class Monitor:
                 )
                 if self.debug:
                     print(f"[Monitor ASYNC] ✅ Built today's cache with {len(new_token_holders)} tokens")
-                    
-                # Reload the cache after building
                 token_to_top_holders, wallet_freq, loaded_days = self.dune_cache.load_last_7_days()
                 if self.debug:
                     print(f"[Monitor ASYNC] ✅ After rebuild - loaded days: {loaded_days}")
                     print(f"[Monitor ASYNC] ✅ After rebuild - total tokens: {len(token_to_top_holders)}")
                     print(f"[Monitor ASYNC] ✅ After rebuild - total wallets: {len(wallet_freq)}")
-                    
             except Exception as e:
                 if self.debug:
                     print(f"[Monitor ASYNC] ❌ Failed to build today's Dune cache: {e}")
-                    import traceback
                     traceback.print_exc()
         else:
             if self.debug:
@@ -2088,6 +2049,7 @@ class Monitor:
 
         return token_to_top_holders, wallet_freq, loaded_days
 
+    # ----------------- Startup recovery (unchanged) -----------------
     async def startup_recovery(self):
         if self.debug:
             print("Monitor ASYNC: performing startup recovery")
@@ -2121,14 +2083,12 @@ class Monitor:
                 task = asyncio.create_task(self._schedule_repeat_check_only(token_mint, delay))
                 recovery_tasks.append(task)
             elif status == "probation":
-                # recreate minimal TradingStart and rehydrate probation loop
                 try:
                     from_dataclass = globals().get("TradingStart")
                     start_obj = None
                     if from_dataclass:
                         start_obj = from_dataclass(mint=token_mint, block_time=state.get("launch_time"))
                     else:
-                        # fallback minimal object
                         class _S: pass
                         start_obj = _S()
                         start_obj.mint = token_mint
@@ -2145,6 +2105,7 @@ class Monitor:
             if self.debug:
                 print(f"Monitor ASYNC: started {len(recovery_tasks)} recovery tasks")
 
+    # ----------------- Scheduling helpers (unchanged) -----------------
     async def _schedule_first_check_only(self, token_mint: str, delay_seconds: float):
         if delay_seconds > 0:
             await asyncio.sleep(delay_seconds)
@@ -2161,7 +2122,6 @@ class Monitor:
         try:
             res = await self.check_holders_overlap(token_start)
             obj = safe_load_overlap(self.overlap_store)
-            # Route through security gate; it will save if passed or start probation otherwise
             await self._security_gate_and_route(token_start, res, obj)
             current_time = int(datetime.now(timezone.utc).timestamp())
             next_check = current_time + self.repeat_interval_seconds
@@ -2174,7 +2134,6 @@ class Monitor:
             asyncio.create_task(self._schedule_repeat_checks_for_token(token_start, next_check))
             if self.debug:
                 print(f"_schedule_first_check_only: completed first check for {token_mint}, grade: {res.get('grade', 'N/A')}")
-        
         except Exception as e:
             if self.debug:
                 print(f"_schedule_first_check_only: error for {token_mint}: {e}")
@@ -2232,7 +2191,7 @@ class Monitor:
             if self.debug:
                 print(f"_schedule_repeat_check_only: error for {token_mint}: {e}")
 
-    async def _schedule_repeat_checks_for_token(self, start: TradingStart, first_check_at: int):
+    async def _schedule_repeat_checks_for_token(self, start: Any, first_check_at: int):
         current_time = int(datetime.now(timezone.utc).timestamp())
         launch_time = start.block_time or current_time
         stop_after = launch_time + 24 * 3600
@@ -2275,62 +2234,204 @@ class Monitor:
                     print(f"_schedule_repeat_checks: error for {start.mint}: {e}")
                 check_time = now + self.repeat_interval_seconds
 
+    # ----------------- Dexscreener boosts fetcher & converter -----------------
+    async def _fetch_latest_boosts(self) -> List[Dict[str, Any]]:
+        url = "https://api.dexscreener.com/token-boosts/latest/v1"
+        session = await self._get_http_session()
+        async with self._api_sema:
+            try:
+                async with session.get(url, timeout=12) as resp:
+                    if resp.status != 200:
+                        if self.debug:
+                            text = await resp.text()
+                            print(f"_fetch_latest_boosts: dexscreener status {resp.status} - {text}")
+                        return []
+                    data = await resp.json()
+            except Exception as e:
+                if self.debug:
+                    print(f"_fetch_latest_boosts: exception {e}")
+                return []
+
+        arr = []
+        if isinstance(data, list):
+            arr = data
+        elif isinstance(data, dict):
+            arr = data.get("tokens") or data.get("data") or data.get("list") or []
+            if not arr and "tokenAddress" in data and "chainId" in data:
+                arr = [data]
+        else:
+            return []
+
+        filtered = []
+        for item in arr:
+            addr = item.get("tokenAddress") or item.get("token") or item.get("address")
+            chain = item.get("chainId")
+            if not addr:
+                continue
+            if chain and self.monitored_chains and chain not in self.monitored_chains:
+                continue
+            filtered.append({
+                "tokenAddress": addr,
+                "chainId": chain,
+                "amount": item.get("amount"),
+                "totalAmount": item.get("totalAmount"),
+                "boostedAt": item.get("boostedAt"),
+                "description": item.get("description"),
+                "links": item.get("links"),
+                "raw": item
+            })
+        return filtered
+
+    def _to_trading_start_from_boost(self, boost_item: Dict[str, Any]) -> Any:
+        minted = boost_item.get("tokenAddress")
+        boosted_at = boost_item.get("boostedAt")
+        try:
+            if boosted_at:
+                ts = int(boosted_at) // 1000 if int(boosted_at) > 10_000_000_000 else int(boosted_at)
+            else:
+                ts = int(datetime.now(timezone.utc).timestamp())
+        except Exception:
+            ts = int(datetime.now(timezone.utc).timestamp())
+
+        start = SimpleNamespace()
+        start.mint = minted
+        start.block_time = ts
+        start.detected_via = "boosted"
+        start.extra = {
+            "description": boost_item.get("description"),
+            "links": boost_item.get("links"),
+            "dexscreener_raw": boost_item.get("raw")
+        }
+        start.fdv_usd = None
+        start.volume_usd = None
+        start.source_dex = "dexscreener"
+        start.price_change_percentage = None
+        return start
+
+    # ----------------- Main poll loop (merged) -----------------
     async def poll_coingecko_loop(self):
         if self.debug:
-            print("Monitor ASYNC: 🚀 starting CoinGecko poll loop")
-        
+            print("Monitor ASYNC: 🚀 starting CoinGecko + Dexscreener merged poll loop")
+
         # Start the daily Dune scheduler as a background task
         asyncio.create_task(self.daily_dune_scheduler())
-        
-        # Start startup recovery (commented out as per original)
-        # await self.startup_recovery()
-        
+
         while True:
             try:
-                starts = await self.token_discovery.get_tokens_created_today(limit=500)
+                # 1) fetch new pools from CoinGecko / token_discovery
+                starts: List[Any] = await self.token_discovery.get_tokens_created_today(limit=500)
                 if self.debug:
                     print(f"Monitor ASYNC: CoinGecko returned {len(starts)} tokens")
-                new_tokens_scheduled = 0
+
+                # 2) fetch latest boosted tokens (Dexscreener)
+                boosted_raw = await self._fetch_latest_boosts()
+                if self.debug:
+                    print(f"Monitor ASYNC: Dexscreener returned {len(boosted_raw)} boosted entries (filtered by chains: {self.monitored_chains})")
+
+                # 3) convert boosted entries into minimal TradingStart-like objects
+                boosted_starts: List[Any] = []
+                for b in boosted_raw:
+                    try:
+                        boosted_starts.append(self._to_trading_start_from_boost(b))
+                    except Exception:
+                        # skip malformed
+                        continue
+
+                # 4) merge both pools by mint (dedupe). Keep token_discovery objects when present,
+                #    but ensure we tag detected_via correctly and attach dexscreener metadata when available.
+                merged_by_mint: Dict[str, Any] = {}
+
+                # Add detection objects from token_discovery first (prefer real TradingStart)
                 for s in starts:
-                    if not s.mint:
+                    if not getattr(s, "mint", None):
                         continue
-                    if s.mint in self._scheduled:
+                    key = str(s.mint).lower()
+                    merged_by_mint[key] = s
+
+                # Merge boosted starts
+                for bs in boosted_starts:
+                    if not getattr(bs, "mint", None):
                         continue
-                    existing_state = self.scheduling_store.get_token_state(s.mint)
-                    if existing_state:
-                        if self.debug:
-                            print(f"Monitor ASYNC: token {s.mint} already has scheduling state, skipping")
+                    key = str(bs.mint).lower()
+                    if key in merged_by_mint:
+                        existing = merged_by_mint[key]
+                        # unify detected_via
+                        existing.detected_via = "both" if getattr(existing, "detected_via", None) != "both" else "both"
+                        # attach dexscreener metadata into extra dictionary
+                        if not getattr(existing, "extra", None):
+                            existing.extra = {}
+                        # store raw boost metadata under a known key
+                        existing.extra.setdefault("dexscreener_boost", bs.extra)
+                        merged_by_mint[key] = existing
+                    else:
+                        merged_by_mint[key] = bs
+
+                merged_list = list(merged_by_mint.values())
+
+                # 5) Schedule overlap checks in the exact same way for all merged tokens
+                scheduled_count = 0
+                for start in merged_list:
+                    mint = getattr(start, "mint", None)
+                    if not mint:
                         continue
-                    asyncio.create_task(self._schedule_overlap_checks_for_token(s))
-                    self._scheduled.add(s.mint)
-                    new_tokens_scheduled += 1
+                    if mint in self._scheduled:
+                        continue
+                    # Keep same scheduling behaviour for new and boosted tokens:
+                    # schedule _schedule_overlap_checks_for_token which will delay by initial_check_delay_seconds
+                    asyncio.create_task(self._schedule_overlap_checks_for_token(start))
+                    self._scheduled.add(mint)
+                    scheduled_count += 1
+                    # persist scheduling state for tracking
                     current_time = int(datetime.now(timezone.utc).timestamp())
-                    self.scheduling_store.update_token_state(s.mint, {
-                        "launch_time": s.block_time or current_time,
-                        "first_check_at": (s.block_time or current_time) + self.initial_check_delay_seconds,
-                        "status": "pending_first",
-                        "created_at": datetime.now(timezone.utc).isoformat(),
-                        "total_checks_completed": 0
-                    })
-                if new_tokens_scheduled > 0 and self.debug:
-                    print(f"Monitor ASYNC: scheduled overlap checks for {new_tokens_scheduled} new tokens")
+                    try:
+                        self.scheduling_store.update_token_state(mint, {
+                            "launch_time": start.block_time or current_time,
+                            "first_check_at": (start.block_time or current_time) + self.initial_check_delay_seconds,
+                            "status": "pending_first",
+                            "created_at": datetime.now(timezone.utc).isoformat(),
+                            "total_checks_completed": 0,
+                            "detected_via": getattr(start, "detected_via", None)
+                        })
+                    except Exception:
+                        # non-critical; continue
+                        pass
+
+                if self.debug:
+                    print(f"Monitor ASYNC: scheduled {scheduled_count} merged tokens (CoinGecko + boosted) for overlap checks")
+
+                # 6) persist discovered starts (save both coinGecko starts and boosted starts where possible)
                 try:
+                    # Save only the token_discovery starts (to preserve previous storage behavior) +
+                    # additionally try to save boosted starts by converting to a minimal structure if needed.
+                    # Here we save `starts` (CoinGecko) first to preserve existing behaviour.
                     await self.updater.save_trading_starts_async(starts, skip_existing=True)
+                    # Attempt to persist boosted starts as well (best-effort)
+                    if boosted_starts:
+                        try:
+                            await self.updater.save_trading_starts_async(boosted_starts, skip_existing=True)
+                        except Exception:
+                            # not fatal
+                            if self.debug:
+                                print("Monitor ASYNC: failed to save boosted_starts - continuing")
                 except Exception as e:
                     if self.debug:
                         print("Monitor ASYNC: updater save error", e)
+
+                # 7) maintenance
                 current_time = time.time()
                 if current_time - self.last_cleanup > 3600:
                     await self.updater.cleanup_old_tokens_async()
                     self.scheduling_store.cleanup_old_states()
                     self.last_cleanup = current_time
+
             except Exception as e:
                 if self.debug:
-                    print("Monitor ASYNC: CoinGecko poll error", e)
+                    print("Monitor ASYNC: merged poll loop error", e)
                     traceback.print_exc()
             await asyncio.sleep(self.coingecko_poll_interval_seconds)
 
-    async def _schedule_overlap_checks_for_token(self, start: TradingStart):
+    # ----------------- Overlap analysis (unchanged) -----------------
+    async def _schedule_overlap_checks_for_token(self, start: Any):
         now_ts = int(datetime.now(timezone.utc).timestamp())
         block_ts = int(start.block_time or now_ts)
         first_run_at = block_ts + self.initial_check_delay_seconds
@@ -2355,7 +2456,6 @@ class Monitor:
                 res = await self.check_holders_overlap(start)
                 check_count += 1
                 obj = safe_load_overlap(self.overlap_store)
-                # Route through security gate; it will save if passed or start probation otherwise
                 await self._security_gate_and_route(start, res, obj)
                 next_check_time = now_ts2 + self.repeat_interval_seconds
                 self.scheduling_store.update_token_state(start.mint, {
@@ -2375,27 +2475,20 @@ class Monitor:
                 })
             await asyncio.sleep(self.repeat_interval_seconds)
 
-    async def check_holders_overlap(self, start: TradingStart, top_k_holders: int = 500) -> Dict[str, Any]:
-        """
-        Check overlap between the token's top holders and the merged 7-day Dune winners.
-        Returns a summary dict with distinct and weighted concentration metrics.
-        """
+    async def check_holders_overlap(self, start: Any, top_k_holders: int = 500) -> Dict[str, Any]:
         if self.debug:
             print(f"check_holders_overlap ASYNC: computing for {start.mint}")
 
-        # Ensure Dune winners cache available
         token_to_top_holders, wallet_freq, loaded_days = self.dune_cache.load_last_7_days()
         if self.debug:
             print(f"check_holders_overlap ASYNC: using {len(loaded_days)} cached days, {len(token_to_top_holders)} tokens in memory")
 
-        # Merge winners union and compute total frequency sum
         winners_union: Set[str] = set()
         for holders in token_to_top_holders.values():
             winners_union.update(holders)
         total_winner_wallets = len(winners_union)
         total_winner_weights = sum(wallet_freq.values()) if wallet_freq else 0
 
-        # Fetch holders for the target token and apply hybrid sampling rule
         try:
             holders_list = await self.holder_agg.get_token_holders(start.mint, limit=1000, max_pages=2, decimals=None)
         except Exception as e:
@@ -2415,11 +2508,9 @@ class Monitor:
         overlap_count = len(overlap)
         top_count = len(top_set)
 
-        # distinct concentration (overlap_count / total distinct winner wallets)
         concentration = (overlap_count / total_winner_wallets * 100.0) if total_winner_wallets else 0.0
         overlap_pct = (overlap_count / top_count * 100.0) if top_count > 0 else 0.0
 
-        # weighted concentration (sum of wallet frequencies for overlapping wallets / total wallet frequencies)
         overlap_weight = sum(wallet_freq.get(w, 0) for w in overlap) if wallet_freq else 0
         weighted_concentration = (overlap_weight / total_winner_weights * 100.0) if total_winner_weights else 0.0
 
@@ -2442,15 +2533,15 @@ class Monitor:
             "total_winner_wallets": total_winner_wallets,
             "overlap_wallets_sample": list(overlap)[:20],
             "grade": grade,
-            "detected_via": start.detected_via,
+            "detected_via": getattr(start, "detected_via", None),
             "block_time": start.block_time,
             "token_metadata": {
                 k: v for k, v in {
-                    "name": start.extra.get("name") if start.extra else None,
-                    "fdv_usd": start.fdv_usd,
-                    "volume_usd": start.volume_usd,
-                    "source_dex": start.source_dex,
-                    "price_change_percentage": start.price_change_percentage,
+                    "name": start.extra.get("name") if getattr(start, "extra", None) else None,
+                    "fdv_usd": getattr(start, "fdv_usd", None),
+                    "volume_usd": getattr(start, "volume_usd", None),
+                    "source_dex": getattr(start, "source_dex", None),
+                    "price_change_percentage": getattr(start, "price_change_percentage", None),
                 }.items() if v is not None
             }
         }
