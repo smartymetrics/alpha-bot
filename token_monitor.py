@@ -1667,8 +1667,80 @@ class Monitor:
         self._http_session: Optional[aiohttp.ClientSession] = None
         self._api_sema = asyncio.Semaphore(8)
 
-        # Chains to consider when pulling Dexscreener boosts (tweak as needed)
+        # Chains to consider when pulling Dexscreener boosts
         self.monitored_chains: Set[str] = {"solana"}
+
+    # ----------------- HTTP session helpers -----------------
+    async def _get_http_session(self) -> aiohttp.ClientSession:
+        if not self._http_session or self._http_session.closed:
+            self._http_session = aiohttp.ClientSession()
+        return self._http_session
+
+    async def _close_http_session(self):
+        if self._http_session and not self._http_session.closed:
+            await self._http_session.close()
+
+    async def poll_dexscreener_boosts_loop(self):
+        """
+        Poll Dexscreener token-boosts endpoint once every 61 seconds
+        and integrate boosted tokens into the monitoring pipeline.
+        """
+        url = "https://api.dexscreener.com/token-boosts/latest/v1"
+        session = await self._get_http_session()
+
+        while True:
+            try:
+                async with session.get(url, timeout=15) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        entries = data if isinstance(data, list) else data.get("boosts", [])
+                        if self.debug:
+                            print(f"[Dexscreener] ✅ Got {len(entries)} boosted entries")
+
+                        trading_starts = []
+                        now_ts = int(datetime.now(timezone.utc).timestamp())
+
+                        for entry in entries:
+                            if entry.get("chainId") not in self.monitored_chains:
+                                continue
+                            mint = entry.get("tokenAddress")
+                            if not mint:
+                                continue
+
+                            ts = TradingStart(
+                                mint=mint,
+                                block_time=now_ts,  # no launch time, so use now
+                                program_id="dexscreener",
+                                detected_via="dexscreener_boost",
+                                extra={
+                                    "description": entry.get("description"),
+                                    "icon": entry.get("icon"),
+                                    "header": entry.get("header"),
+                                    "url": entry.get("url"),
+                                },
+                                source_dex="dexscreener",
+                            )
+                            trading_starts.append(ts)
+
+                        if trading_starts:
+                            result = await self.updater.save_trading_starts_async(trading_starts)
+                            if self.debug:
+                                print(f"[Dexscreener] Saved {result['saved']} boosted tokens, skipped {result['skipped']}")
+
+                            for ts in trading_starts:
+                                if ts.mint not in self._scheduled:
+                                    self._scheduled.add(ts.mint)
+                                    asyncio.create_task(self._schedule_overlap_checks_for_token(ts))
+
+                    else:
+                        text = await resp.text()
+                        if self.debug:
+                            print(f"[Dexscreener] ❌ Status {resp.status}: {text}")
+            except Exception as e:
+                if self.debug:
+                    print(f"[Dexscreener] ⚠️ Error fetching boosts: {e}")
+
+            await asyncio.sleep(61)
 
     # ----------------- HTTP session helpers -----------------
     async def _get_http_session(self) -> aiohttp.ClientSession:
@@ -2582,23 +2654,23 @@ async def main_loop():
         overlap_store=overlap_store,
         scheduling_store=scheduling_store,
         coingecko_poll_interval_seconds=30,
-        initial_check_delay_seconds=1 * 3600, # Adjusted
-        repeat_interval_seconds=2 * 3600, # Adjusted
+        initial_check_delay_seconds=1 * 3600,
+        repeat_interval_seconds=2 * 3600,
         debug=True,
     )
 
-    # Start both tasks concurrently - CoinGecko can poll while Dune builds cache
+    # Start tasks concurrently
     dune_task = asyncio.create_task(monitor.ensure_dune_holders())
     coingecko_task = asyncio.create_task(monitor.poll_coingecko_loop())
-    
-    print("🚀 Starting CoinGecko polling and Dune cache building concurrently...")
-    
-    # Wait for both tasks (poll_coingecko_loop runs forever, so this keeps the program alive)
-    await asyncio.gather(dune_task, coingecko_task)
+    dexscreener_task = asyncio.create_task(monitor.poll_dexscreener_boosts_loop())
+
+    print("🚀 Starting CoinGecko, Dune, and Dexscreener polling concurrently...")
+
+    # Keep program alive
+    await asyncio.gather(dune_task, coingecko_task, dexscreener_task)
 
 if __name__ == "__main__":
     try:
         asyncio.run(main_loop())
     except KeyboardInterrupt:
         print("🚀 Interrupted, exiting")
-
