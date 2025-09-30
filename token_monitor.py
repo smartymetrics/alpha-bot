@@ -1740,7 +1740,7 @@ class Monitor:
                 if self.debug:
                     print(f"[Dexscreener] ⚠️ Error fetching boosts: {e}")
 
-            await asyncio.sleep(61)
+            await asyncio.sleep(random.uniform(0, 5))
 
     # ----------------- HTTP session helpers -----------------
     async def _get_http_session(self) -> aiohttp.ClientSession:
