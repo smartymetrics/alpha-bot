@@ -13,6 +13,7 @@ import json
 import pickle
 import requests
 from supabase import create_client, Client
+import tempfile
 
 BUCKET_NAME = "monitor-data"
 OVERLAP_FILE_NAME = "overlap_results.pkl"
@@ -25,8 +26,11 @@ MAX_SIZE_MB = 1.7
 # -------------------
 def get_supabase_client() -> Client:
     """Create and return a Supabase client. Uses env vars with local fallback."""
-    SUPABASE_URL = os.getenv("SUPABASE_URL", "https://ldraroaloinsesjoayxc.supabase.co")
-    SUPABASE_KEY = os.getenv("SUPABASE_KEY", "SUPABASE_KEY")
+    # SUPABASE_URL = os.getenv("SUPABASE_URL", "https://ldraroaloinsesjoayxc.supabase.co")
+    # SUPABASE_KEY = os.getenv("SUPABASE_KEY", "SUPABASE_KEY")
+
+    SUPABASE_URL="https://ldraroaloinsesjoayxc.supabase.co"
+    SUPABASE_KEY="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImxkcmFyb2Fsb2luc2Vzam9heXhjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTYzMzEyNDYsImV4cCI6MjA3MTkwNzI0Nn0._F1o7W9ttSGCEh70dEM6l2dtpG5lieo1nQ7Q9zA2VUs"
 
     if not SUPABASE_URL or not SUPABASE_KEY:
         raise RuntimeError("❌ Missing SUPABASE_URL or SUPABASE_KEY in environment variables")
@@ -286,6 +290,57 @@ def download_dune_cache_file(save_path: str, filename: str, bucket: str = BUCKET
     """Download a dune cache file from dune_cache/ folder."""
     return download_file(save_path, f"dune_cache/{filename}", bucket)
 
+# -------------------
+# Wallet PnL Helpers
+# -------------------
+WALLET_FOLDER = "wallet_pnl"
+
+def wallet_file_name(wallet: str) -> str:
+    """Return remote file path for a wallet JSON file."""
+    return f"{WALLET_FOLDER}/{wallet}.json"
+
+
+def upload_wallet_data(wallet: str, data: dict, bucket: str = BUCKET_NAME, debug: bool = True) -> bool:
+    """Upload wallet balances + trades JSON to Supabase."""
+    try:
+        # Save JSON locally first
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".json") as tmp:
+            tmp.write(json.dumps(data, indent=2, default=str).encode())
+            tmp_path = tmp.name
+
+        success = upload_file(tmp_path, bucket, wallet_file_name(wallet), debug=debug)
+        os.remove(tmp_path)
+        return success
+    except Exception as e:
+        if debug:
+            print(f"❌ Failed to upload wallet {wallet}: {e}")
+        return False
+
+
+def download_wallet_data(wallet: str, bucket: str = BUCKET_NAME, debug: bool = True) -> dict | None:
+    """Download wallet JSON from Supabase and return as dict."""
+    save_path = f"/tmp/{wallet}.json"
+    if not download_file(save_path, wallet_file_name(wallet), bucket=bucket):
+        return None
+    try:
+        with open(save_path, "r") as f:
+            return json.load(f)
+    except Exception as e:
+        if debug:
+            print(f"⚠️ Failed to parse wallet JSON {wallet}: {e}")
+        return None
+
+
+def wallet_data_exists(wallet: str, bucket: str = BUCKET_NAME) -> bool:
+    """Check if wallet data exists in Supabase Storage."""
+    try:
+        supabase = get_supabase_client()
+        res = supabase.storage.from_(bucket).list(WALLET_FOLDER)
+        if not isinstance(res, list):
+            return False
+        return any(obj.get("name") == f"{wallet}.json" for obj in res)
+    except Exception:
+        return False
 
 # -------------------
 # Script Runner
