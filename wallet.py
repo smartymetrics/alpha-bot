@@ -2,8 +2,8 @@
 """
 wallet_pnl_with_behavior.py
 
-Consolidated script that fetches Moralis swaps and Helius balances, processes trades,
-computes PnL and behavioral metrics using DexScreener for current prices.
+OPTIMIZED: Only fetches DexScreener prices for tokens actually needed (paginated results)
+This drastically reduces API calls and avoids 429 rate limit errors.
 """
 
 import requests
@@ -64,16 +64,15 @@ DEXSCREENER_API_URL = "https://api.dexscreener.com/latest/dex/tokens/{}"
 SOL_MINT_ADDRESS = "So11111111111111111111111111111111111111112"
 BALANCE_NOT_BOUGHT_MODE = "clamped"
 
-# --- NEW: DexScreener Price Cache ---
+# --- DexScreener Price Cache ---
 _price_cache = {}
 _price_cache_ttl = 300  # 5 minutes
 
 def get_current_price_from_dexscreener(mint_address: str) -> float:
     """
-    Fetch current price from DexScreener API.
+    Fetch current price from DexScreener API with caching.
     Returns 0 if liquidity < $1 or on error.
     """
-    # Check cache first
     cache_key = mint_address
     if cache_key in _price_cache:
         cached_price, cached_time = _price_cache[cache_key]
@@ -86,22 +85,17 @@ def get_current_price_from_dexscreener(mint_address: str) -> float:
         response.raise_for_status()
         data = response.json()
         
-        # Check if we have pairs
         pairs = data.get('pairs', [])
         if not pairs or len(pairs) == 0:
             _price_cache[cache_key] = (0.0, time.time())
             return 0.0
         
-        # Get first pair
         first_pair = pairs[0]
-        
-        # Check liquidity
         liquidity_usd = safe_float(first_pair.get('liquidity', {}).get('usd', 0))
         if liquidity_usd <= 1.0:
             _price_cache[cache_key] = (0.0, time.time())
             return 0.0
         
-        # Get price
         price_usd = safe_float(first_pair.get('priceUsd', 0))
         _price_cache[cache_key] = (price_usd, time.time())
         return price_usd
@@ -118,14 +112,9 @@ def get_current_prices_batch(mint_addresses: List[str]) -> Dict[str, float]:
     """
     prices = {}
     for mint in mint_addresses:
-        if mint == SOL_MINT_ADDRESS:
-            # For SOL, we can fetch from a known pair or use a fixed source
-            # For now, fetch it like any other token
-            pass
         price = get_current_price_from_dexscreener(mint)
         prices[mint] = price
-        # Add small delay to avoid rate limiting
-        time.sleep(0.1)
+        time.sleep(0.15)  # Increased delay to avoid rate limiting
     
     return prices
 
@@ -616,7 +605,7 @@ def process_trade_data(raw_trades: List[Dict[str, Any]]) -> pd.DataFrame:
     df['realized_pnl'] = df.apply(calculate_pnl, axis=1)
     return df
 
-# --- Behavior & Formatting (keeping existing functions) ---
+# --- Behavior & Formatting ---
 def compute_behavior_metrics(processed_trades: pd.DataFrame, within_seconds: int = 5,
                              interval_days: int = 0) -> Dict[str, Any]:
     """Compute trading behavior metrics, optionally filtered by time window."""
@@ -816,20 +805,21 @@ def format_behavior_panel(behavior: Dict[str, Any]) -> str:
     blacklist_pct = 0.0
 
     def get_emoji(count):
-        return "🟢" if count == 0 else "🔴"
+        return "SAFE" if count == 0 else "FLAG"
 
     lines = []
     lines.append("Phishing check")
-    lines.append(f"{get_emoji(blacklist_count)} Blacklist:\n  {blacklist_count} ({blacklist_pct:.0f}%)")
-    lines.append(f"{get_emoji(sell_not_bought_count)} Didn't buy:\n  {sell_not_bought_count} ({sell_not_bought_pct:.0f}%)")
-    lines.append(f"{get_emoji(sold_gt_bought_count)} Sold > Bought:\n  {sold_gt_bought_count} ({sold_gt_bought_pct:.0f}%)")
-    lines.append(f"{get_emoji(sells_within)} Buy/Sell within fast window:\n  {sells_within} ({sells_within_pct:.0f}%)")
+    lines.append(f"[{get_emoji(blacklist_count)}] Blacklist: {blacklist_count} ({blacklist_pct:.0f}%)")
+    lines.append(f"[{get_emoji(sell_not_bought_count)}] Didn't buy: {sell_not_bought_count} ({sell_not_bought_pct:.0f}%)")
+    lines.append(f"[{get_emoji(sold_gt_bought_count)}] Sold > Bought: {sold_gt_bought_count} ({sold_gt_bought_pct:.0f}%)")
+    lines.append(f"[{get_emoji(sells_within)}] Buy/Sell within fast window: {sells_within} ({sells_within_pct:.0f}%)")
 
     return "\n".join(lines)
 
-# --- Analysis helpers (PnL) - MODIFIED for DexScreener prices ---
+# --- Analysis helpers (PnL) - OPTIMIZED ---
 
 def get_overall_pnl_summary(processed_trades, balances, interval_days):
+    """Get PnL summary - only fetches prices for tokens with current balances"""
     if processed_trades is None or processed_trades.empty:
         return {"error": "No processed trade data available."}
     
@@ -837,10 +827,17 @@ def get_overall_pnl_summary(processed_trades, balances, interval_days):
     interval_trades = processed_trades[processed_trades['block_timestamp'] >= interval_start_date]
     total_realized_pnl = float(interval_trades['realized_pnl'].sum())
     
-    # Get current prices from DexScreener for all tokens
-    print("\nFetching current prices from DexScreener...")
-    all_mints = processed_trades['mint_address'].unique().tolist()
-    current_prices = get_current_prices_batch(all_mints)
+    # OPTIMIZATION: Only fetch prices for tokens we currently hold
+    tokens_with_balance = []
+    if balances:
+        for token in balances:
+            mint = token.get('mint')
+            amount = safe_float(token.get('amount'))
+            if mint and amount > 0:
+                tokens_with_balance.append(mint)
+    
+    print(f"\nFetching prices for {len(tokens_with_balance)} tokens with current balances...")
+    current_prices = get_current_prices_batch(tokens_with_balance) if tokens_with_balance else {}
     
     unrealized_pnl_total = 0.0
     
@@ -892,7 +889,7 @@ def get_overall_pnl_summary(processed_trades, balances, interval_days):
 
 
 def get_pnl_distribution(processed_trades, interval_days=0):
-    """Get PnL distribution filtered by interval"""
+    """Get PnL distribution filtered by interval - NO price fetching needed"""
     if processed_trades is None or processed_trades.empty:
         return {"error": "No processed trade data available."}
 
@@ -932,8 +929,11 @@ def get_pnl_distribution(processed_trades, interval_days=0):
     return {'distribution_percentage': distribution, 'trade_counts': counts}
 
 
-def get_pnl_breakdown_per_token(processed_trades, balances, interval_days=0):
-    """Get per-token PnL breakdown with DexScreener prices"""
+def get_pnl_breakdown_per_token(processed_trades, balances, interval_days=0, mints_to_fetch: List[str] = None):
+    """
+    Get per-token PnL breakdown with DexScreener prices.
+    OPTIMIZATION: Only fetch prices for specified mints (paginated tokens)
+    """
     if processed_trades is None or processed_trades.empty:
         return {"error": "No processed trade data available."}
 
@@ -943,11 +943,6 @@ def get_pnl_breakdown_per_token(processed_trades, balances, interval_days=0):
         filtered_trades = processed_trades[processed_trades['block_timestamp'] >= cutoff_date].copy()
     else:
         filtered_trades = processed_trades.copy()
-
-    # Get current prices from DexScreener
-    print("\nFetching current prices from DexScreener for breakdown...")
-    all_mints = filtered_trades['mint_address'].unique().tolist()
-    current_prices = get_current_prices_batch(all_mints)
 
     # Use filtered trades for calculations
     buys = filtered_trades[filtered_trades['trade_type'] == 'buy']
@@ -978,6 +973,23 @@ def get_pnl_breakdown_per_token(processed_trades, balances, interval_days=0):
             if mint:
                 all_mints.add(mint)
 
+    # OPTIMIZATION: Only fetch prices for specified mints (if provided)
+    if mints_to_fetch is not None:
+        mints_needing_prices = [m for m in mints_to_fetch if m in all_mints]
+        print(f"Fetching prices for {len(mints_needing_prices)} tokens on current page...")
+    else:
+        # Fallback: fetch for tokens with balances
+        mints_needing_prices = []
+        if balances:
+            for token in balances:
+                mint = token.get('mint') or token.get('tokenAddress') or token.get('address')
+                amount = safe_float(token.get('amount') or token.get('balance') or token.get('uiAmount'), 0.0)
+                if mint and amount > 0 and mint in all_mints:
+                    mints_needing_prices.append(mint)
+        print(f"Fetching prices for {len(mints_needing_prices)} tokens with balances...")
+    
+    current_prices = get_current_prices_batch(mints_needing_prices) if mints_needing_prices else {}
+
     for mint in all_mints:
         data = {}
         data['total_realized_pnl_usd'] = float(realized_by_token.get(mint, 0.0))
@@ -995,7 +1007,7 @@ def get_pnl_breakdown_per_token(processed_trades, balances, interval_days=0):
                     data['current_balance'] = float(amount)
                     break
 
-        # Use DexScreener price instead of derived price
+        # Use fetched price if available, otherwise 0
         current_price = current_prices.get(mint, 0.0)
         data['current_price'] = float(current_price)
         
@@ -1067,11 +1079,14 @@ def get_wallet_data(wallet: str, refresh: bool = False):
 
     return balances, trades
 
-# Pagination functions with DexScreener prices
+# Pagination functions - OPTIMIZED to only fetch prices for current page
 
 def get_token_pnl_paginated(processed_trades: pd.DataFrame, balances: List[Dict],
-                           page: int = 1, per_page: int = 9) -> Dict[str, Any]:
-    """Get paginated token PnL data ordered by last trade time (descending)."""
+                           page: int = 1, per_page: int = 9, interval_days: int = 0) -> Dict[str, Any]:
+    """
+    Get paginated token PnL data ordered by last trade time (descending).
+    OPTIMIZATION: Only fetches prices for tokens on the current page
+    """
     if processed_trades is None or processed_trades.empty:
         return {
             "tokens": [],
@@ -1081,35 +1096,51 @@ def get_token_pnl_paginated(processed_trades: pd.DataFrame, balances: List[Dict]
             "total_pages": 0
         }
 
-    last_trade_times = processed_trades.groupby('mint_address')['block_timestamp'].max().to_dict()
-    breakdown = get_pnl_breakdown_per_token(processed_trades, balances)
+    # Filter by interval if needed
+    if interval_days > 0:
+        cutoff_date = processed_trades['block_timestamp'].max() - timedelta(days=interval_days)
+        filtered_trades = processed_trades[processed_trades['block_timestamp'] >= cutoff_date].copy()
+    else:
+        filtered_trades = processed_trades.copy()
+
+    last_trade_times = filtered_trades.groupby('mint_address')['block_timestamp'].max().to_dict()
+    
+    # First, get all tokens sorted by last trade time (without prices)
+    all_tokens_with_time = []
+    for mint, last_trade in last_trade_times.items():
+        all_tokens_with_time.append({
+            'mint': mint,
+            'last_trade_time': last_trade
+        })
+    
+    all_tokens_with_time.sort(key=lambda x: x['last_trade_time'], reverse=True)
+    
+    # Calculate pagination
+    total_tokens = len(all_tokens_with_time)
+    total_pages = (total_tokens + per_page - 1) // per_page
+    start_idx = (page - 1) * per_page
+    end_idx = start_idx + per_page
+    
+    # Get only the mints for the current page
+    page_tokens = all_tokens_with_time[start_idx:end_idx]
+    page_mints = [t['mint'] for t in page_tokens]
+    
+    # OPTIMIZATION: Only fetch breakdown (with prices) for current page mints
+    breakdown = get_pnl_breakdown_per_token(processed_trades, balances, interval_days=interval_days, mints_to_fetch=page_mints)
 
     if isinstance(breakdown, dict) and 'error' not in breakdown:
         token_list = []
-        for mint, data in breakdown.items():
-            last_trade = last_trade_times.get(mint)
-            if last_trade:
-                token_list.append({
-                    'mint': mint,
-                    'last_trade_time': last_trade.isoformat(),
-                    **data
-                })
-            else:
-                token_list.append({
-                    'mint': mint,
-                    'last_trade_time': datetime.datetime.now(timezone.utc).isoformat(),
-                    **data
-                })
-
-        token_list.sort(key=lambda x: x['last_trade_time'], reverse=True)
-
-        total_tokens = len(token_list)
-        total_pages = (total_tokens + per_page - 1) // per_page
-        start_idx = (page - 1) * per_page
-        end_idx = start_idx + per_page
+        for token in page_tokens:
+            mint = token['mint']
+            data = breakdown.get(mint, {})
+            token_list.append({
+                'mint': mint,
+                'last_trade_time': token['last_trade_time'].isoformat(),
+                **data
+            })
 
         return {
-            "tokens": token_list[start_idx:end_idx],
+            "tokens": token_list,
             "total_tokens": total_tokens,
             "page": page,
             "per_page": per_page,
@@ -1127,7 +1158,7 @@ def get_token_pnl_paginated(processed_trades: pd.DataFrame, balances: List[Dict]
 
 def get_trades_paginated(processed_trades: pd.DataFrame, page: int = 1,
                         per_page: int = 9) -> Dict[str, Any]:
-    """Get paginated individual trades ordered by trade time (descending)."""
+    """Get paginated individual trades ordered by trade time (descending). NO price fetching needed."""
     if processed_trades is None or processed_trades.empty:
         return {
             "trades": [],
@@ -1171,7 +1202,10 @@ def get_trades_paginated(processed_trades: pd.DataFrame, page: int = 1,
 
 def get_holdings_paginated(processed_trades: pd.DataFrame, balances: List[Dict],
                           page: int = 1, per_page: int = 9) -> Dict[str, Any]:
-    """Get paginated current holdings with PnL data using DexScreener prices."""
+    """
+    Get paginated current holdings with PnL data.
+    OPTIMIZATION: Only fetches prices for tokens on the current page
+    """
     if processed_trades is None or processed_trades.empty or not balances:
         return {
             "holdings": [],
@@ -1181,14 +1215,49 @@ def get_holdings_paginated(processed_trades: pd.DataFrame, balances: List[Dict],
             "total_pages": 0
         }
 
-    breakdown = get_pnl_breakdown_per_token(processed_trades, balances)
-
     buy_counts = processed_trades[processed_trades['trade_type'] == 'buy'].groupby('mint_address').size().to_dict()
     sell_counts = processed_trades[processed_trades['trade_type'] == 'sell'].groupby('mint_address').size().to_dict()
 
+    # First, identify all tokens with balances and sort them
+    holdings_preview = []
+    if balances:
+        for token in balances:
+            mint = token.get('mint') or token.get('tokenAddress') or token.get('address')
+            amount = safe_float(token.get('amount') or token.get('balance') or token.get('uiAmount'), 0.0)
+            if mint and amount > 0:
+                # Estimate balance USD using last trade price as approximation for sorting
+                last_price = 0.0
+                token_trades = processed_trades[processed_trades['mint_address'] == mint]
+                if not token_trades.empty:
+                    last_price = token_trades.iloc[-1]['price_per_token_usd']
+                
+                holdings_preview.append({
+                    'mint': mint,
+                    'amount': amount,
+                    'estimated_usd': amount * last_price
+                })
+    
+    holdings_preview.sort(key=lambda x: x['estimated_usd'], reverse=True)
+    
+    # Calculate pagination
+    total_holdings = len(holdings_preview)
+    total_pages = (total_holdings + per_page - 1) // per_page
+    start_idx = (page - 1) * per_page
+    end_idx = start_idx + per_page
+    
+    # Get only the mints for the current page
+    page_holdings = holdings_preview[start_idx:end_idx]
+    page_mints = [h['mint'] for h in page_holdings]
+    
+    # OPTIMIZATION: Only fetch breakdown (with prices) for current page mints
+    breakdown = get_pnl_breakdown_per_token(processed_trades, balances, mints_to_fetch=page_mints)
+
     if isinstance(breakdown, dict) and 'error' not in breakdown:
         holdings = []
-        for mint, data in breakdown.items():
+        for holding_preview in page_holdings:
+            mint = holding_preview['mint']
+            data = breakdown.get(mint, {})
+            
             if data.get('current_balance', 0) > 0:
                 current_price = data.get('current_price', 0)
                 balance_usd = data['current_balance'] * current_price
@@ -1210,15 +1279,8 @@ def get_holdings_paginated(processed_trades: pd.DataFrame, balances: List[Dict],
                     'total_sells': int(sells)
                 })
 
-        holdings.sort(key=lambda x: x['balance_usd'], reverse=True)
-
-        total_holdings = len(holdings)
-        total_pages = (total_holdings + per_page - 1) // per_page
-        start_idx = (page - 1) * per_page
-        end_idx = start_idx + per_page
-
         return {
-            "holdings": holdings[start_idx:end_idx],
+            "holdings": holdings,
             "total_holdings": total_holdings,
             "page": page,
             "per_page": per_page,
@@ -1237,7 +1299,7 @@ def get_holdings_paginated(processed_trades: pd.DataFrame, balances: List[Dict],
 # --- CLI main ---
 
 def main():
-    parser = argparse.ArgumentParser(description="Solana Wallet PnL Analysis Script with DexScreener prices")
+    parser = argparse.ArgumentParser(description="Solana Wallet PnL Analysis Script with optimized DexScreener price fetching")
     parser.add_argument("wallet_address", type=str, help="The Solana wallet address to analyze.")
     parser.add_argument("interval_days", type=int, nargs='?', default=0, help="The time interval in days for the PnL summary. Use 0 for All.")
     parser.add_argument("--fast-seconds", type=int, default=5, help="Seconds threshold to consider a sell as 'fast' after buy")
@@ -1266,7 +1328,7 @@ def main():
     print(panel)
 
     print("\n" + "="*60)
-    print("--- 1. Overall PnL Summary (with DexScreener prices) ---")
+    print("--- 1. Overall PnL Summary (optimized DexScreener fetching) ---")
     print("="*60)
     pnl_summary = get_overall_pnl_summary(processed_trades_df, balances, args.interval_days)
     if 'error' in pnl_summary:
@@ -1281,7 +1343,7 @@ def main():
     print("\n" + "="*60)
     print("--- 2. PnL Distribution of All Sells ---")
     print("="*60)
-    pnl_dist = get_pnl_distribution(processed_trades_df)
+    pnl_dist = get_pnl_distribution(processed_trades_df, args.interval_days)
     if 'error' in pnl_dist:
         print(pnl_dist['error'])
     else:
@@ -1296,26 +1358,20 @@ def main():
                 print(f"Category '{category}': {perc:.2f}% ({count} trades)")
 
     print("\n" + "="*60)
-    print("--- 3. PnL Breakdown Per Token (with DexScreener prices) ---")
+    print("--- 3. Sample Token PnL (First Page) ---")
     print("="*60)
-    pnl_breakdown = get_pnl_breakdown_per_token(processed_trades_df, balances)
-    if isinstance(pnl_breakdown, dict) and 'error' not in pnl_breakdown:
-        sorted_breakdown = sorted(pnl_breakdown.items(), key=lambda item: item[1].get('total_combined_pnl_usd', 0.0), reverse=True)
-        for mint, data in sorted_breakdown[:10]:  # Show top 10 tokens
-            print(f"\nToken: {mint}")
-            for key, value in data.items():
-                if isinstance(value, numbers.Real):
-                    if value is None:
-                        print(f"  - {key.replace('_', ' ').title()}: N/A")
-                    else:
-                        print(f"  - {key.replace('_', ' ').title()}: {value:,.2f}")
-                else:
-                    print(f"  - {key.replace('_', ' ').title()}: {value}")
-
-        if len(sorted_breakdown) > 10:
-            print(f"\n... and {len(sorted_breakdown) - 10} more tokens")
+    # Get first page of token PnL to demonstrate optimization
+    token_pnl_page1 = get_token_pnl_paginated(processed_trades_df, balances, page=1, per_page=5, interval_days=args.interval_days)
+    if token_pnl_page1['tokens']:
+        print(f"Showing page 1 of {token_pnl_page1['total_pages']} ({token_pnl_page1['total_tokens']} total tokens)")
+        for token_data in token_pnl_page1['tokens']:
+            print(f"\nToken: {token_data['mint']}")
+            print(f"  - Last Trade: {token_data.get('last_trade_time', 'N/A')}")
+            print(f"  - Total Combined PnL: ${token_data.get('total_combined_pnl_usd', 0):,.2f}")
+            print(f"  - Current Balance: {token_data.get('current_balance', 0):,.4f}")
+            print(f"  - Current Price: ${token_data.get('current_price', 0):,.6f}")
     else:
-        print("No breakdown available.")
+        print("No tokens found.")
 
     print("\n" + "="*60)
     print("Analysis complete!")
