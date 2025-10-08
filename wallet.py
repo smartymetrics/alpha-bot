@@ -928,11 +928,10 @@ def get_pnl_distribution(processed_trades, interval_days=0):
     counts = sells_df['pnl_category'].value_counts().to_dict()
     return {'distribution_percentage': distribution, 'trade_counts': counts}
 
-
 def get_pnl_breakdown_per_token(processed_trades, balances, interval_days=0, mints_to_fetch: List[str] = None):
     """
     Get per-token PnL breakdown with DexScreener prices.
-    OPTIMIZATION: Only fetch prices for specified mints (paginated tokens)
+    SMART OPTIMIZATION: Automatically only fetches prices for tokens with balances
     """
     if processed_trades is None or processed_trades.empty:
         return {"error": "No processed trade data available."}
@@ -973,12 +972,9 @@ def get_pnl_breakdown_per_token(processed_trades, balances, interval_days=0, min
             if mint:
                 all_mints.add(mint)
 
-    # OPTIMIZATION: Only fetch prices for specified mints (if provided)
-    if mints_to_fetch is not None:
-        mints_needing_prices = [m for m in mints_to_fetch if m in all_mints]
-        print(f"Fetching prices for {len(mints_needing_prices)} tokens on current page...")
-    else:
-        # Fallback: fetch for tokens with balances
+    # SMART OPTIMIZATION: If mints_to_fetch not provided, automatically detect tokens that need prices
+    # Only tokens with current balances need current prices for unrealized PnL
+    if mints_to_fetch is None:
         mints_needing_prices = []
         if balances:
             for token in balances:
@@ -986,9 +982,15 @@ def get_pnl_breakdown_per_token(processed_trades, balances, interval_days=0, min
                 amount = safe_float(token.get('amount') or token.get('balance') or token.get('uiAmount'), 0.0)
                 if mint and amount > 0 and mint in all_mints:
                     mints_needing_prices.append(mint)
-        print(f"Fetching prices for {len(mints_needing_prices)} tokens with balances...")
+        
+        print(f"[SMART OPTIMIZATION] Fetching prices for {len(mints_needing_prices)} tokens with balances (out of {len(all_mints)} total tokens)")
+    else:
+        # Use provided list (for pagination)
+        mints_needing_prices = [m for m in mints_to_fetch if m in all_mints]
+        print(f"[PAGINATION] Fetching prices for {len(mints_needing_prices)} tokens on current page")
     
-    current_prices = get_current_prices_batch(mints_needing_prices) if mints_needing_prices else {}
+    # Fetch prices with improved error handling
+    current_prices = get_current_prices_batch_safe(mints_needing_prices) if mints_needing_prices else {}
 
     for mint in all_mints:
         data = {}
@@ -1039,6 +1041,116 @@ def get_pnl_breakdown_per_token(processed_trades, balances, interval_days=0, min
         breakdown[mint] = data
 
     return breakdown
+
+
+def get_current_prices_batch_safe(mint_addresses: List[str]) -> Dict[str, float]:
+    """
+    Fetch current prices with exponential backoff and better error handling
+    """
+    if not mint_addresses:
+        return {}
+    
+    prices = {}
+    consecutive_failures = 0
+    total_429_errors = 0
+    
+    for i, mint in enumerate(mint_addresses):
+        try:
+            price = get_current_price_from_dexscreener_safe(mint)
+            prices[mint] = price
+            
+            if price == 0.0:
+                consecutive_failures += 1
+            else:
+                consecutive_failures = 0
+            
+            # Adaptive delay: increase if hitting failures
+            base_delay = 0.4  # Safer base delay (2.5 requests/sec)
+            if consecutive_failures > 0:
+                delay = base_delay * (1.5 ** min(consecutive_failures, 4))
+                if consecutive_failures >= 3:
+                    print(f"[WARNING] {consecutive_failures} consecutive failures, increasing delay to {delay:.2f}s")
+            else:
+                delay = base_delay
+            
+            # Don't delay after the last request
+            if i < len(mint_addresses) - 1:
+                time.sleep(delay)
+                
+        except Exception as e:
+            print(f"[ERROR] Failed to fetch price for {mint}: {e}")
+            prices[mint] = 0.0
+            consecutive_failures += 1
+    
+    failed_count = sum(1 for p in prices.values() if p == 0.0)
+    if failed_count > 0:
+        print(f"[WARNING] {failed_count}/{len(mint_addresses)} price fetches returned 0.0")
+    
+    return prices
+
+def get_current_price_from_dexscreener_safe(mint_address: str, retry_count: int = 3) -> float:
+    """
+    Fetch current price from DexScreener API with caching and exponential backoff.
+    Returns 0 if liquidity < $1 or on error.
+    """
+    cache_key = mint_address
+    if cache_key in _price_cache:
+        cached_price, cached_time = _price_cache[cache_key]
+        if time.time() - cached_time < _price_cache_ttl:
+            return cached_price
+    
+    for attempt in range(retry_count):
+        try:
+            url = DEXSCREENER_API_URL.format(mint_address)
+            response = requests.get(url, timeout=10)
+            
+            # Handle rate limiting with exponential backoff
+            if response.status_code == 429:
+                if attempt < retry_count - 1:
+                    wait_time = (2 ** attempt) + random.uniform(0, 1)
+                    print(f"[DexScreener] Rate limited on {mint_address[:8]}..., waiting {wait_time:.2f}s (attempt {attempt + 1}/{retry_count})")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    print(f"[DexScreener] Rate limit persists for {mint_address[:8]}... after {retry_count} attempts")
+                    _price_cache[cache_key] = (0.0, time.time())
+                    return 0.0
+            
+            response.raise_for_status()
+            data = response.json()
+            
+            pairs = data.get('pairs', [])
+            if not pairs or len(pairs) == 0:
+                _price_cache[cache_key] = (0.0, time.time())
+                return 0.0
+            
+            first_pair = pairs[0]
+            liquidity_usd = safe_float(first_pair.get('liquidity', {}).get('usd', 0))
+            if liquidity_usd <= 1.0:
+                _price_cache[cache_key] = (0.0, time.time())
+                return 0.0
+            
+            price_usd = safe_float(first_pair.get('priceUsd', 0))
+            _price_cache[cache_key] = (price_usd, time.time())
+            return price_usd
+            
+        except requests.exceptions.RequestException as e:
+            if attempt < retry_count - 1:
+                wait_time = (1.5 ** attempt) + random.uniform(0, 0.5)
+                print(f"[DexScreener] Request error for {mint_address[:8]}..., retrying in {wait_time:.2f}s: {str(e)[:50]}")
+                time.sleep(wait_time)
+                continue
+            else:
+                print(f"[ERROR] All retries failed for {mint_address[:8]}...: {e}")
+                _price_cache[cache_key] = (0.0, time.time())
+                return 0.0
+        except Exception as e:
+            print(f"[ERROR] Unexpected error fetching price for {mint_address[:8]}...: {e}")
+            _price_cache[cache_key] = (0.0, time.time())
+            return 0.0
+    
+    _price_cache[cache_key] = (0.0, time.time())
+    return 0.0
 
 def fetch_from_apis(wallet: str):
     """Fetch both balances and trades for a wallet using existing functions."""

@@ -1677,44 +1677,243 @@ class Monitor:
         if self._http_session and not self._http_session.closed:
             await self._http_session.close()
 
-    async def _run_goplus_check(self, mint: str) -> Dict[str, Any]:
-        url = f"https://api.gopluslabs.io/api/v1/solana/token_security?contract_addresses={mint}"
+    async def _run_rugcheck_check(self, mint: str) -> Dict[str, Any]:
+        """
+        Check token security using RugCheck API with comprehensive risk analysis.
+        This version aggregates liquidity across all markets.
+        """
+        url = f"https://api.rugcheck.xyz/v1/tokens/{mint}/report"
         session = await self._get_http_session()
         async with self._api_sema:
             try:
                 async with session.get(url, timeout=15) as resp:
                     if resp.status != 200:
                         text = await resp.text()
-                        return {"ok": False, "error": f"goplus_status_{resp.status}", "error_text": text}
+                        return {"ok": False, "error": f"rugcheck_status_{resp.status}", "error_text": text}
                     data = await resp.json()
             except Exception as e:
-                return {"ok": False, "error": "goplus_exception", "error_text": str(e)}
+                return {"ok": False, "error": "rugcheck_exception", "error_text": str(e)}
 
-        result = data.get("result", {}) or {}
-        entry = result.get(mint) or {}
-        authority_fields = [
-            "mintable", "freezable", "closable", "balance_mutable_authority",
-            "default_account_state_upgradable", "transfer_fee_upgradable", "transfer_hook_upgradable"
-        ]
-        hard_flags = []
-        for f in authority_fields:
-            fv = entry.get(f, {})
-            if isinstance(fv, dict) and fv.get("status") == "1":
-                hard_flags.append(f)
-        holders = entry.get("holders", []) or []
-        try:
-            holder_count = int(entry.get("holder_count") or len(holders) or 0)
-        except Exception:
-            holder_count = len(holders or [])
-        trusted_token = int(entry.get("trusted_token") or 0)
+        # Extract key security metrics
+        top_holders = data.get("topHolders", [])
+        rugged = data.get("rugged", False)
+        
+        # Authorities and Creator Balance
+        freeze_authority = data.get("freezeAuthority")
+        mint_authority = data.get("mintAuthority")
+        has_authorities = bool(freeze_authority or mint_authority)
+        creator_balance = data.get("creatorBalance", 0)
+
+        # Transfer fee check
+        transfer_fee_pct = data.get("transferFee", {}).get("pct", 0)
+        
+        # Holder metrics
+        total_holders = data.get("totalHolders", 0)
+        top1_holder_pct = top_holders[0].get("pct", 0) if top_holders else 0.0
+
+        # --- Liquidity Aggregation ---
+        markets = data.get("markets", [])
+        total_lp_locked_usd = 0.0
+        total_lp_usd = 0.0
+        lp_lock_details = []
+
+        for market in markets:
+            lp_data = market.get("lp", {})
+            if lp_data:
+                lp_locked_usd = float(lp_data.get("lpLockedUSD", 0))
+                lp_unlocked_usd = float(lp_data.get("lpUnlocked", 0))
+                
+                # Total LP for this market is locked + unlocked
+                lp_total_usd_market = lp_locked_usd + lp_unlocked_usd
+                
+                # Aggregate totals
+                total_lp_locked_usd += lp_locked_usd
+                total_lp_usd += lp_total_usd_market
+                
+                lp_lock_details.append({
+                    "market_type": market.get("marketType"),
+                    "locked_usd": lp_locked_usd,
+                    "total_usd": lp_total_usd_market,
+                    "locked_pct": lp_data.get("lpLockedPct", 0)
+                })
+        
+        # Calculate overall LP lock percentage from aggregated values
+        overall_lp_locked_pct = (total_lp_locked_usd / total_lp_usd * 100) if total_lp_usd > 0 else 0.0
+        lp_lock_sufficient = overall_lp_locked_pct >= 95.0
+
         return {
             "ok": True,
-            "hard_flags": hard_flags,
-            "holders": holders,
-            "holder_count": holder_count,
-            "trusted_token": trusted_token,
-            "raw": entry
+            "rugged": rugged,
+            "total_holders": total_holders,
+            "top1_holder_pct": top1_holder_pct,
+            "creator_balance": creator_balance,
+            "freeze_authority": freeze_authority,
+            "mint_authority": mint_authority,
+            "has_authorities": has_authorities,
+            "transfer_fee_pct": transfer_fee_pct,
+            # Aggregated liquidity metrics
+            "total_lp_usd": total_lp_usd,
+            "overall_lp_locked_pct": overall_lp_locked_pct,
+            "lp_lock_sufficient": lp_lock_sufficient,
+            "lp_lock_details": lp_lock_details,
+            "raw": data # Keep raw data for debugging
         }
+
+
+    async def _security_gate_and_route(self, start: Any, overlap_result: Dict[str, Any], overlap_store_obj: Dict[str, Any]):
+        mint = getattr(start, "mint", None) or (overlap_result or {}).get("mint")
+        grade = (overlap_result or {}).get("grade", "NONE")
+
+        if grade == "NONE":
+            overlap_store_obj.setdefault(mint, []).append({
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "result": overlap_result,
+                "security": "skipped_grade_none"
+            })
+            try:
+                self.overlap_store.save(overlap_store_obj)
+            except Exception:
+                pass
+            return
+
+        # Run RugCheck API call
+        try:
+            r = await retry_with_backoff(self._run_rugcheck_check, mint, retries=2, base_delay=0.8)
+        except Exception as e:
+            if self.debug:
+                print(f"[Security] Exception fetching RugCheck data for {mint}: {e}")
+            reasons = [f"rugcheck_exception:{str(e)}"]
+            await self._start_or_update_probation(mint, start, overlap_result, reasons)
+            return
+
+        reasons = []
+        
+        if not r.get("ok"):
+            reasons.append(f"rugcheck_error:{r.get('error')}")
+            await self._start_or_update_probation(mint, start, overlap_result, reasons)
+            return
+
+        # --- Enforce Security and Liquidity Rules ---
+
+        # Rule 1: Check if token is marked as rugged
+        if r.get("rugged"):
+            reasons.append("rugged:true")
+            if self.debug:
+                print(f"[Security] {mint} FAILED check: Marked as RUGGED by RugCheck")
+
+        # Rule 2: Check for mint/freeze authorities
+        if r.get("has_authorities"):
+            authorities = []
+            if r.get("freeze_authority"): authorities.append("freeze")
+            if r.get("mint_authority"): authorities.append("mint")
+            reason_str = f"authorities:{','.join(authorities)}"
+            reasons.append(reason_str)
+            if self.debug:
+                print(f"[Security] {mint} FAILED check: Has dangerous authorities: {', '.join(authorities)}")
+
+        # Rule 3: Check creator token balance
+        creator_balance = r.get("creator_balance", 0)
+        if creator_balance > 0:
+            reasons.append(f"creator_balance:{creator_balance}")
+            if self.debug:
+                print(f"[Security] {mint} FAILED check: Creator holds {creator_balance} tokens")
+
+        # Rule 4: Check transfer fee (must be <= 5%)
+        transfer_fee_pct = r.get("transfer_fee_pct", 0)
+        if transfer_fee_pct > 5:
+            reasons.append(f"transfer_fee:{transfer_fee_pct}%")
+            if self.debug:
+                print(f"[Security] {mint} FAILED check: Transfer fee is {transfer_fee_pct}% (max 5%)")
+
+        # Rule 5: Check top holder concentration (must be < 40%)
+        top1_pct = r.get("top1_holder_pct", 0.0)
+        if top1_pct >= 40:
+            reasons.append(f"top1_holder:{top1_pct:.1f}%")
+            if self.debug:
+                print(f"[Security] {mint} FAILED check: Top holder owns {top1_pct:.1f}% (max 40%)")
+
+        # Rule 6: Check holder count (must be >= 500)
+        holder_count = r.get("total_holders", 0)
+        if holder_count < 500:
+            reasons.append(f"holder_count:{holder_count}_req_500")
+            if self.debug:
+                print(f"[Security] {mint} FAILED check: Has {holder_count} holders (min 500)")
+
+        # Rule 7: Check aggregated liquidity lock percentage (must be >= 95%)
+        lp_locked_pct = r.get("overall_lp_locked_pct", 0.0)
+        if lp_locked_pct < 95.0:
+            reasons.append(f"lp_locked:{lp_locked_pct:.1f}%_req_95%")
+            if self.debug:
+                print(f"[Security] {mint} FAILED LP lock check: {lp_locked_pct:.1f}% locked (min 95%)")
+
+        # Rule 8: Check aggregated total liquidity (must be >= $30,000)
+        total_liquidity = r.get("total_lp_usd", 0.0)
+        if total_liquidity < 30000.0:
+            reasons.append(f"liquidity_usd:{total_liquidity:.2f}_req_30k")
+            if self.debug:
+                print(f"[Security] {mint} FAILED liquidity check: ${total_liquidity:,.2f} total liquidity (min $30,000)")
+        
+        # --- Decision Point ---
+        if reasons:
+            await self._start_or_update_probation(mint, start, overlap_result, reasons)
+            return
+
+        # Token passed all security checks, save result
+        if self.debug:
+            print(f"[Security] {mint} PASSED all checks: LP Locked={lp_locked_pct:.1f}%, Liquidity=${total_liquidity:,.2f}, Top Holder={top1_pct:.1f}%, Holders={holder_count}")
+        
+        try:
+            # Get a fresh overlap analysis before saving the "passed" state
+            fresh_overlap_result = await self.check_holders_overlap(start)
+            
+            # Use dexscreener to get current price, but not for gating
+            d = await retry_with_backoff(self._run_dexscreener_check, mint, retries=2, base_delay=0.8)
+            current_price_usd = float(d.get("raw", {}).get("priceUsd", 0.0)) if d.get("ok") else None
+
+            overlap_store_obj.setdefault(mint, []).append({
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "result": fresh_overlap_result,
+                "security": "passed",
+                "rugcheck": {
+                    "top1_holder_pct": top1_pct,
+                    "holder_count": holder_count,
+                    "has_authorities": r.get("has_authorities"),
+                    "creator_balance": creator_balance,
+                    "transfer_fee_pct": transfer_fee_pct,
+                    "lp_locked_pct": lp_locked_pct,
+                    "total_liquidity_usd": total_liquidity,
+                    "lp_lock_details": r.get("lp_lock_details", [])
+                },
+                "dexscreener": {
+                    "current_price_usd": current_price_usd
+                }
+            })
+            
+            if self.debug:
+                print(f"Grade update for {mint}: {overlap_result.get('grade', 'N/A')} -> {fresh_overlap_result.get('grade', 'N/A')}")
+                
+        except Exception as e:
+            if self.debug:
+                print(f"Fresh overlap check failed for {mint}, using original: {e}")
+            overlap_store_obj.setdefault(mint, []).append({
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "result": overlap_result,
+                "security": "passed_stale_overlap"
+            })
+
+        self.overlap_store.save(overlap_store_obj)
+        
+        if mint in self.pending_risky_tokens:
+            self.pending_risky_tokens.pop(mint, None)
+        
+        self.scheduling_store.update_token_state(mint, {
+            "status": "completed",
+            "promoted_at": datetime.now(timezone.utc).isoformat(),
+            "security_passed": True,
+            "liquidity_usd": total_liquidity,
+            "lp_locked_pct": lp_locked_pct,
+        })
+
 
     async def _run_dexscreener_check(self, mint: str) -> Dict[str, Any]:
         url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
@@ -1829,147 +2028,6 @@ class Monitor:
                         pass
             await asyncio.sleep(interval)
 
-    async def _security_gate_and_route(self, start: Any, overlap_result: Dict[str, Any], overlap_store_obj: Dict[str, Any]):
-        mint = getattr(start, "mint", None) or (overlap_result or {}).get("mint")
-        grade = (overlap_result or {}).get("grade", "NONE")
-        if grade == "NONE":
-            overlap_store_obj.setdefault(mint, []).append({
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "result": overlap_result,
-                "security": "skipped_grade_none"
-            })
-            try:
-                self.overlap_store.save(overlap_store_obj)
-            except Exception:
-                pass
-            return
-
-        # Run GoPlus
-        g = await retry_with_backoff(self._run_goplus_check, mint, retries=2, base_delay=0.8)
-        reasons = []
-        if not g.get("ok"):
-            reasons.append(f"goplus_error:{g.get('error')}")
-            await self._start_or_update_probation(mint, start, overlap_result, reasons)
-            return
-
-        hard = g.get("hard_flags", []) or []
-        if hard:
-            reasons.append("goplus_hard_flags:" + ",".join(hard))
-            await self._start_or_update_probation(mint, start, overlap_result, reasons)
-            return
-
-        holders = g.get("holders", []) or []
-        top1_percent = 0.0
-        if holders:
-            pstr = holders[0].get("percent") if holders[0].get("percent") is not None else None
-            if pstr is not None:
-                try:
-                    p = float(str(pstr))
-                    if p <= 1.0:
-                        top1_percent = p * 100.0
-                    else:
-                        top1_percent = p
-                except Exception:
-                    top1_percent = 0.0
-        holder_count = int(g.get("holder_count", 0) or 0)
-
-        now = int(datetime.now(timezone.utc).timestamp())
-        launch_ts = int(getattr(start, "block_time", now) or now)
-        age_seconds = max(0, now - launch_ts)
-        age_h = age_seconds / 3600.0
-
-        def top1_threshold_pass(top1_pct, age_h):
-            if age_h < 4:
-                return top1_pct <= 70.0
-            if age_h < 8:
-                return top1_pct <= 60.0
-            if age_h < 16:
-                return top1_pct <= 50.0
-            return top1_pct <= 60.0
-
-        def holder_count_pass(count, age_h):
-            if age_h < 4:
-                return count >= 20
-            if age_h < 8:
-                return count >= 50
-            if age_h < 16:
-                return count >= 100
-            return count >= 200
-
-        if not top1_threshold_pass(top1_percent, age_h):
-            reasons.append(f"top1_pct:{top1_percent:.2f}")
-        if not holder_count_pass(holder_count, age_h):
-            reasons.append(f"holder_count:{holder_count}")
-
-        if reasons:
-            await self._start_or_update_probation(mint, start, overlap_result, reasons)
-            return
-
-        d = await retry_with_backoff(self._run_dexscreener_check, mint, retries=2, base_delay=0.8)
-        
-        current_price_usd = None
-        if d.get("ok") and d.get("pair_exists"):
-            try:
-                current_price_usd = float(d.get("raw", {}).get("priceUsd", 0.0))
-            except (ValueError, TypeError):
-                current_price_usd = 0.0
-
-        if not d.get("ok"):
-            reasons.append(f"dexscreener_error:{d.get('error')}")
-            await self._start_or_update_probation(mint, start, overlap_result, reasons)
-            return
-
-        if not d.get("pair_exists") or (float(d.get("liquidity_usd", 0.0)) < 5000.0):
-            reasons.append(f"liquidity_usd:{d.get('liquidity_usd',0.0)}")
-            await self._start_or_update_probation(mint, start, overlap_result, reasons)
-            return
-
-        # ✅ Token passed all security checks - get fresh overlap before saving
-        try:
-            if self.debug:
-                print(f"Security passed for {mint}, getting fresh overlap analysis...")
-            fresh_overlap_result = await self.check_holders_overlap(start)
-            
-            overlap_store_obj.setdefault(mint, []).append({
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "result": fresh_overlap_result,  # Use fresh result instead of old one
-                "security": "passed",
-                "goplus": {"top1": top1_percent, "holder_count": holder_count},
-                "dexscreener": {"liquidity_usd": d.get("liquidity_usd"), "current_price_usd": current_price_usd}
-            })
-            
-            if self.debug:
-                old_grade = overlap_result.get("grade", "NONE")
-                new_grade = fresh_overlap_result.get("grade", "NONE")
-                print(f"Grade update for {mint}: {old_grade} -> {new_grade}")
-                
-        except Exception as e:
-            if self.debug:
-                print(f"Fresh overlap check failed for {mint}, using original: {e}")
-            # Fallback to original overlap result if fresh check fails
-            overlap_store_obj.setdefault(mint, []).append({
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "result": overlap_result,
-                "security": "passed",
-                "goplus": {"top1": top1_percent, "holder_count": holder_count},
-                "dexscreener": {"liquidity_usd": d.get("liquidity_usd"), "current_price_usd": current_price_usd}
-            })
-
-        try:
-            self.overlap_store.save(overlap_store_obj)
-        except Exception:
-            pass
-        
-        if mint in self.pending_risky_tokens:
-            self.pending_risky_tokens.pop(mint, None)
-        try:
-            self.scheduling_store.update_token_state(mint, {
-                "status": "completed",
-                "promoted_at": datetime.now(timezone.utc).isoformat(),
-                "security_passed": True
-            })
-        except Exception:
-            pass
 
     async def daily_dune_scheduler(self):
         """
