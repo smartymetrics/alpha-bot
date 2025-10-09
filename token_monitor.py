@@ -1641,8 +1641,8 @@ class Monitor:
         scheduling_store: SchedulingStore,
         *,
         coingecko_poll_interval_seconds: int = 30,
-        initial_check_delay_seconds: int = 3600, # Adjusted to 1 hour
-        repeat_interval_seconds: int = 7200, # Adjusted to 2 hours
+        initial_check_delay_seconds: int = 1800, # 30 minutes
+        repeat_interval_seconds: int = 3600, # 1 hour
         debug: bool = False,
     ):
         self.sol_client = sol_client
@@ -1866,9 +1866,20 @@ class Monitor:
             # Get a fresh overlap analysis before saving the "passed" state
             fresh_overlap_result = await self.check_holders_overlap(start)
             
-            # Use dexscreener to get current price, but not for gating
-            d = await retry_with_backoff(self._run_dexscreener_check, mint, retries=2, base_delay=0.8)
-            current_price_usd = float(d.get("raw", {}).get("priceUsd", 0.0)) if d.get("ok") else None
+            # Fetch DexScreener data with robust retries
+            dex_data = None
+            try:
+                dex_data = await retry_with_backoff(
+                    self._run_dexscreener_check, mint, retries=8, base_delay=1.5
+                )
+            except Exception as e:
+                if self.debug:
+                    print(f"[Security] Dexscreener check for {mint} failed after all retries: {e}")
+                # If it fails permanently, we'll save nulls
+                dex_data = {"ok": False, "price_usd": None, "market_cap_usd": None}
+
+            current_price_usd = dex_data.get("price_usd")
+            market_cap_usd = dex_data.get("market_cap_usd")
 
             overlap_store_obj.setdefault(mint, []).append({
                 "ts": datetime.now(timezone.utc).isoformat(),
@@ -1885,7 +1896,8 @@ class Monitor:
                     "lp_lock_details": r.get("lp_lock_details", [])
                 },
                 "dexscreener": {
-                    "current_price_usd": current_price_usd
+                    "current_price_usd": current_price_usd,
+                    "market_cap_usd": market_cap_usd,
                 }
             })
             
@@ -1916,28 +1928,66 @@ class Monitor:
 
 
     async def _run_dexscreener_check(self, mint: str) -> Dict[str, Any]:
+        """
+        Fetches token data from DexScreener.
+        Designed to be used with `retry_with_backoff`, so it raises exceptions on failure
+        (HTTP errors, no pairs found, invalid price) to trigger retries.
+        """
         url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
         session = await self._get_http_session()
         async with self._api_sema:
-            try:
-                async with session.get(url, timeout=12) as resp:
-                    if resp.status != 200:
-                        text = await resp.text()
-                        return {"ok": False, "error": f"dexscreener_status_{resp.status}", "error_text": text}
-                    data = await resp.json()
-            except Exception as e:
-                return {"ok": False, "error": "dexscreener_exception", "error_text": str(e)}
+            # Let retry_with_backoff handle exceptions from this block
+            async with session.get(url, timeout=15) as resp:
+                if resp.status == 429:
+                    # Specific error for rate limiting to make logs clearer
+                    raise aiohttp.ClientResponseError(
+                        resp.request_info, resp.history, status=resp.status,
+                        message=f"Rate limited by DexScreener for {mint}"
+                    )
+                # Raise an exception for any other 4xx/5xx status
+                resp.raise_for_status()
+                data = await resp.json()
 
         pairs = data.get("pairs") or []
         if not pairs:
-            return {"ok": True, "pair_exists": False, "liquidity_usd": 0.0, "raw": data}
+            # A successful response but no data is a retryable condition
+            raise ValueError(f"DexScreener: No pairs found for mint {mint}")
+
+        # Use the first pair as the canonical source
         p0 = pairs[0]
-        liquidity = p0.get("liquidity", {}).get("usd") or 0.0
+        
+        # Validate priceUsd: must exist and be a positive float
         try:
-            liquidity = float(liquidity)
-        except Exception:
+            price_str = p0.get("priceUsd")
+            if price_str is None:
+                raise ValueError("priceUsd is null")
+            price_usd = float(price_str)
+            if price_usd <= 0:
+                raise ValueError(f"price is zero or negative: {price_usd}")
+        except (ValueError, TypeError, KeyError) as e:
+            # Re-raise a more informative error to trigger retry
+            raise ValueError(f"DexScreener: Could not parse valid price for {mint}. Raw value: '{price_str}'. Details: {e}") from e
+
+        # Extract liquidity, converting to float safely
+        try:
+            liquidity = float(p0.get("liquidity", {}).get("usd", 0.0) or 0.0)
+        except (ValueError, TypeError):
             liquidity = 0.0
-        return {"ok": True, "pair_exists": True, "liquidity_usd": liquidity, "raw": p0}
+
+        # Extract FDV as market cap, converting to float safely
+        try:
+            fdv = float(p0.get("fdv", 0.0) or 0.0)
+        except (ValueError, TypeError):
+            fdv = 0.0
+
+        return {
+            "ok": True,
+            "pair_exists": True,
+            "liquidity_usd": liquidity,
+            "price_usd": price_usd,
+            "market_cap_usd": fdv,
+            "raw": p0
+        }
 
     async def _start_or_update_probation(self, mint: str, start: Any, overlap_result: Dict[str, Any], reasons: List[str]):
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -2549,8 +2599,8 @@ async def main_loop():
         overlap_store=overlap_store,
         scheduling_store=scheduling_store,
         coingecko_poll_interval_seconds=30,
-        initial_check_delay_seconds=1 * 3600, # Adjusted
-        repeat_interval_seconds=2 * 3600, # Adjusted
+        initial_check_delay_seconds=30 * 60, # 30 minutes
+        repeat_interval_seconds=1 * 3600, # 1 hour
         debug=True,
     )
 
