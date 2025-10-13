@@ -1639,6 +1639,8 @@ class Monitor:
         dune_builder: DuneWinnersBuilder,
         overlap_store: OverlapStore,
         scheduling_store: SchedulingStore,
+        # ------------------ 🚀 CHANGE 1: Accept http_session ------------------
+        http_session: aiohttp.ClientSession,
         *,
         coingecko_poll_interval_seconds: int = 30,
         initial_check_delay_seconds: int = 1800, # 30 minutes
@@ -1663,19 +1665,16 @@ class Monitor:
         # Probation / risky tokens (for GoPlus + Dexscreener gating)
         self.pending_risky_tokens: Dict[str, Dict[str, Any]] = {}  # mint -> {first_seen, last_checked, attempts, reasons, overlap_result}
         self._probation_tasks: Dict[str, asyncio.Task] = {}  # mint -> asyncio.Task
-        # HTTP session (shared)
-        self._http_session: Optional[aiohttp.ClientSession] = None
+        # ------------------ 🚀 CHANGE 2: Use the provided session ------------------
+        self.http_session = http_session
         # concurrency guard for external API calls
         self._api_sema = asyncio.Semaphore(8)
 
-    async def _get_http_session(self) -> aiohttp.ClientSession:
-        if not self._http_session or self._http_session.closed:
-            self._http_session = aiohttp.ClientSession()
-        return self._http_session
-
-    async def _close_http_session(self):
-        if self._http_session and not self._http_session.closed:
-            await self._http_session.close()
+    # ------------------ 🚀 CHANGE 3: Remove session management methods ------------------
+    # async def _get_http_session(self) -> aiohttp.ClientSession:
+    #     ...
+    # async def _close_http_session(self):
+    #     ...
 
     async def _run_rugcheck_check(self, mint: str) -> Dict[str, Any]:
         """
@@ -1683,7 +1682,8 @@ class Monitor:
         This version aggregates liquidity across all markets.
         """
         url = f"https://api.rugcheck.xyz/v1/tokens/{mint}/report"
-        session = await self._get_http_session()
+        # ------------------ 🚀 CHANGE 4: Use self.http_session directly ------------------
+        session = self.http_session
         async with self._api_sema:
             try:
                 async with session.get(url, timeout=15) as resp:
@@ -1934,7 +1934,8 @@ class Monitor:
         (HTTP errors, no pairs found, invalid price) to trigger retries.
         """
         url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
-        session = await self._get_http_session()
+        # ------------------ 🚀 CHANGE 5: Use self.http_session directly ------------------
+        session = self.http_session
         async with self._api_sema:
             # Let retry_with_backoff handle exceptions from this block
             async with session.get(url, timeout=15) as resp:
@@ -2570,48 +2571,60 @@ class Monitor:
 # Main loop wiring
 # -----------------------
 async def main_loop():
-    sol_client = SolanaAlphaClient()
-    ok = await sol_client.test_connection()
-    print("🚀 Solana RPC ok:", ok)
+    # ------------------ 🚀 CHANGE 6: Manage session lifecycle here ------------------
+    async with aiohttp.ClientSession() as http_session:
+        try:
+            sol_client = SolanaAlphaClient()
+            ok = await sol_client.test_connection()
+            print("🚀 Solana RPC ok:", ok)
 
-    td = TokenDiscovery(
-        client=sol_client,
-        coingecko_pro_api_key=COINGECKO_PRO_API_KEY,
-        dune_api_key=DUNE_API_KEY,
-        dune_query_id=DUNE_QUERY_ID,
-        dune_cache_file="./data/dune_recent.pkl",
-        timestamp_cache_file="./data/last_timestamp.pkl",
-        debug=True
-    )
-    holder_agg = HolderAggregator(sol_client, debug=True)
-    updater = JobLibTokenUpdater(data_dir="./data/token_data", expiry_hours=24, debug=True)
-    dune_cache = DuneWinnersCache(cache_dir="./data/dune_cache", debug=True)
-    dune_builder = DuneWinnersBuilder(cache=dune_cache, debug=True, max_concurrency=8)
-    overlap_store = OverlapStore(filepath="./data/overlap_results.pkl", debug=True)
-    scheduling_store = SchedulingStore(filepath="./data/scheduling_state.pkl", debug=True)
-    monitor = Monitor(
-        sol_client=sol_client,
-        token_discovery=td,
-        holder_agg=holder_agg,
-        updater=updater,
-        dune_cache=dune_cache,
-        dune_builder=dune_builder,
-        overlap_store=overlap_store,
-        scheduling_store=scheduling_store,
-        coingecko_poll_interval_seconds=30,
-        initial_check_delay_seconds=30 * 60, # 30 minutes
-        repeat_interval_seconds=1 * 3600, # 1 hour
-        debug=True,
-    )
+            td = TokenDiscovery(
+                client=sol_client,
+                coingecko_pro_api_key=COINGECKO_PRO_API_KEY,
+                dune_api_key=DUNE_API_KEY,
+                dune_query_id=DUNE_QUERY_ID,
+                dune_cache_file="./data/dune_recent.pkl",
+                timestamp_cache_file="./data/last_timestamp.pkl",
+                debug=True
+            )
+            holder_agg = HolderAggregator(sol_client, debug=True)
+            updater = JobLibTokenUpdater(data_dir="./data/token_data", expiry_hours=24, debug=True)
+            dune_cache = DuneWinnersCache(cache_dir="./data/dune_cache", debug=True)
+            dune_builder = DuneWinnersBuilder(cache=dune_cache, debug=True, max_concurrency=8)
+            overlap_store = OverlapStore(filepath="./data/overlap_results.pkl", debug=True)
+            scheduling_store = SchedulingStore(filepath="./data/scheduling_state.pkl", debug=True)
+            
+            monitor = Monitor(
+                sol_client=sol_client,
+                token_discovery=td,
+                holder_agg=holder_agg,
+                updater=updater,
+                dune_cache=dune_cache,
+                dune_builder=dune_builder,
+                overlap_store=overlap_store,
+                scheduling_store=scheduling_store,
+                http_session=http_session, # Pass the session here
+                coingecko_poll_interval_seconds=30,
+                initial_check_delay_seconds=30 * 60, # 30 minutes
+                repeat_interval_seconds=1 * 3600, # 1 hour
+                debug=True,
+            )
 
-    # Start both tasks concurrently - CoinGecko can poll while Dune builds cache
-    dune_task = asyncio.create_task(monitor.ensure_dune_holders())
-    coingecko_task = asyncio.create_task(monitor.poll_coingecko_loop())
-    
-    print("🚀 Starting CoinGecko polling and Dune cache building concurrently...")
-    
-    # Wait for both tasks (poll_coingecko_loop runs forever, so this keeps the program alive)
-    await asyncio.gather(dune_task, coingecko_task)
+            # Start both tasks concurrently
+            dune_task = asyncio.create_task(monitor.ensure_dune_holders())
+            coingecko_task = asyncio.create_task(monitor.poll_coingecko_loop())
+            
+            print("🚀 Starting CoinGecko polling and Dune cache building concurrently...")
+            
+            # Wait for both tasks (poll_coingecko_loop runs forever)
+            await asyncio.gather(dune_task, coingecko_task)
+
+        except asyncio.CancelledError:
+            print("🚀 Main loop was cancelled. Shutting down gracefully.")
+        finally:
+            # The 'async with' block ensures the http_session is closed automatically.
+            print("🚀 Main loop has finished.")
+
 
 if __name__ == "__main__":
     try:
