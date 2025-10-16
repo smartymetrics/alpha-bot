@@ -38,6 +38,9 @@ from typing import List, Set
 
 load_dotenv()
 
+PROBATION_TOP_N = int(os.getenv("PROBATION_TOP_N", "10"))
+PROBATION_THRESHOLD_PCT = float(os.getenv("PROBATION_THRESHOLD_PCT", "40.0"))
+
 COINGECKO_PRO_API_KEY = os.environ.get("GECKO_API")
 DUNE_API_KEY = os.environ.get("DUNE_API_KEY")
 DUNE_QUERY_ID = int(os.environ.get("DUNE_QUERY_ID"))
@@ -1512,6 +1515,61 @@ def safe_load_overlap(overlap_store):
 
 
 # -----------------------
+# Security Analysis Helpers
+# -----------------------
+def evaluate_probation_from_rugcheck(report: dict, top_n: int = PROBATION_TOP_N, threshold_pct: float = PROBATION_THRESHOLD_PCT) -> dict:
+    """
+    Evaluates if a token should be on probation based on top holder concentration from a RugCheck report.
+    This is a pure function for testability.
+
+    Configuration is managed via environment variables:
+      - PROBATION_TOP_N (default: 10)
+      - PROBATION_THRESHOLD_PCT (default: 40.0)
+
+    Returns a dict with:
+      - probation (bool): True if combined top N pct > threshold_pct
+      - top_n_pct (float): Sum of top N holders' pct values
+      - top_n (int): How many holders were actually processed
+      - threshold_pct (float): The threshold used for the check
+      - explanation (str): A short human-readable reason for the result
+    """
+    top_holders = report.get("topHolders")
+    if not isinstance(top_holders, list) or not top_holders:
+        return {
+            "probation": False,
+            "top_n_pct": 0.0,
+            "top_n": 0,
+            "threshold_pct": threshold_pct,
+            "explanation": "topHolders missing or empty in RugCheck report"
+        }
+
+    total_pct = 0.0
+    processed_count = 0
+    for holder in top_holders[:top_n]:
+        pct_val = holder.get("pct")
+        if pct_val is None:
+            continue
+        try:
+            pct = float(pct_val)
+            total_pct += pct
+            processed_count += 1
+        except (ValueError, TypeError):
+            continue
+
+    total_pct = round(total_pct, 6)
+    probation = total_pct > threshold_pct
+    explanation = f"Top {processed_count} holders own {total_pct}% of supply; threshold is >{threshold_pct}%. Probation={probation}."
+
+    return {
+        "probation": probation,
+        "top_n_pct": total_pct,
+        "top_n": processed_count,
+        "threshold_pct": threshold_pct,
+        "explanation": explanation
+    }
+
+
+# -----------------------
 # Grading logic
 # -----------------------
 def calculate_overlap_grade(overlap_count: int, overlap_percentage: float, concentration: float, weighted_concentration: float, total_new_holders: int, total_winner_wallets: int) -> str:
@@ -1695,6 +1753,9 @@ class Monitor:
                 return {"ok": False, "error": "rugcheck_exception", "error_text": str(e)}
 
         # Extract key security metrics
+        # --- Probation Check ---
+        probation_result = evaluate_probation_from_rugcheck(data)
+
         top_holders = data.get("topHolders", [])
         rugged = data.get("rugged", False)
         
@@ -1755,6 +1816,8 @@ class Monitor:
             "total_lp_usd": total_lp_usd,
             "overall_lp_locked_pct": overall_lp_locked_pct,
             "lp_lock_sufficient": lp_lock_sufficient,
+            "probation": probation_result["probation"],
+            "probation_meta": probation_result,
             "lp_lock_details": lp_lock_details,
             "raw": data # Keep raw data for debugging
         }
@@ -1794,6 +1857,13 @@ class Monitor:
             return
 
         # --- Enforce Security and Liquidity Rules ---
+
+        # Rule 0: Check for high holder concentration (probation)
+        if r.get("probation"):
+            probation_reason = r.get("probation_meta", {}).get("explanation", "Probation: High top holder concentration")
+            reasons.append(probation_reason)
+            if self.debug:
+                print(f"[Security] {mint} FAILED probation check: {probation_reason}")
 
         # Rule 1: Check if token is marked as rugged
         if r.get("rugged"):
@@ -1855,6 +1925,8 @@ class Monitor:
         
         # --- Decision Point ---
         if reasons:
+            if r.get("probation_meta"):
+                overlap_result["probation_meta"] = r.get("probation_meta")
             await self._start_or_update_probation(mint, start, overlap_result, reasons)
             return
 
@@ -1885,6 +1957,7 @@ class Monitor:
                 "ts": datetime.now(timezone.utc).isoformat(),
                 "result": fresh_overlap_result,
                 "security": "passed",
+                "probation_meta": r.get("probation_meta"),
                 "rugcheck": {
                     "top1_holder_pct": top1_pct,
                     "holder_count": holder_count,
