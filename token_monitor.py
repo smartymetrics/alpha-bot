@@ -1558,7 +1558,7 @@ def evaluate_probation_from_rugcheck(report: dict, top_n: int = PROBATION_TOP_N,
 
     total_pct = round(total_pct, 6)
     probation = total_pct > threshold_pct
-    explanation = f"Top {processed_count} holders own {total_pct}% of supply; threshold is >{threshold_pct}%. Probation={probation}."
+    explanation = f"Top {processed_count} holders own {total_pct:.2f}% of supply; threshold is >{threshold_pct}%. Probation={probation}."
 
     return {
         "probation": probation,
@@ -1734,6 +1734,47 @@ class Monitor:
     # async def _close_http_session(self):
     #     ...
 
+    async def _cleanup_finished_tasks(self):
+        """Periodically cleans up finished tasks and states from internal memory."""
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        cutoff_ts = now_ts - (24 * 3600)  # 24 hours ago
+
+        # --- Cleanup _probation_tasks ---
+        finished_probation_tasks = [
+            mint for mint, task in self._probation_tasks.items() if task.done()
+        ]
+        if finished_probation_tasks:
+            for mint in finished_probation_tasks:
+                del self._probation_tasks[mint]
+            if self.debug:
+                print(f"[Cleanup] Removed {len(finished_probation_tasks)} finished probation tasks from memory.")
+
+        # --- Cleanup _scheduled (as a safety net) ---
+        scheduling_state = self.scheduling_store.load()
+        expired_mints_in_mem = set()
+        
+        # Iterate over a copy of the set as we might modify it
+        for mint in list(self._scheduled):
+            state = scheduling_state.get(mint)
+            if not state:
+                continue
+
+            launch_time = state.get("launch_time", 0)
+            status = state.get("status")
+
+            # Condition 1: Token is older than 24 hours
+            if launch_time < cutoff_ts:
+                expired_mints_in_mem.add(mint)
+            # Condition 2: Token's lifecycle is explicitly finished
+            elif status in ["completed", "dropped", "failed"]:
+                expired_mints_in_mem.add(mint)
+
+        if expired_mints_in_mem:
+            for mint in expired_mints_in_mem:
+                self._scheduled.discard(mint)
+            if self.debug:
+                print(f"[Cleanup] Safety net removed {len(expired_mints_in_mem)} expired/completed tokens from _scheduled set.")
+
     async def _run_rugcheck_check(self, mint: str) -> Dict[str, Any]:
         """
         Check token security using RugCheck API with comprehensive risk analysis.
@@ -1858,7 +1899,7 @@ class Monitor:
 
         # --- Enforce Security and Liquidity Rules ---
 
-        # Rule 0: Check for high holder concentration (probation)
+        # Rule 0: Check for high holder concentration (probation) using the top N check.
         if r.get("probation"):
             probation_reason = r.get("probation_meta", {}).get("explanation", "Probation: High top holder concentration")
             reasons.append(probation_reason)
@@ -1895,12 +1936,12 @@ class Monitor:
             if self.debug:
                 print(f"[Security] {mint} FAILED check: Transfer fee is {transfer_fee_pct}% (max 5%)")
 
-        # Rule 5: Check top holder concentration (must be < 40%)
-        top1_pct = r.get("top1_holder_pct", 0.0)
-        if top1_pct >= 40:
-            reasons.append(f"top1_holder:{top1_pct:.1f}%")
-            if self.debug:
-                print(f"[Security] {mint} FAILED check: Top holder owns {top1_pct:.1f}% (max 40%)")
+        # Rule 5 (REMOVED): The check for top 1 holder is now covered by the more general probation check (Rule 0).
+        # top1_pct = r.get("top1_holder_pct", 0.0)
+        # if top1_pct >= 40:
+        #     reasons.append(f"top1_holder:{top1_pct:.1f}%")
+        #     if self.debug:
+        #         print(f"[Security] {mint} FAILED check: Top holder owns {top1_pct:.1f}% (max 40%)")
 
         # Rule 6: Check holder count (must be >= 500)
         holder_count = r.get("total_holders", 0)
@@ -1931,6 +1972,7 @@ class Monitor:
             return
 
         # Token passed all security checks, save result
+        top1_pct = r.get("top1_holder_pct", 0.0)
         if self.debug:
             print(f"[Security] {mint} PASSED all checks: LP Locked={lp_locked_pct:.1f}%, Liquidity=${total_liquidity:,.2f}, Top Holder={top1_pct:.1f}%, Holders={holder_count}")
         
@@ -2123,6 +2165,7 @@ class Monitor:
                         "dropped_at": datetime.now(timezone.utc).isoformat(),
                         "probation_final": True
                     })
+                    self._scheduled.discard(mint) # Cleanup from memory
                 except Exception:
                     pass
                 break
@@ -2339,6 +2382,7 @@ class Monitor:
         if not token_start:
             if self.debug:
                 print(f"_schedule_first_check_only: token {token_mint} not found in tracked tokens")
+            self._scheduled.discard(token_mint) # Cleanup from memory
             return
         try:
             res = await self.check_holders_overlap(token_start)
@@ -2379,6 +2423,7 @@ class Monitor:
         if not token_start:
             if self.debug:
                 print(f"_schedule_repeat_only: token {token_mint} not found in tracked tokens")
+            self._scheduled.discard(token_mint) # Cleanup from memory
             return
         current_time = int(datetime.now(timezone.utc).timestamp())
         launch_time = token_start.block_time or current_time
@@ -2389,6 +2434,7 @@ class Monitor:
                 "status": "completed",
                 "completed_at": datetime.now(timezone.utc).isoformat()
             })
+            self._scheduled.discard(token_mint) # Cleanup from memory
             return
         try:
             res = await self.check_holders_overlap(token_start)
@@ -2431,6 +2477,7 @@ class Monitor:
                     "status": "completed",
                     "completed_at": datetime.now(timezone.utc).isoformat()
                 })
+                self._scheduled.discard(start.mint) # Cleanup from memory
                 break
             try:
                 res = await self.check_holders_overlap(start)
@@ -2505,6 +2552,7 @@ class Monitor:
                 if current_time - self.last_cleanup > 3600:
                     await self.updater.cleanup_old_tokens_async()
                     self.scheduling_store.cleanup_old_states()
+                    await self._cleanup_finished_tasks() # Memory cleanup
                     self.last_cleanup = current_time
             except Exception as e:
                 if self.debug:
@@ -2532,6 +2580,7 @@ class Monitor:
                     "status": "completed",
                     "completed_at": datetime.now(timezone.utc).isoformat()
                 })
+                self._scheduled.discard(start.mint) # Cleanup from memory
                 break
             try:
                 res = await self.check_holders_overlap(start)
