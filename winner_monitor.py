@@ -7,9 +7,9 @@ Tracks high-frequency winner wallets and monitors their latest token purchases.
 - Enforces 6-hour cooldown per wallet
 - Analyzes discovered tokens for overlap with winner wallets
 - Applies RugCheck security validation for tokens with LOW+ grades
-- FIXED: Tokens that fail RugCheck do NOT get overlap checks (saves API calls)
-- FIXED: Failed tokens stay in memory for 24h hourly rechecks (NOT uploaded to Supabase)
-- Only tokens passing ALL requirements get uploaded to Supabase
+- Tokens that fail RugCheck, fail security requirements, or are in probation do NOT get overlap checks.
+- Failed tokens stay in memory for 24h hourly rechecks (NOT uploaded to Supabase).
+- ONLY tokens passing ALL RugCheck requirements AND having NON-ZERO overlap get uploaded to Supabase.
 """
 
 import asyncio
@@ -28,6 +28,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 # --- Local Imports ---
+# Assuming these are correct from your environment
 from shared.moralis_client import MoralisClient
 from supabase_utils import (
     download_dune_cache_file, 
@@ -47,9 +48,9 @@ load_dotenv()
 MORALIS_API_KEYS = [
     k.strip() for k in os.getenv("MORALIS_API_KEY", "").split(",") if k.strip()
 ]
-WINNER_POLL_INTERVAL_SECONDS = int(os.getenv("WINNER_POLL_INTERVAL_SECONDS", "900"))
+WINNER_POLL_INTERVAL_SECONDS = int(os.getenv("WINNER_POLL_INTERVAL_SECONDS", "1800"))
 WINNER_WALLET_COOLDOWN_SECONDS = int(os.getenv("WINNER_WALLET_COOLDOWN_SECONDS", "21600"))
-WINNER_TOP_N_WALLETS = int(os.getenv("WINNER_TOP_N_WALLETS", "50"))
+WINNER_TOP_N_WALLETS = int(os.getenv("WINNER_TOP_N_WALLETS", "70"))
 SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "monitor-data")
 
 # --- Probation Config ---
@@ -59,6 +60,12 @@ PROBATION_THRESHOLD_PCT = float(os.getenv("PROBATION_THRESHOLD_PCT", "40"))
 # --- Monitoring Window Config ---
 TOKEN_MONITORING_WINDOW_HOURS = int(os.getenv("TOKEN_MONITORING_WINDOW_HOURS", "24"))
 
+# --- MINIMUM SECURITY REQUIREMENTS (Reinforced to match user request) ---
+MIN_HOLDER_COUNT = 500
+MIN_LIQUIDITY_USD = 30000.0
+MIN_LP_LOCKED_PCT = 95.0
+MAX_TRANSFER_FEE_PCT = 5
+MAX_CREATOR_BALANCE = 0.0 # Must be exactly 0
 
 # -----------------------------------------------
 # Re-usable Helpers
@@ -153,11 +160,21 @@ def safe_load_overlap(overlap_store_or_obj: Any) -> Dict[str, List[Dict]]:
 
 
 def prune_old_overlap_entries(data: dict, expiry_hours: int = 24) -> dict:
-    """Robust pruning of overlap entries older than expiry_hours."""
+    """
+    Robust pruning of overlap entries older than expiry_hours
+    or with timestamps far in the future (handles clock skew).
+    """
     if not data:
         return {}
         
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=expiry_hours)
+    # --- MODIFIED: Requirement 1 ---
+    # Define both a past cutoff and a future cutoff
+    now = datetime.now(timezone.utc)
+    cutoff_past = now - timedelta(hours=expiry_hours)
+    # Prune entries with timestamps more than 1 day in the future
+    cutoff_future = now + timedelta(days=1)
+    # --- End Modification ---
+    
     pruned = {}
 
     for mint, entries in (data or {}).items():
@@ -176,6 +193,7 @@ def prune_old_overlap_entries(data: dict, expiry_hours: int = 24) -> dict:
                 )
             
             if ts_val is None:
+                # Keep entries without a recognizable timestamp
                 new_entries.append(entry)
                 continue
 
@@ -194,12 +212,19 @@ def prune_old_overlap_entries(data: dict, expiry_hours: int = 24) -> dict:
                     if ts.tzinfo is None:
                         ts = ts.replace(tzinfo=timezone.utc)
                 else:
+                    # Keep unrecognizable timestamp formats
                     new_entries.append(entry)
                     continue
                 
-                if ts and ts > cutoff:
+                # --- MODIFIED: Requirement 1 ---
+                # Keep entry only if it's within the valid time window
+                # (i.e., not expired AND not in the future)
+                if ts and (ts > cutoff_past and ts < cutoff_future):
                     new_entries.append(entry)
+                # --- End Modification ---
+                
             except Exception:
+                # Keep entries with parsing errors
                 new_entries.append(entry)
 
         if new_entries:
@@ -681,16 +706,52 @@ class AlphaOverlapStore:
             try:
                 normalized = safe_load_overlap(obj)
                 
+                # Prune by time first (handles Requirement 1)
                 pruned = prune_old_overlap_entries(
                     normalized, expiry_hours=expiry_hours
                 )
                 
-                joblib.dump(_sanitize_maybe(pruned), self.filepath)
+                # --- Requirement 2: Reinforce Quality Gate ---
+                # This filter runs every time the .pkl file is saved, ensuring
+                # only entries that meet quality standards are persisted.
+                filtered_for_quality = {}
+                has_uploadable_data = False
+                for mint, entries in pruned.items():
+                    valid_entries = []
+                    for entry in entries:
+                        # 1. Check for explicit "passed" security status
+                        is_security_passed = entry.get("security") == "passed"
+                        
+                        # 2. Check for a grade above "NONE"
+                        grade = entry.get("result", {}).get("grade", "NONE")
+                        is_graded = grade not in ("NONE", "UNKNOWN")
+                        
+                        # Only keep entries that pass BOTH checks
+                        if is_security_passed and is_graded:
+                            valid_entries.append(entry)
+                            has_uploadable_data = True # Set flag for upload check
+                        elif self.debug:
+                            security = entry.get("security", "N/A")
+                            ts = entry.get("ts", "N/A")
+                            print(f"[AlphaOverlapStore] 🗑️ Discarding old/failed entry from PKL for {mint} (TS: {ts}, Sec: {security}, Grade: {grade})")
+                            
+                    if valid_entries:
+                        filtered_for_quality[mint] = valid_entries
+                        
+                joblib.dump(_sanitize_maybe(filtered_for_quality), self.filepath)
+                # --- END Requirement 2 ---
 
+                # IMPORTANT: Only upload if save is not throttled
                 if now - self._last_upload < 120:
                     if self.debug:
                         print("[AlphaOverlapStore] 💾 Save throttled (recent upload). Local save OK.")
                     return
+
+                # Use the flag set during filtering
+                if not has_uploadable_data:
+                     if self.debug:
+                         print("[AlphaOverlapStore] ⚠️ Upload skipped (no new PASSED/GRADED tokens since last upload)")
+                     return
 
                 if self.debug:
                     print("[AlphaOverlapStore] 🚀 Uploading to Supabase...")
@@ -704,7 +765,7 @@ class AlphaOverlapStore:
                         print(f"[AlphaOverlapStore] ✅ Saved and uploaded at {time.ctime(now)}")
                 else:
                     if self.debug:
-                        print("[AlphaOverlapStore] ⚠️ Upload skipped (empty or NONE-only data)")
+                        print("[AlphaOverlapStore] ⚠️ Upload failed or skipped by utility (check utility logs)")
 
             except Exception as e:
                 if self.debug:
@@ -784,9 +845,15 @@ class AlphaTokenAnalyzer:
         for market in markets:
             lp_data = market.get("lp", {})
             if lp_data:
-                lp_locked_usd = float(lp_data.get("lpLockedUSD", 0) or 0)
-                lp_unlocked_usd = float(lp_data.get("lpUnlocked", 0) or 0)
+                # Ensure the values are treated as numbers
+                lp_locked_usd = float(lp_data.get("lpLockedUSD") or 0.0)
+                lp_unlocked_usd = float(lp_data.get("lpUnlocked") or 0.0)
                 lp_total_usd_market = lp_locked_usd + lp_unlocked_usd
+                
+                # Check for locked status for this market
+                market_lp_locked_pct = (lp_locked_usd / lp_total_usd_market * 100) if lp_total_usd_market > 0 else 0.0
+                
+                # Only count markets with sufficient lock towards totals? No, let's keep all
                 total_lp_locked_usd += lp_locked_usd
                 total_lp_usd += lp_total_usd_market
         
@@ -804,7 +871,7 @@ class AlphaTokenAnalyzer:
             "transfer_fee_pct": transfer_fee_pct,
             "total_lp_usd": total_lp_usd,
             "overall_lp_locked_pct": overall_lp_locked_pct,
-            "lp_lock_sufficient": overall_lp_locked_pct >= 95.0,
+            "lp_lock_sufficient": overall_lp_locked_pct >= MIN_LP_LOCKED_PCT,
             "probation": probation_result["probation"],
             "probation_meta": probation_result,
             "raw": data
@@ -813,7 +880,7 @@ class AlphaTokenAnalyzer:
     async def analyze_token(self, mint: str) -> Dict[str, Any]:
         """
         Comprehensive token analysis.
-        FIXED: If RugCheck fails, returns immediately without checking overlap.
+        If RugCheck fails OR probation=True OR security requirements fail, returns immediately without checking overlap.
         Failed tokens enter 24h monitoring loop and are NOT uploaded to Supabase.
         """
         if self.debug:
@@ -845,6 +912,8 @@ class AlphaTokenAnalyzer:
                     "holder_count": rugcheck.get("total_holders"),
                     "has_authorities": rugcheck.get("has_authorities"),
                     "creator_balance": rugcheck.get("creator_balance"),
+                    "freeze_authority": rugcheck.get("freeze_authority"),
+                    "mint_authority": rugcheck.get("mint_authority"),
                     "transfer_fee_pct": rugcheck.get("transfer_fee_pct"),
                     "lp_locked_pct": rugcheck.get("overall_lp_locked_pct"),
                     "total_liquidity_usd": rugcheck.get("total_lp_usd")
@@ -852,15 +921,16 @@ class AlphaTokenAnalyzer:
             else:
                 security_report["rugcheck_passed"] = False
                 if self.debug:
-                    print(f"[TokenAnalyzer] ❌ RugCheck failed for {mint}: {rugcheck.get('error')}")
+                    print(f"[TokenAnalyzer] ❌ RugCheck API call failed for {mint}: {rugcheck.get('error')}")
                     
         except Exception as e:
             security_report["rugcheck_passed"] = False
             if self.debug:
                 print(f"[TokenAnalyzer] ❌ RugCheck exception for {mint}: {e}")
 
-        # 2. CHECK RUGCHECK RESULT - RETURN IMMEDIATELY IF FAILED
-        # CRITICAL FIX: Do NOT proceed with overlap check if RugCheck fails
+        # --- PRE-OVERLAP SECURITY GATE ---
+        
+        # 2. CHECK RUGCHECK API SUCCESS - RETURN IMMEDIATELY IF FAILED
         if security_report["rugcheck_passed"] is False:
             if self.debug:
                 print(f"[TokenAnalyzer] ⚠️ RugCheck API failed for {mint} - SKIPPING overlap check")
@@ -875,11 +945,11 @@ class AlphaTokenAnalyzer:
                 "grade": "NONE",
                 "overlap_wallets_sample": [],
                 "security": security_report,
-                "needs_monitoring": True,
-                "skip_reason": "rugcheck_failed"
+                "needs_monitoring": True, # Keep in memory for recheck
+                "skip_reason": "rugcheck_api_failed"
             }
         
-        # Check if token is rugged
+        # 3. CHECK RUGGED STATUS
         if security_report["rugcheck"].get("rugged"):
             if self.debug:
                 print(f"[TokenAnalyzer] ⚠️ Token {mint} marked as RUGGED - SKIPPING overlap check")
@@ -894,11 +964,11 @@ class AlphaTokenAnalyzer:
                 "grade": "NONE",
                 "overlap_wallets_sample": [],
                 "security": security_report,
-                "needs_monitoring": True,
+                "needs_monitoring": True, # Keep in memory for recheck
                 "skip_reason": "rugged"
             }
         
-        # Check probation status
+        # 4. CHECK PROBATION STATUS
         if security_report["probation"]:
             if self.debug:
                 print(f"[TokenAnalyzer] ⚠️ Token {mint} in PROBATION - SKIPPING overlap check")
@@ -914,31 +984,37 @@ class AlphaTokenAnalyzer:
                 "grade": "NONE",
                 "overlap_wallets_sample": [],
                 "security": security_report,
-                "needs_monitoring": True,
+                "needs_monitoring": True, # Keep in memory for recheck
                 "skip_reason": "probation"
             }
-
-        # Check security requirements (holder count, liquidity, LP lock, etc.)
+        
+        # 5. CHECK MINIMUM SECURITY REQUIREMENTS (User-Requested Filtering)
         rugcheck_details = security_report.get("rugcheck", {})
         security_failures = []
         
+        # Check for active authorities (Mint/Freeze)
         if rugcheck_details.get("has_authorities"):
-            security_failures.append("has_authorities")
-            
-        if rugcheck_details.get("creator_balance", 0) > 0:
-            security_failures.append(f"creator_balance:{rugcheck_details.get('creator_balance')}")
-            
-        if rugcheck_details.get("transfer_fee_pct", 0) > 5:
-            security_failures.append(f"transfer_fee:{rugcheck_details.get('transfer_fee_pct')}%")
-            
-        if rugcheck_details.get("holder_count", 0) < 500:
-            security_failures.append(f"holder_count:{rugcheck_details.get('holder_count')}_req_500")
+            security_failures.append("has_active_authorities")
+        
+        # Check for creator balance (must be zero)
+        if rugcheck_details.get("creator_balance", 0) > MAX_CREATOR_BALANCE:
+            security_failures.append(f"creator_balance:{rugcheck_details.get('creator_balance')}_req_{MAX_CREATOR_BALANCE}")
+        
+        # Check transfer fee (must be low)
+        if rugcheck_details.get("transfer_fee_pct", 0) > MAX_TRANSFER_FEE_PCT:
+            security_failures.append(f"transfer_fee:{rugcheck_details.get('transfer_fee_pct')}%_req_<{MAX_TRANSFER_FEE_PCT}%")
+        
+        # Check holder count
+        if rugcheck_details.get("holder_count", 0) < MIN_HOLDER_COUNT:
+            security_failures.append(f"holder_count:{rugcheck_details.get('holder_count')}_req_{MIN_HOLDER_COUNT}")
              
-        if rugcheck_details.get("lp_locked_pct", 100) < 95.0:
-            security_failures.append(f"lp_locked:{rugcheck_details.get('lp_locked_pct')}%_req_95%")
+        # Check LP lock percentage
+        if rugcheck_details.get("lp_locked_pct", 0) < MIN_LP_LOCKED_PCT:
+            security_failures.append(f"lp_locked:{rugcheck_details.get('lp_locked_pct')}%_req_{MIN_LP_LOCKED_PCT}%")
              
-        if rugcheck_details.get("total_liquidity_usd", 0) < 30000.0:
-            security_failures.append(f"liquidity_usd:{rugcheck_details.get('total_liquidity_usd')}_req_30k")
+        # Check total liquidity USD
+        if rugcheck_details.get("total_liquidity_usd", 0) < MIN_LIQUIDITY_USD:
+            security_failures.append(f"liquidity_usd:{rugcheck_details.get('total_liquidity_usd'):.2f}_req_{MIN_LIQUIDITY_USD:.0f}")
         
         # If any security requirement fails, SKIP overlap check
         if security_failures:
@@ -956,15 +1032,18 @@ class AlphaTokenAnalyzer:
                 "grade": "NONE",
                 "overlap_wallets_sample": [],
                 "security": security_report,
-                "needs_monitoring": True,
+                "needs_monitoring": True, # Keep in memory for recheck
                 "skip_reason": "security_requirements_failed",
                 "security_failures": security_failures
             }
-
-        # 3. ONLY IF RUGCHECK PASSES ALL REQUIREMENTS, PROCEED WITH OVERLAP CHECK
-        if self.debug:
-            print(f"[TokenAnalyzer] ✅ RugCheck passed for {mint} - proceeding with overlap check")
         
+        # --- END PRE-OVERLAP SECURITY GATE ---
+        
+        # 6. ONLY IF ALL RUGCHECK REQUIREMENTS PASS, PROCEED WITH OVERLAP CHECK
+        if self.debug:
+            print(f"[TokenAnalyzer] ✅ RugCheck passed ALL requirements for {mint} - proceeding with overlap check")
+        
+        # Fetch token holders (expensive step)
         try:
             async with self.helius_limiter:
                 holders_list = await self.holder_agg.get_token_holders(
@@ -984,7 +1063,9 @@ class AlphaTokenAnalyzer:
                 "grade": "NONE",
                 "overlap_wallets_sample": [],
                 "security": security_report,
-                "error": f"Holder fetch failed: {e}"
+                "error": f"Holder fetch failed: {e}",
+                "needs_monitoring": True, # Should retry holder fetch
+                "skip_reason": "holder_fetch_failed"
             }
 
         # HYBRID SAMPLING RULE
@@ -1015,7 +1096,9 @@ class AlphaTokenAnalyzer:
                 "grade": "NONE",
                 "overlap_wallets_sample": [],
                 "security": security_report,
-                "error": "No holders found"
+                "error": "No holders found",
+                "needs_monitoring": True, # Keep monitoring in case of delayed data
+                "skip_reason": "zero_holders"
             }
 
         try:
@@ -1039,10 +1122,12 @@ class AlphaTokenAnalyzer:
                 "grade": "NONE",
                 "overlap_wallets_sample": [],
                 "security": security_report,
-                "error": f"Dune cache load failed: {e}"
+                "error": f"Dune cache load failed: {e}",
+                "needs_monitoring": True, # Should retry later
+                "skip_reason": "dune_cache_failed"
             }
 
-        # 4. OVERLAP CALCULATION
+        # 7. OVERLAP CALCULATION
         overlap = top_set.intersection(winners_union)
         overlap_count = len(overlap)
         
@@ -1059,7 +1144,7 @@ class AlphaTokenAnalyzer:
             if total_winner_weights else 0.0
         )
 
-        # 5. GRADE CALCULATION
+        # 8. GRADE CALCULATION
         grade = calculate_overlap_grade(
             overlap_count=overlap_count,
             overlap_percentage=overlap_pct, 
@@ -1068,6 +1153,18 @@ class AlphaTokenAnalyzer:
             total_new_holders=top_count,
             total_winner_wallets=total_winner_wallets
         )
+        
+        # 9. FINAL CHECK: ONLY UPLOAD IF OVERLAP IS FOUND (User requirement: only clean/quality tokens)
+        final_needs_monitoring = False
+        final_skip_reason = None
+        
+        if overlap_count == 0:
+            # If it passed all security but has no overlap, monitor it in case winners buy later.
+            final_needs_monitoring = True
+            final_skip_reason = "zero_overlap_after_security_pass"
+            if self.debug:
+                 print(f"[TokenAnalyzer] ⚠️ {mint} passed security but ZERO overlap - setting to monitoring.")
+            
         
         result = {
             "mint": mint,
@@ -1079,11 +1176,13 @@ class AlphaTokenAnalyzer:
             "total_winner_wallets": total_winner_wallets,
             "grade": grade,
             "overlap_wallets_sample": list(overlap)[:20],
-            "security": security_report
+            "security": security_report,
+            "needs_monitoring": final_needs_monitoring, # Only False if overlap > 0
+            "skip_reason": final_skip_reason
         }
         
-        if self.debug:
-            print(f"[TokenAnalyzer] ✅ {mint} -> Grade: {grade}, Overlap: {overlap_count}")
+        if self.debug and not final_needs_monitoring:
+            print(f"[TokenAnalyzer] ✅ {mint} -> Grade: {grade}, Overlap: {overlap_count}, CLEARED for upload")
             
         return result
 
@@ -1144,7 +1243,7 @@ class WinnerMonitor:
         self.monitoring_window_hours = monitoring_window_hours
         self.debug = debug
         
-        # Track ALL tokens under monitoring (including NONE grade)
+        # Track ALL tokens under monitoring (including NONE grade, probation, security fail)
         self.pending_tokens: Dict[str, Dict[str, Any]] = {}
         self._monitoring_tasks: Dict[str, asyncio.Task] = {}
         
@@ -1174,26 +1273,21 @@ class WinnerMonitor:
         check_type: str = "new_discovery"
     ) -> bool:
         """
-        FIXED: Properly handles tokens that need monitoring vs. upload.
-        - Tokens with needs_monitoring=True: Enter 24h monitoring loop (NOT uploaded)
-        - Tokens passing ALL requirements: Uploaded to Supabase immediately
+        Properly handles tokens that need monitoring vs. upload.
+        - Tokens with needs_monitoring=True: Enter 24h monitoring loop (NOT uploaded to Supabase)
+        - Tokens passing ALL requirements AND overlap_count > 0: Uploaded to Supabase immediately
         """
         mint = overlap_result.get("mint")
         if not mint:
             return False
         
-        # Check if token needs monitoring (RugCheck failed or security issues)
         needs_monitoring = overlap_result.get("needs_monitoring", False)
         skip_reason = overlap_result.get("skip_reason")
         security_failures = overlap_result.get("security_failures", [])
-        
         grade = overlap_result.get("grade", "NONE")
-        security_report = overlap_result.get("security", {})
+        overlap_count = overlap_result.get("overlap_count", 0)
         
-        if security_report is None:
-            security_report = {}
-        
-        # CRITICAL: If needs_monitoring flag is set, do NOT upload
+        # 1. CRITICAL: If needs_monitoring flag is set, do NOT upload. Start monitoring.
         if needs_monitoring:
             reasons = [skip_reason] if skip_reason else []
             reasons.extend(security_failures)
@@ -1202,49 +1296,43 @@ class WinnerMonitor:
                 print(f"[SecurityGate] 🔒 Token {mint} needs monitoring - NOT uploading to Supabase")
                 print(f"[SecurityGate] Reasons: {', '.join(reasons)}")
             
-            # Start monitoring loop (stays in memory only)
+            # Start/update monitoring loop (stays in memory only)
             await self._start_or_update_monitoring(mint, overlap_result, reasons, grade)
             return False  # Return False to prevent Supabase upload
-        
-        # Token passed RugCheck - check overlap results
-        overlap_count = overlap_result.get("overlap_count", 0)
-        
-        # Build entry for storage
-        entry = {
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "result": overlap_result,
-            "check_type": check_type
-        }
-        
-        # If zero overlap but passed RugCheck, still might want to monitor
-        if overlap_count == 0:
-            if self.debug:
-                print(f"[SecurityGate] ⚠️ Token {mint} passed RugCheck but has ZERO overlap - monitoring")
+
+        # 2. Token passed ALL checks (RugCheck, Probation, Security, AND has overlap > 0) - upload
+        # THIS IS THE ONLY PATH TO PERSISTENT STORAGE
+        if overlap_count > 0 and grade not in ("NONE", "UNKNOWN"):
             
-            reasons = ["zero_overlap"]
-            entry["security"] = "monitoring"
+            # Build entry for storage
+            entry = {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "result": overlap_result,
+                "check_type": check_type,
+                "security": "passed"  # This is the "passed" status checked by Requirement 2
+            }
             
-            await self._start_or_update_monitoring(mint, overlap_result, reasons, grade)
             current_store_state.setdefault(mint, []).append(entry)
-            return False  # Don't upload zero-overlap tokens yet
-        
-        # Token passed ALL checks - upload to Supabase
-        entry["security"] = "passed"
-        current_store_state.setdefault(mint, []).append(entry)
-        
-        # Remove from monitoring if it was there
-        if mint in self.pending_tokens:
+            
+            # Remove from monitoring if it was there (e.g. if a recheck brought it here)
+            if mint in self.pending_tokens:
+                if self.debug:
+                    print(f"[SecurityGate] ✅ Token {mint} passed and removed from monitoring.")
+                self.pending_tokens.pop(mint, None)
+                task = self._monitoring_tasks.pop(mint, None)
+                if task and not task.done():
+                    task.cancel()
+            
             if self.debug:
-                print(f"[SecurityGate] ✅ Token {mint} passed and removed from monitoring.")
-            self.pending_tokens.pop(mint, None)
-            task = self._monitoring_tasks.pop(mint, None)
-            if task and not task.done():
-                task.cancel()
-        
+                print(f"[SecurityGate] ✅ Token {mint} PASSED ALL CHECKS - uploading to Supabase [Grade: {grade}]")
+            
+            return True  # Upload to Supabase
+
+        # 3. If here, needs_monitoring was False, but overlap_count was 0 or grade was NONE.
         if self.debug:
-            print(f"[SecurityGate] ✅ Token {mint} PASSED all checks - uploading to Supabase [Grade: {grade}]")
-        
-        return True  # Upload to Supabase
+            print(f"[SecurityGate] ⚠️ Token {mint} passed security/probation but has ZERO overlap or {grade} grade. Not uploading.")
+            
+        return False # Do not upload zero-overlap/NONE-grade tokens
 
     async def poll_wallets_loop(self):
         """Main 15-minute loop: check top wallets for new tokens."""
@@ -1256,6 +1344,7 @@ class WinnerMonitor:
                 print(f"[PollLoop] Starting new poll cycle")
             
             try:
+                # Ranker should be run periodically for fresh data (now in refresh_dune_cache_loop)
                 all_ranked = self.wallet_ranker.get_top_n_wallets(n=10000)
                 
                 if self.debug:
@@ -1277,6 +1366,7 @@ class WinnerMonitor:
                 if self.debug:
                     print(f"[PollLoop] Processing {len(eligible)} eligible wallets this cycle")
                 
+                # Load state once before batch processing
                 current_store_state = self.overlap_store.load()
                 store_changed = False
                 
@@ -1292,6 +1382,8 @@ class WinnerMonitor:
                             self.wallet_scheduler.mark_wallet_checked(wallet, 0, key_used)
                             continue
                         
+                        # Only check new tokens or tokens failing monitoring.
+                        # Do NOT check tokens already in the main store or pending monitoring.
                         new_mints_to_check = [
                             m for m in mints 
                             if m not in current_store_state 
@@ -1315,10 +1407,11 @@ class WinnerMonitor:
                             if "error" in res:
                                 continue
                             
-                            changed = await self._security_gate_and_save(
+                            # The security gate handles whether it goes to monitoring or the store.
+                            uploaded_to_be_stored = await self._security_gate_and_save(
                                 res, current_store_state, "new_discovery"
                             )
-                            if changed:
+                            if uploaded_to_be_stored:
                                 store_changed = True
                             
                     except Exception as e:
@@ -1329,6 +1422,7 @@ class WinnerMonitor:
                         self.wallet_scheduler.mark_wallet_checked(wallet, 0, key_used)
 
                 if store_changed:
+                    # Save and upload if any token was cleared for upload in this batch
                     self.overlap_store.save(current_store_state)
                 
                 if self.debug:
@@ -1390,10 +1484,13 @@ class WinnerMonitor:
                     print("[RecheckLoop] -----------------------------------------------")
                     print("[RecheckLoop] 🔄 Starting hourly recheck...")
                 
+                # Load current store for recheck eligibility
                 current_store = self.overlap_store.load()
                 
+                # We only recheck tokens that are currently in the store and have a grade (passed the initial gate)
                 tokens_to_recheck = []
                 for mint, entries in current_store.items():
+                    # Do not recheck tokens already in the pending_tokens monitoring loop
                     if mint in self.pending_tokens:
                         continue
                     
@@ -1404,22 +1501,25 @@ class WinnerMonitor:
                         latest_entry = entries[-1]
                         latest_grade = latest_entry.get("result", {}).get("grade", "NONE")
                         
-                        if latest_grade != "NONE":
+                        # Recheck tokens that have a grade higher than NONE AND passed security
+                        if latest_grade not in ("NONE", "UNKNOWN") and latest_entry.get("security") == "passed":
                             tokens_to_recheck.append(mint)
                             
                     except Exception:
+                        # Fallback: recheck if entry is malformed but still exists
                         tokens_to_recheck.append(mint)
 
                 if not tokens_to_recheck:
                     if self.debug:
-                        print("[RecheckLoop] No graded (non-NONE) tokens to recheck.")
+                        print("[RecheckLoop] No graded (non-NONE/UNKNOWN) tokens to recheck.")
                     continue
                 
                 if self.debug:
-                    print(f"[RecheckLoop] Rechecking {len(tokens_to_recheck)} (non-NONE) tokens...")
+                    print(f"[RecheckLoop] Rechecking {len(tokens_to_recheck)} (non-NONE/UNKNOWN) tokens...")
                     
                 results = await self.token_analyzer.batch_analyze_tokens(tokens_to_recheck)
                 
+                # Re-load store as it may have changed during analysis (via monitoring passes)
                 current_store = self.overlap_store.load()
                 changed = False
                 
@@ -1430,16 +1530,34 @@ class WinnerMonitor:
                         
                     history = current_store.get(mint, [])
                     if not history:
+                        # If a token was removed between load and now, skip
                         continue 
                     
                     latest_entry = history[-1]
                     latest_grade = latest_entry.get("result", {}).get("grade", "NONE")
                     new_grade = res.get("grade", "NONE")
                     
-                    if latest_grade != new_grade:
+                    # If the recheck changed the grade OR the security/monitoring status changed
+                    security_check_passed = not res.get("needs_monitoring", False)
+                    overlap_check_passed = res.get("overlap_count", 0) > 0
+                    
+                    # If the security status is now failing (e.g. market cap drop, new authority)
+                    if not security_check_passed:
                         if self.debug:
-                            print(f"[RecheckLoop] 📊 Grade change {mint}: {latest_grade} -> {new_grade}")
+                            print(f"[RecheckLoop] ⚠️ {mint} FAILED SECURITY on recheck (Grade: {latest_grade} -> NONE). Moving to monitoring.")
                         
+                        # Use the security gate to put it into monitoring (since needs_monitoring=True)
+                        await self._security_gate_and_save(
+                            res, current_store, "hourly_recheck_fail"
+                        )
+                        # We don't mark as changed yet, as this is purely an in-memory change.
+                        
+                    # If the grade or overlap changed
+                    elif latest_grade != new_grade or (latest_grade not in ("NONE", "UNKNOWN") and overlap_check_passed):
+                        if self.debug:
+                            print(f"[RecheckLoop] 📊 Status change {mint}: {latest_grade} -> {new_grade}")
+                        
+                        # Use the security gate, which will append a new entry with "security": "passed"
                         gated = await self._security_gate_and_save(
                             res, current_store, "hourly_recheck"
                         )
@@ -1462,21 +1580,17 @@ class WinnerMonitor:
         now_iso = datetime.now(timezone.utc).isoformat()
         now_ts = int(datetime.now(timezone.utc).timestamp())
         
-        if mint not in self.pending_tokens:
-            self.pending_tokens[mint] = {
-                "first_seen_ts": now_ts,
-                "last_checked": now_iso,
-                "attempts": 1,
-                "reasons": list(dict.fromkeys(reasons)),
-                "overlap_result": overlap_result,
-                "grade": grade
-            }
-        else:
-            entry = self.pending_tokens[mint]
-            entry["last_checked"] = now_iso
-            entry["attempts"] = entry.get("attempts", 0) + 1
-            entry["reasons"] = list(dict.fromkeys(entry.get("reasons", []) + reasons))
-            entry["grade"] = grade
+        # Determine the correct first_seen_ts: keep the original if updating
+        first_seen_ts = self.pending_tokens.get(mint, {}).get("first_seen_ts", now_ts)
+        
+        self.pending_tokens[mint] = {
+            "first_seen_ts": first_seen_ts,
+            "last_checked": now_iso,
+            "attempts": self.pending_tokens.get(mint, {}).get("attempts", 0) + 1,
+            "reasons": list(dict.fromkeys(self.pending_tokens.get(mint, {}).get("reasons", []) + reasons)),
+            "overlap_result": overlap_result,
+            "grade": grade
+        }
 
         if mint in self._monitoring_tasks and not self._monitoring_tasks[mint].done():
             if self.debug:
@@ -1484,16 +1598,16 @@ class WinnerMonitor:
             return
 
         task = asyncio.create_task(
-            self._monitoring_recheck_loop(mint, overlap_result)
+            self._monitoring_recheck_loop(mint)
         )
         self._monitoring_tasks[mint] = task
         if self.debug:
             print(f"[Monitoring] 🔍 Started 24h monitoring for {mint} [Grade: {grade}]; reasons={self.pending_tokens[mint]['reasons']}")
 
     async def _monitoring_recheck_loop(
-        self, mint: str, overlap_result: Dict[str, Any]
+        self, mint: str
     ):
-        """Recheck token every hour for 24 hours (applies to ALL grades including NONE)."""
+        """Recheck token every hour for 24 hours (applies to ALL grades including NONE) that failed the gate."""
         entry = self.pending_tokens.get(mint)
         if not entry:
             return
@@ -1507,18 +1621,17 @@ class WinnerMonitor:
             if now_ts >= deadline:
                 if self.debug:
                     final_grade = entry.get("grade", "NONE")
-                    print(f"[Monitoring] ⏰ {mint} completed 24h monitoring [Final Grade: {final_grade}] -> NOT uploading to Supabase.")
+                    final_reasons = ", ".join(entry.get("reasons", ["no_reason"]))
+                    print(f"[Monitoring] ⏰ {mint} completed 24h monitoring [Final Grade: {final_grade}, Reasons: {final_reasons}] -> NOT uploading to Supabase.")
                 
-                monitoring_entry = self.pending_tokens.pop(mint, None)
+                # Remove from monitoring memory
+                self.pending_tokens.pop(mint, None)
                 self._monitoring_tasks.pop(mint, None)
-                
-                # DO NOT save to store - token failed monitoring
-                if self.debug:
-                    print(f"[Monitoring] Token {mint} removed from memory after 24h (never passed requirements)")
                 break
             
             await asyncio.sleep(interval)
             
+            # Check if token was removed during sleep (e.g. if it passed and was uploaded)
             if mint not in self.pending_tokens:
                 if self.debug:
                     print(f"[Monitoring] {mint} no longer in pending list. Exiting monitoring loop.")
@@ -1532,54 +1645,32 @@ class WinnerMonitor:
                     
                 fresh_result = await self.token_analyzer.analyze_token(mint)
                 
-                # Check if token now passes requirements
-                needs_monitoring = fresh_result.get("needs_monitoring", False)
+                # The crucial difference: we use the security gate.
+                # If it passes the gate (meaning security passes AND overlap > 0), it gets uploaded and removed from monitoring.
                 
-                if not needs_monitoring:
-                    # Token now passes all RugCheck requirements!
-                    new_grade = fresh_result.get("grade", "NONE")
-                    overlap_count = fresh_result.get("overlap_count", 0)
-                    
+                store = self.overlap_store.load()
+                uploaded = await self._security_gate_and_save(
+                    fresh_result, store, "monitoring_recheck"
+                )
+                
+                if uploaded:
+                    self.overlap_store.save(store)
+                    # _security_gate_and_save already removes it from pending_tokens and monitoring_tasks
                     if self.debug:
-                        print(f"[Monitoring] ✅ {mint} NOW PASSES RugCheck [Grade: {new_grade}, Overlap: {overlap_count}]!")
-                    
-                    # Check if it also has overlap
-                    if overlap_count > 0:
-                        if self.debug:
-                            print(f"[Monitoring] 🎉 {mint} PASSES ALL REQUIREMENTS - Uploading to Supabase!")
-                        
-                        # Add to store and upload
-                        store = self.overlap_store.load()
-                        store.setdefault(mint, []).append({
-                            "ts": datetime.now(timezone.utc).isoformat(),
-                            "result": fresh_result, 
-                            "security": "passed",
-                            "check_type": "monitoring_passed"
-                        })
-                        self.overlap_store.save(store)
-                        
-                        # Remove from monitoring
-                        self.pending_tokens.pop(mint, None)
-                        self._monitoring_tasks.pop(mint, None)
-                        break
-                    else:
-                        if self.debug:
-                            print(f"[Monitoring] ⚠️ {mint} passed RugCheck but still has ZERO overlap - continuing monitoring")
-                        
-                        # Update monitoring state but keep monitoring
-                        if mint in self.pending_tokens:
-                            self.pending_tokens[mint]["grade"] = new_grade
-                            self.pending_tokens[mint]["reasons"] = ["zero_overlap"]
+                        print(f"[Monitoring] 🎉 {mint} PASSED ALL REQUIREMENTS (recheck) - Uploaded and removed from monitoring!")
+                    break 
                 else:
-                    # Still failing requirements - update state
-                    if self.debug:
-                        skip_reason = fresh_result.get("skip_reason", "unknown")
-                        print(f"[Monitoring] 🔍 {mint} still failing: {skip_reason}")
-                    
+                    # Still failing to pass all requirements for upload (security/probation fail OR zero overlap)
+                    # Update monitoring state if it's still in pending_tokens
                     if mint in self.pending_tokens:
-                        self.pending_tokens[mint]["grade"] = fresh_result.get("grade", "NONE")
+                        if self.debug:
+                            print(f"[Monitoring] 🔍 {mint} still failing: {fresh_result.get('skip_reason', 'unknown')}")
                         
-                        # Update reasons
+                        entry = self.pending_tokens[mint]
+                        entry["last_checked"] = datetime.now(timezone.utc).isoformat()
+                        entry["attempts"] += 1
+                        
+                        # Update reasons from the fresh result
                         new_reasons = []
                         if fresh_result.get("skip_reason"):
                             new_reasons.append(fresh_result.get("skip_reason"))
@@ -1587,7 +1678,8 @@ class WinnerMonitor:
                             new_reasons.extend(fresh_result.get("security_failures"))
                         
                         if new_reasons:
-                            self.pending_tokens[mint]["reasons"] = list(dict.fromkeys(new_reasons))
+                            entry["reasons"] = list(dict.fromkeys(new_reasons))
+                        entry["grade"] = fresh_result.get("grade", "NONE")
                     
             except Exception as e:
                 if self.debug:
