@@ -19,6 +19,7 @@ import pandas as pd
 
 # Import the main monitoring loop
 from token_monitor import main_loop
+from winner_monitor import main
 
 # Import wallet PnL functions
 from wallet import (
@@ -32,9 +33,9 @@ from wallet import (
     get_pnl_breakdown_per_token,
     get_wallet_data,
     SUPABASE_AVAILABLE,
-    get_token_pnl_paginated,    # ADD THIS
-    get_trades_paginated,        # ADD THIS
-    get_holdings_paginated       # ADD THIS
+    get_token_pnl_paginated,    
+    get_trades_paginated,        
+    get_holdings_paginated       
 )
 
 # Setup logging
@@ -49,6 +50,7 @@ service_status = {
     "started_at": None,
     "last_activity": None,
     "monitor_running": False,
+    "winner_monitor_running": False,
     "error": None,
     "wallet_requests": 0,
     "last_wallet_request": None
@@ -67,25 +69,50 @@ async def run_monitor():
         logger.info("Attempting to restart monitor...")
         asyncio.create_task(run_monitor())
 
+async def run_winner_monitor():
+    """
+    Wrapper to run winner_monitor.py's main function and handle errors.
+    """
+    try:
+        await main()
+    except Exception as e:
+        logger.error(f"Winner monitor crashed: {e}")
+        service_status["winner_monitor_running"] = False
+        service_status["error"] = str(e)
+        # Attempt to restart after 10 seconds
+        await asyncio.sleep(10)
+        logger.info("Attempting to restart winner monitor...")
+        asyncio.create_task(run_winner_monitor())
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Handle application startup and shutdown"""
     # Startup
     service_status["started_at"] = datetime.utcnow().isoformat()
     service_status["monitor_running"] = True
-    
-    logger.info("Starting token monitor background task...")
-    
-    # Run main_loop as a background task
+    service_status["winner_monitor_running"] = True
+
+    logger.info("Starting token monitor and winner monitor background tasks...")
+
+    # Run main_loop and winner monitor as background tasks
     monitor_task = asyncio.create_task(run_monitor())
-    
+    winner_monitor_task = asyncio.create_task(run_winner_monitor())
+
     yield
-    
+
     # Shutdown
     logger.info("Shutting down token monitor...")
     monitor_task.cancel()
+
+    logger.info("Shutting down winner monitor...")
+    winner_monitor_task.cancel()
     try:
         await monitor_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await winner_monitor_task
     except asyncio.CancelledError:
         pass
 
@@ -231,7 +258,7 @@ async def get_wallet_pnl(
 async def get_wallet_behavior(
     address: str,
     fast_seconds: int = Query(5, ge=1, le=3600, description="Seconds threshold for fast sells"),
-    refresh: bool = Query(False, description="Force refresh from APIs")
+    refresh: bool = Query(False, description="Force refresh from APIs instead of using cache")
 ):
     """
     Get behavioral metrics and phishing check for a wallet
@@ -343,7 +370,7 @@ async def get_wallet_token_breakdown(
     address: str,
     limit: int = Query(10, ge=1, le=100, description="Number of tokens to return"),
     sort_by: str = Query("total_combined_pnl_usd", description="Field to sort by"),
-    refresh: bool = Query(False, description="Force refresh from APIs")
+    refresh: bool = Query(False, description="Force refresh data from APIs instead of using cache")
 ):
     """
     Get per-token PnL breakdown

@@ -6,6 +6,9 @@ Uploads both .pkl and .json versions of overlap results.
 Adds Dexscreener price enrichment (priceUsd) for each token.
 Overwrites existing files (no upsert).
 Supports dune cache file uploads under dune_cache/.
+
+NEW: Added support for 'alpha' overlap results with
+     upload_alpha_overlap_results().
 """
 
 import os
@@ -16,8 +19,15 @@ from supabase import create_client, Client
 import tempfile
 
 BUCKET_NAME = "monitor-data"
+
+# Original overlap files
 OVERLAP_FILE_NAME = "overlap_results.pkl"
 OVERLAP_JSON_NAME = "overlap_results.json"
+
+# Alpha overlap files
+OVERLAP_ALPHA_FILE_NAME = "overlap_results_alpha.pkl"
+OVERLAP_ALPHA_JSON_NAME = "overlap_results_alpha.json"
+
 MAX_SIZE_MB = 1.7
 
 
@@ -48,8 +58,8 @@ def fetch_dexscreener_price(token_id: str, debug: bool = True) -> float | None:
         resp = requests.get(url, timeout=10)
         data = resp.json()
         price = data.get("pairs", [{}])[0].get("priceUsd")
-        if debug:
-            print(f"💰 Dexscreener price for {token_id}: {price}")
+        # if debug:
+        #     print(f"💰 Dexscreener price for {token_id}: {price}")
         return float(price) if price else None
     except Exception as e:
         if debug:
@@ -65,11 +75,13 @@ def safe_get_grade(history_entry):
     if not isinstance(history_entry, dict):
         return "UNKNOWN"
 
+    # New 'alpha' structure
     if isinstance(history_entry.get("result"), dict):
         grade = history_entry["result"].get("grade")
         if isinstance(grade, str):
             return grade
 
+    # Original structure
     if isinstance(history_entry.get("grade"), str):
         return history_entry["grade"]
 
@@ -88,6 +100,12 @@ def safe_get_timestamp(history_entry):
     if not isinstance(history_entry, dict):
         return "1970-01-01T00:00:00"
 
+    # New 'alpha' structure
+    ts_field = history_entry.get("ts")
+    if isinstance(ts_field, str):
+        return ts_field
+
+    # Original structure
     for field in ["ts", "timestamp", "checked_at", "created_at", "updated_at"]:
         ts = history_entry.get(field)
         if isinstance(ts, str):
@@ -129,16 +147,33 @@ def prepare_json_from_pkl(pkl_path: str, debug: bool = True) -> bytes:
     for token_id, history in overlap_results.items():
         if not isinstance(history, list) or not history:
             continue
+        
+        # Get grade from the *latest* history entry
         grade = safe_get_grade(history[-1])
+        
         if grade != "NONE":
             latest = history[-1]
+            
+            # --- Handle both original and alpha structures ---
+            target_dict = None
+            if "result" in latest and isinstance(latest["result"], dict):
+                # This is 'alpha' structure: history[-1] = {"ts":..., "result":{...}}
+                target_dict = latest["result"]
+            elif "grade" in latest:
+                # This is 'original' structure: history[-1] = {"grade":..., "token":...}
+                target_dict = latest
+            else:
+                target_dict = latest # Fallback
+            
             # Ensure dexscreener section exists
-            if "dexscreener" not in latest or not isinstance(latest["dexscreener"], dict):
-                latest["dexscreener"] = {}
+            if "dexscreener" not in target_dict or not isinstance(target_dict.get("dexscreener"), dict):
+                target_dict["dexscreener"] = {}
+                
             # Add current price if missing
-            if "current_price_usd" not in latest["dexscreener"]:
+            if "current_price_usd" not in target_dict["dexscreener"]:
                 price = fetch_dexscreener_price(token_id, debug=debug)
-                latest["dexscreener"]["current_price_usd"] = price
+                target_dict["dexscreener"]["current_price_usd"] = price
+            
             filtered[token_id] = history
 
     if not filtered:
@@ -220,17 +255,7 @@ def upload_overlap_results(file_path: str, bucket: str = BUCKET_NAME, debug: boo
 
     # Generate enriched JSON and update PKL
     json_bytes = prepare_json_from_pkl(file_path, debug=debug)
-    try:
-        json_obj = json.loads(json_bytes)
-    except Exception:
-        json_obj = {}
-
-    # if not json_obj:
-    #     if debug:
-    #         print("🚫 Filtered JSON empty, removing remote files")
-    #         get_supabase_client().storage.from_(bucket).remove([OVERLAP_FILE_NAME, OVERLAP_JSON_NAME])
-    #     return False
-
+    
     # Upload PKL
     if not upload_file(file_path, bucket, OVERLAP_FILE_NAME, debug=debug):
         return False
@@ -247,6 +272,44 @@ def upload_overlap_results(file_path: str, bucket: str = BUCKET_NAME, debug: boo
     except Exception as e:
         if debug:
             print(f"❌ JSON upload failed: {e}")
+        return False
+
+    return True
+
+# -------------------
+# NEW: Alpha Upload
+# -------------------
+def upload_alpha_overlap_results(file_path: str, bucket: str = BUCKET_NAME, debug: bool = True) -> bool:
+    """
+    Upload overlap_results_alpha.pkl + JSON, with Dexscreener enrichment.
+    (Filters NONE grades before upload)
+    """
+    if not os.path.exists(file_path):
+        if debug:
+            print(f"❌ Missing {file_path}")
+        return False
+
+    # Generate enriched JSON (which also filters NONE) and update PKL
+    json_bytes = prepare_json_from_pkl(file_path, debug=debug)
+    
+    # Upload PKL
+    if not upload_file(file_path, bucket, OVERLAP_ALPHA_FILE_NAME, debug=debug):
+        if debug:
+            print(f"❌ Alpha PKL upload failed for {OVERLAP_ALPHA_FILE_NAME}")
+        return False
+
+    # Upload JSON
+    try:
+        supabase = get_supabase_client()
+        supabase.storage.from_(bucket).remove([OVERLAP_ALPHA_JSON_NAME])
+        supabase.storage.from_(bucket).upload(
+            OVERLAP_ALPHA_JSON_NAME, json_bytes, {"content-type": "application/json"}
+        )
+        if debug:
+            print(f"✅ Uploaded {OVERLAP_ALPHA_JSON_NAME} ({len(json_bytes)/1024:.2f} KB)")
+    except Exception as e:
+        if debug:
+            print(f"❌ Alpha JSON upload failed: {e}")
         return False
 
     return True
@@ -346,6 +409,33 @@ def wallet_data_exists(wallet: str, bucket: str = BUCKET_NAME) -> bool:
 # Script Runner
 # -------------------
 if __name__ == "__main__":
+    # Test original upload
     test_pkl_path = r"C:\Users\HP USER\Documents\Data Analyst\degen smart\overlap_results (3).pkl"
-    upload_overlap_results(test_pkl_path)
-    download_overlap_results("./downloaded_overlap_results.pkl")
+    if os.path.exists(test_pkl_path):
+        upload_overlap_results(test_pkl_path)
+        download_overlap_results("./downloaded_overlap_results.pkl")
+    else:
+        print(f"Test file not found: {test_pkl_path}")
+        
+    # Test alpha upload
+    test_alpha_path = "./data/overlap_results_alpha.pkl"
+    if os.path.exists(test_alpha_path):
+        print("\nTesting Alpha Upload...")
+        upload_alpha_overlap_results(test_alpha_path)
+        download_file("./downloaded_alpha.pkl", OVERLAP_ALPHA_FILE_NAME)
+    else:
+        print(f"\nTest file not found: {test_alpha_path}")
+        # Create dummy file for testing
+        try:
+            os.makedirs("./data", exist_ok=True)
+            dummy_data = {
+                "tokenA": [{"ts": "2025-01-01T00:00:00Z", "result": {"grade": "HIGH"}}],
+                "tokenB": [{"ts": "2025-01-01T01:00:00Z", "result": {"grade": "NONE"}}]
+            }
+            with open(test_alpha_path, "wb") as f:
+                pickle.dump(dummy_data, f)
+            print("Created dummy alpha file for testing.")
+            upload_alpha_overlap_results(test_alpha_path)
+            download_file("./downloaded_alpha.pkl", OVERLAP_ALPHA_FILE_NAME)
+        except Exception as e:
+            print(f"Failed to create/upload dummy alpha file: {e}")

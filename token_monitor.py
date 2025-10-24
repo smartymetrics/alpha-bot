@@ -39,7 +39,7 @@ from typing import List, Set
 load_dotenv()
 
 PROBATION_TOP_N = int(os.getenv("PROBATION_TOP_N", "10"))
-PROBATION_THRESHOLD_PCT = float(os.getenv("PROBATION_THRESHOLD_PCT", "40.0"))
+PROBATION_THRESHOLD_PCT = float(os.getenv("PROBATION_THRESHOLD_PCT", "40"))
 
 COINGECKO_PRO_API_KEY = os.environ.get("GECKO_API")
 DUNE_API_KEY = os.environ.get("DUNE_API_KEY")
@@ -1588,7 +1588,7 @@ def calculate_overlap_grade(overlap_count: int, overlap_percentage: float, conce
         str: Grade level - "CRITICAL", "HIGH", "MEDIUM", "LOW", or "NONE"
     """
     
-    # CRITICAL: Extremely high overlap indicating potential manipulation
+    # CRITICAL: Extremely high overlap 
     if (
         # High overlap percentage with significant count
         (overlap_percentage >= 50 and overlap_count >= 100) or
@@ -1610,7 +1610,7 @@ def calculate_overlap_grade(overlap_count: int, overlap_percentage: float, conce
     ):
         return "CRITICAL"
     
-    # HIGH: Significant overlap suggesting coordinated activity
+    # HIGH: Significant overlap
     elif (
         # Moderate-high overlap percentage
         (overlap_percentage >= 30 and overlap_count >= 50) or
