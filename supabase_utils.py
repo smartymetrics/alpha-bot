@@ -36,11 +36,8 @@ MAX_SIZE_MB = 1.7
 # -------------------
 def get_supabase_client() -> Client:
     """Create and return a Supabase client. Uses env vars with local fallback."""
-    # SUPABASE_URL = os.getenv("SUPABASE_URL", "https://ldraroaloinsesjoayxc.supabase.co")
-    # SUPABASE_KEY = os.getenv("SUPABASE_KEY", "SUPABASE_KEY")
-
-    SUPABASE_URL="https://ldraroaloinsesjoayxc.supabase.co"
-    SUPABASE_KEY="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImxkcmFyb2Fsb2luc2Vzam9heXhjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTYzMzEyNDYsImV4cCI6MjA3MTkwNzI0Nn0._F1o7W9ttSGCEh70dEM6l2dtpG5lieo1nQ7Q9zA2VUs"
+    SUPABASE_URL = os.getenv("SUPABASE_URL", "https://ldraroaloinsesjoayxc.supabase.co")
+    SUPABASE_KEY = os.getenv("SUPABASE_KEY", "SUPABASE_KEY")
 
     if not SUPABASE_URL or not SUPABASE_KEY:
         raise RuntimeError("❌ Missing SUPABASE_URL or SUPABASE_KEY in environment variables")

@@ -118,16 +118,16 @@ class MoralisClient:
         Params: ?order=DESC&fromDate=...&transactionTypes=buy&limit=100
         """
         
-        # --- NEW: Use /swaps endpoint ---
+        # Use /swaps endpoint ---
         url = f"https://solana-gateway.moralis.io/account/mainnet/{wallet_address}/swaps"
         
-        # --- NEW: Generate fromDate for 12am UTC of current day ---
+        # Generate fromDate for 12am UTC of current day ---
         now_utc = datetime.now(timezone.utc)
         start_of_day = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
         # Format as YYYY-MM-DDTHH:MM:SS.mmm
         from_date_str = start_of_day.strftime('%Y-%m-%dT%H:%M:%S.000')
 
-        # --- NEW: Update params for /swaps endpoint ---
+        # params for /swaps endpoint ---
         params = {
             "order": "DESC",
             "fromDate": from_date_str,
