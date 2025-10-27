@@ -1697,6 +1697,7 @@ class Monitor:
         dune_builder: DuneWinnersBuilder,
         overlap_store: OverlapStore,
         scheduling_store: SchedulingStore,
+        # ------------------ 🚀 CHANGE 1: Accept http_session ------------------
         http_session: aiohttp.ClientSession,
         *,
         coingecko_poll_interval_seconds: int = 30,
@@ -1722,9 +1723,16 @@ class Monitor:
         # Probation / risky tokens (for GoPlus + Dexscreener gating)
         self.pending_risky_tokens: Dict[str, Dict[str, Any]] = {}  # mint -> {first_seen, last_checked, attempts, reasons, overlap_result}
         self._probation_tasks: Dict[str, asyncio.Task] = {}  # mint -> asyncio.Task
+        # ------------------ 🚀 CHANGE 2: Use the provided session ------------------
         self.http_session = http_session
         # concurrency guard for external API calls
         self._api_sema = asyncio.Semaphore(8)
+
+    # ------------------ 🚀 CHANGE 3: Remove session management methods ------------------
+    # async def _get_http_session(self) -> aiohttp.ClientSession:
+    #     ...
+    # async def _close_http_session(self):
+    #     ...
 
     async def _cleanup_finished_tasks(self):
         """Periodically cleans up finished tasks and states from internal memory."""
@@ -1773,6 +1781,7 @@ class Monitor:
         This version aggregates liquidity across all markets.
         """
         url = f"https://api.rugcheck.xyz/v1/tokens/{mint}/report"
+        # ------------------ 🚀 CHANGE 4: Use self.http_session directly ------------------
         session = self.http_session
         async with self._api_sema:
             try:
@@ -1791,18 +1800,11 @@ class Monitor:
         top_holders = data.get("topHolders", [])
         rugged = data.get("rugged", False)
         
-        # Token supply and creator balance
-        total_supply = data.get("supply", 0)
-        decimals = data.get("decimals", 6)
-        creator_balance = data.get("creatorBalance", 0)
-        
-        # Calculate creator percentage of supply
-        creator_pct = (creator_balance / total_supply * 100) if total_supply > 0 else 0
-        
-        # Authorities
+        # Authorities and Creator Balance
         freeze_authority = data.get("freezeAuthority")
         mint_authority = data.get("mintAuthority")
         has_authorities = bool(freeze_authority or mint_authority)
+        creator_balance = data.get("creatorBalance", 0)
 
         # Transfer fee check
         transfer_fee_pct = data.get("transferFee", {}).get("pct", 0)
@@ -1845,11 +1847,8 @@ class Monitor:
             "ok": True,
             "rugged": rugged,
             "total_holders": total_holders,
-            "total_supply": total_supply,
-            "decimals": decimals,
             "top1_holder_pct": top1_holder_pct,
             "creator_balance": creator_balance,
-            "creator_pct": creator_pct,
             "freeze_authority": freeze_authority,
             "mint_authority": mint_authority,
             "has_authorities": has_authorities,
@@ -1923,15 +1922,12 @@ class Monitor:
             if self.debug:
                 print(f"[Security] {mint} FAILED check: Has dangerous authorities: {', '.join(authorities)}")
 
-        # Rule 3: Check creator token balance (must not exceed 5% of supply)
+        # Rule 3: Check creator token balance
         creator_balance = r.get("creator_balance", 0)
-        total_supply = r.get("total_supply", 0)
-        creator_pct = r.get("creator_pct", 0)
-        
-        if creator_pct > 5.0:
-            reasons.append(f"creator_balance:{creator_balance}_pct:{creator_pct:.2f}%_max_5%")
+        if creator_balance > 0:
+            reasons.append(f"creator_balance:{creator_balance}")
             if self.debug:
-                print(f"[Security] {mint} FAILED check: Creator holds {creator_pct:.2f}% of supply (max 5%)")
+                print(f"[Security] {mint} FAILED check: Creator holds {creator_balance} tokens")
 
         # Rule 4: Check transfer fee (must be <= 5%)
         transfer_fee_pct = r.get("transfer_fee_pct", 0)
@@ -1940,10 +1936,19 @@ class Monitor:
             if self.debug:
                 print(f"[Security] {mint} FAILED check: Transfer fee is {transfer_fee_pct}% (max 5%)")
 
-        # Rule 6: Holder count check removed - accepting tokens with any number of holders
+        # Rule 5 (REMOVED): The check for top 1 holder is now covered by the more general probation check (Rule 0).
+        # top1_pct = r.get("top1_holder_pct", 0.0)
+        # if top1_pct >= 40:
+        #     reasons.append(f"top1_holder:{top1_pct:.1f}%")
+        #     if self.debug:
+        #         print(f"[Security] {mint} FAILED check: Top holder owns {top1_pct:.1f}% (max 40%)")
+
+        # Rule 6: Check holder count (must be >= 500)
         holder_count = r.get("total_holders", 0)
-        if self.debug and holder_count < 100:
-            print(f"[Security] {mint} has low holder count ({holder_count}) but proceeding with checks")
+        if holder_count < 500:
+            reasons.append(f"holder_count:{holder_count}_req_500")
+            if self.debug:
+                print(f"[Security] {mint} FAILED check: Has {holder_count} holders (min 500)")
 
         # Rule 7: Check aggregated liquidity lock percentage (must be >= 95%)
         lp_locked_pct = r.get("overall_lp_locked_pct", 0.0)
@@ -1952,10 +1957,12 @@ class Monitor:
             if self.debug:
                 print(f"[Security] {mint} FAILED LP lock check: {lp_locked_pct:.1f}% locked (min 95%)")
 
-        # Rule 8: Liquidity check removed - accepting tokens with any liquidity level
+        # Rule 8: Check aggregated total liquidity (must be >= $30,000)
         total_liquidity = r.get("total_lp_usd", 0.0)
-        if self.debug and total_liquidity < 10000:
-            print(f"[Security] {mint} has low liquidity (${total_liquidity:,.2f}) but proceeding with checks")
+        if total_liquidity < 30000.0:
+            reasons.append(f"liquidity_usd:{total_liquidity:.2f}_req_30k")
+            if self.debug:
+                print(f"[Security] {mint} FAILED liquidity check: ${total_liquidity:,.2f} total liquidity (min $30,000)")
         
         # --- Decision Point ---
         if reasons:
@@ -1967,7 +1974,7 @@ class Monitor:
         # Token passed all security checks, save result
         top1_pct = r.get("top1_holder_pct", 0.0)
         if self.debug:
-            print(f"[Security] {mint} PASSED all checks: LP Locked={lp_locked_pct:.1f}%, Liquidity=${total_liquidity:,.2f}, Top Holder={top1_pct:.1f}%, Holders={holder_count}, Creator={creator_pct:.2f}%")
+            print(f"[Security] {mint} PASSED all checks: LP Locked={lp_locked_pct:.1f}%, Liquidity=${total_liquidity:,.2f}, Top Holder={top1_pct:.1f}%, Holders={holder_count}")
         
         try:
             # Get a fresh overlap analysis before saving the "passed" state
@@ -1998,7 +2005,6 @@ class Monitor:
                     "holder_count": holder_count,
                     "has_authorities": r.get("has_authorities"),
                     "creator_balance": creator_balance,
-                    "creator_pct": creator_pct,
                     "transfer_fee_pct": transfer_fee_pct,
                     "lp_locked_pct": lp_locked_pct,
                     "total_liquidity_usd": total_liquidity,
@@ -2043,6 +2049,7 @@ class Monitor:
         (HTTP errors, no pairs found, invalid price) to trigger retries.
         """
         url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
+        # ------------------ 🚀 CHANGE 5: Use self.http_session directly ------------------
         session = self.http_session
         async with self._api_sema:
             # Let retry_with_backoff handle exceptions from this block
@@ -2686,6 +2693,7 @@ class Monitor:
 # Main loop wiring
 # -----------------------
 async def main_loop():
+    # ------------------ 🚀 CHANGE 6: Manage session lifecycle here ------------------
     async with aiohttp.ClientSession() as http_session:
         try:
             sol_client = SolanaAlphaClient()
@@ -2717,7 +2725,7 @@ async def main_loop():
                 dune_builder=dune_builder,
                 overlap_store=overlap_store,
                 scheduling_store=scheduling_store,
-                http_session=http_session,
+                http_session=http_session, # Pass the session here
                 coingecko_poll_interval_seconds=30,
                 initial_check_delay_seconds=30 * 60, # 30 minutes
                 repeat_interval_seconds=1 * 3600, # 1 hour
@@ -2736,6 +2744,7 @@ async def main_loop():
         except asyncio.CancelledError:
             print("🚀 Main loop was cancelled. Shutting down gracefully.")
         finally:
+            # The 'async with' block ensures the http_session is closed automatically.
             print("🚀 Main loop has finished.")
 
 
