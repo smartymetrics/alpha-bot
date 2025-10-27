@@ -1945,8 +1945,8 @@ class Monitor:
 
         # Rule 6: Check holder count (must be >= 500)
         holder_count = r.get("total_holders", 0)
-        if holder_count < 50:
-            reasons.append(f"holder_count:{holder_count}_req_50")
+        if holder_count < 500:
+            reasons.append(f"holder_count:{holder_count}_req_500")
             if self.debug:
                 print(f"[Security] {mint} FAILED check: Has {holder_count} holders (min 500)")
 
@@ -1959,8 +1959,8 @@ class Monitor:
 
         # Rule 8: Check aggregated total liquidity (must be >= $30,000)
         total_liquidity = r.get("total_lp_usd", 0.0)
-        if total_liquidity < 10000.0:
-            reasons.append(f"liquidity_usd:{total_liquidity:.2f}_req_10k")
+        if total_liquidity < 30000.0:
+            reasons.append(f"liquidity_usd:{total_liquidity:.2f}_req_30k")
             if self.debug:
                 print(f"[Security] {mint} FAILED liquidity check: ${total_liquidity:,.2f} total liquidity (min $30,000)")
         
