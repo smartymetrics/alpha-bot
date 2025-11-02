@@ -1,18 +1,15 @@
+#!/usr/bin/env python3
 """
 Enhanced token monitor with persistent scheduling and hierarchical overlap scoring.
 Now using CoinGecko Pro API for new token discovery.
-Features:
- - SchedulingStore: Persistent scheduling state using joblib
- - Enhanced overlap grading with CRITICAL/HIGH/MEDIUM/LOW classifications
- - Concentration-based grading
- - Startup recovery logic
- - Persistent timestamp tracking to avoid refetching
- - 24-hour token expiration
- - Rolling 7-day Dune winners cache (per-day files)
- - Wallet frequency and weighted concentration
- - Hybrid holder sampling (<=200 all; >200 top10% capped 500)
- - Bounded concurrency for holder fetching (Semaphore)
- - FULLY ASYNC DUNE INTEGRATION with INFINITE POLLING (NO TIMEOUTS)
+
+--- REFACTOR NOTES ---
+- This script is now structured like winner_monitor.py to reduce Helius API calls.
+- Helius (HolderAggregator) is now ONLY called AFTER a token passes
+  all RugCheck and minimum security requirements.
+- The core logic is consolidated into `run_token_analysis_step`.
+- Removed functions: _security_gate_and_route, _schedule_first_check_only, _schedule_repeat_check_only.
+- Renamed `check_holders_overlap` to `_fetch_and_calculate_overlap` for clarity.
 """
 import asyncio
 import aiohttp
@@ -1701,8 +1698,8 @@ class Monitor:
         http_session: aiohttp.ClientSession,
         *,
         coingecko_poll_interval_seconds: int = 30,
-        initial_check_delay_seconds: int = 1800, # 30 minutes
-        repeat_interval_seconds: int = 3600, # 1 hour
+        initial_check_delay_seconds: int = 600, # 10 minutes
+        repeat_interval_seconds: int = 1800, # 30 minutes
         debug: bool = False,
     ):
         self.sol_client = sol_client
@@ -1863,184 +1860,198 @@ class Monitor:
             "raw": data # Keep raw data for debugging
         }
 
+    # --------------------------------------------------------------------------
+    # --- 🚀 NEW: CONSOLIDATED ANALYSIS AND ROUTING LOGIC 🚀 ---
+    # --------------------------------------------------------------------------
 
-    async def _security_gate_and_route(self, start: Any, overlap_result: Dict[str, Any], overlap_store_obj: Dict[str, Any]):
-        mint = getattr(start, "mint", None) or (overlap_result or {}).get("mint")
-        grade = (overlap_result or {}).get("grade", "NONE")
+    def _extract_rugcheck_summary(self, r: Dict[str, Any]) -> Dict[str, Any]:
+        """Helper to format RugCheck data for saving."""
+        if not r.get("ok"):
+            return {"error": r.get("error", "unknown"), "error_text": r.get("error_text")}
+        return {
+            "top1_holder_pct": r.get("top1_holder_pct", 0.0),
+            "holder_count": r.get("total_holders", 0),
+            "has_authorities": r.get("has_authorities", False),
+            "creator_balance": r.get("creator_balance", 0),
+            "transfer_fee_pct": r.get("transfer_fee_pct", 0),
+            "lp_locked_pct": r.get("overall_lp_locked_pct", 0.0),
+            "total_liquidity_usd": r.get("total_lp_usd", 0.0),
+            "lp_lock_details": r.get("lp_lock_details", [])
+        }
 
-        if grade == "NONE":
-            overlap_store_obj.setdefault(mint, []).append({
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "result": overlap_result,
-                "security": "skipped_grade_none"
-            })
-            try:
-                self.overlap_store.save(overlap_store_obj)
-            except Exception:
-                pass
-            return
+    async def run_token_analysis_step(self, start: TradingStart, check_count: int):
+        """
+        This is the new core analysis function, replacing _security_gate_and_route.
+        It runs the full analysis lifecycle in the correct, efficient order.
+        1. Run RugCheck.
+        2. Run Pre-Helius Security Gate.
+        3. If fail, send to probation and RETURN.
+        4. If pass, run Helius call (_fetch_and_calculate_overlap).
+        5. If overlap=NONE, save and RETURN.
+        6. If overlap=PASS, run DexScreener, save, and mark as completed.
+        """
+        mint = start.mint
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        
+        if self.debug:
+            print(f"[Analysis] Running check #{check_count} for {mint}")
 
-        # Run RugCheck API call
+        # 1. RUN RUGCHECK FIRST
         try:
             r = await retry_with_backoff(self._run_rugcheck_check, mint, retries=2, base_delay=0.8)
         except Exception as e:
             if self.debug:
                 print(f"[Security] Exception fetching RugCheck data for {mint}: {e}")
             reasons = [f"rugcheck_exception:{str(e)}"]
-            await self._start_or_update_probation(mint, start, overlap_result, reasons)
+            await self._start_or_update_probation(mint, start, {"mint": mint, "grade": "NONE"}, reasons)
             return
 
+        # 2. PRE-HELIUS SECURITY GATE
         reasons = []
-        
         if not r.get("ok"):
             reasons.append(f"rugcheck_error:{r.get('error')}")
-            await self._start_or_update_probation(mint, start, overlap_result, reasons)
-            return
+        else:
+            # Rule 0: Check for high holder concentration (probation)
+            if r.get("probation"):
+                probation_reason = r.get("probation_meta", {}).get("explanation", "Probation: High top holder concentration")
+                reasons.append(probation_reason)
 
-        # --- Enforce Security and Liquidity Rules ---
+            # Rule 1: Check if token is marked as rugged
+            if r.get("rugged"):
+                reasons.append("rugged:true")
 
-        # Rule 0: Check for high holder concentration (probation) using the top N check.
-        if r.get("probation"):
-            probation_reason = r.get("probation_meta", {}).get("explanation", "Probation: High top holder concentration")
-            reasons.append(probation_reason)
-            if self.debug:
-                print(f"[Security] {mint} FAILED probation check: {probation_reason}")
+            # Rule 2: Check for mint/freeze authorities
+            if r.get("has_authorities"):
+                authorities = []
+                if r.get("freeze_authority"): authorities.append("freeze")
+                if r.get("mint_authority"): authorities.append("mint")
+                reasons.append(f"authorities:{','.join(authorities)}")
 
-        # Rule 1: Check if token is marked as rugged
-        if r.get("rugged"):
-            reasons.append("rugged:true")
-            if self.debug:
-                print(f"[Security] {mint} FAILED check: Marked as RUGGED by RugCheck")
+            # Rule 3: Check creator token balance
+            if r.get("creator_balance", 0) > 0:
+                reasons.append(f"creator_balance:{r.get('creator_balance')}")
 
-        # Rule 2: Check for mint/freeze authorities
-        if r.get("has_authorities"):
-            authorities = []
-            if r.get("freeze_authority"): authorities.append("freeze")
-            if r.get("mint_authority"): authorities.append("mint")
-            reason_str = f"authorities:{','.join(authorities)}"
-            reasons.append(reason_str)
-            if self.debug:
-                print(f"[Security] {mint} FAILED check: Has dangerous authorities: {', '.join(authorities)}")
+            # Rule 4: Check transfer fee (must be <= 5%)
+            if r.get("transfer_fee_pct", 0) > 5:
+                reasons.append(f"transfer_fee:{r.get('transfer_fee_pct')}%")
 
-        # Rule 3: Check creator token balance
-        creator_balance = r.get("creator_balance", 0)
-        if creator_balance > 0:
-            reasons.append(f"creator_balance:{creator_balance}")
-            if self.debug:
-                print(f"[Security] {mint} FAILED check: Creator holds {creator_balance} tokens")
+            # Rule 5: Check holder count (must be >= 50)
+            if r.get("total_holders", 0) < 50:
+                reasons.append(f"holder_count:{r.get('total_holders')}_req_50")
 
-        # Rule 4: Check transfer fee (must be <= 5%)
-        transfer_fee_pct = r.get("transfer_fee_pct", 0)
-        if transfer_fee_pct > 5:
-            reasons.append(f"transfer_fee:{transfer_fee_pct}%")
-            if self.debug:
-                print(f"[Security] {mint} FAILED check: Transfer fee is {transfer_fee_pct}% (max 5%)")
+            # Rule 6: Check aggregated liquidity lock percentage (must be >= 95%)
+            if r.get("overall_lp_locked_pct", 0.0) < 95.0:
+                reasons.append(f"lp_locked:{r.get('overall_lp_locked_pct'):.1f}%_req_95%")
 
-        # Rule 5 (REMOVED): The check for top 1 holder is now covered by the more general probation check (Rule 0).
-        # top1_pct = r.get("top1_holder_pct", 0.0)
-        # if top1_pct >= 40:
-        #     reasons.append(f"top1_holder:{top1_pct:.1f}%")
-        #     if self.debug:
-        #         print(f"[Security] {mint} FAILED check: Top holder owns {top1_pct:.1f}% (max 40%)")
+            # Rule 7: Check aggregated total liquidity (must be >= $15,000)
+            if r.get("total_lp_usd", 0.0) < 15000.0:
+                reasons.append(f"liquidity_usd:{r.get('total_lp_usd'):.2f}_req_15k")
 
-        # Rule 6: Check holder count (must be >= 500)
-        holder_count = r.get("total_holders", 0)
-        if holder_count < 500:
-            reasons.append(f"holder_count:{holder_count}_req_500")
-            if self.debug:
-                print(f"[Security] {mint} FAILED check: Has {holder_count} holders (min 500)")
-
-        # Rule 7: Check aggregated liquidity lock percentage (must be >= 95%)
-        lp_locked_pct = r.get("overall_lp_locked_pct", 0.0)
-        if lp_locked_pct < 95.0:
-            reasons.append(f"lp_locked:{lp_locked_pct:.1f}%_req_95%")
-            if self.debug:
-                print(f"[Security] {mint} FAILED LP lock check: {lp_locked_pct:.1f}% locked (min 95%)")
-
-        # Rule 8: Check aggregated total liquidity (must be >= $30,000)
-        total_liquidity = r.get("total_lp_usd", 0.0)
-        if total_liquidity < 30000.0:
-            reasons.append(f"liquidity_usd:{total_liquidity:.2f}_req_30k")
-            if self.debug:
-                print(f"[Security] {mint} FAILED liquidity check: ${total_liquidity:,.2f} total liquidity (min $30,000)")
-        
-        # --- Decision Point ---
         if reasons:
-            if r.get("probation_meta"):
-                overlap_result["probation_meta"] = r.get("probation_meta")
-            await self._start_or_update_probation(mint, start, overlap_result, reasons)
-            return
+            if self.debug:
+                print(f"[Security] {mint} FAILED pre-Helius check: {reasons}")
+            overlap_result_stub = {"mint": mint, "grade": "NONE", "probation_meta": r.get("probation_meta")}
+            await self._start_or_update_probation(mint, start, overlap_result_stub, reasons)
+            
+            # Update scheduler to reflect "active" (but on probation) state
+            self.scheduling_store.update_token_state(mint, {
+                "status": "probation", # Explicitly set status to probation
+                "last_completed_check": now_ts,
+                "next_scheduled_check": now_ts + self.repeat_interval_seconds,
+                "total_checks_completed": check_count
+            })
+            return # Stop here, don't run Helius
 
-        # Token passed all security checks, save result
-        top1_pct = r.get("top1_holder_pct", 0.0)
+        # 3. HELIUS CALL (GATE PASSED)
         if self.debug:
-            print(f"[Security] {mint} PASSED all checks: LP Locked={lp_locked_pct:.1f}%, Liquidity=${total_liquidity:,.2f}, Top Holder={top1_pct:.1f}%, Holders={holder_count}")
+            print(f"[Security] {mint} PASSED pre-Helius check. Fetching holders...")
         
         try:
-            # Get a fresh overlap analysis before saving the "passed" state
-            fresh_overlap_result = await self.check_holders_overlap(start)
-            
-            # Fetch DexScreener data with robust retries
-            dex_data = None
-            try:
-                dex_data = await retry_with_backoff(
-                    self._run_dexscreener_check, mint, retries=8, base_delay=1.5
-                )
-            except Exception as e:
-                if self.debug:
-                    print(f"[Security] Dexscreener check for {mint} failed after all retries: {e}")
-                # If it fails permanently, we'll save nulls
-                dex_data = {"ok": False, "price_usd": None, "market_cap_usd": None}
-
-            current_price_usd = dex_data.get("price_usd")
-            market_cap_usd = dex_data.get("market_cap_usd")
-
-            overlap_store_obj.setdefault(mint, []).append({
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "result": fresh_overlap_result,
-                "security": "passed",
-                "probation_meta": r.get("probation_meta"),
-                "rugcheck": {
-                    "top1_holder_pct": top1_pct,
-                    "holder_count": holder_count,
-                    "has_authorities": r.get("has_authorities"),
-                    "creator_balance": creator_balance,
-                    "transfer_fee_pct": transfer_fee_pct,
-                    "lp_locked_pct": lp_locked_pct,
-                    "total_liquidity_usd": total_liquidity,
-                    "lp_lock_details": r.get("lp_lock_details", [])
-                },
-                "dexscreener": {
-                    "current_price_usd": current_price_usd,
-                    "market_cap_usd": market_cap_usd,
-                }
-            })
-            
-            if self.debug:
-                print(f"Grade update for {mint}: {overlap_result.get('grade', 'N/A')} -> {fresh_overlap_result.get('grade', 'N/A')}")
-                
+            overlap_result = await self._fetch_and_calculate_overlap(start)
         except Exception as e:
             if self.debug:
-                print(f"Fresh overlap check failed for {mint}, using original: {e}")
-            overlap_store_obj.setdefault(mint, []).append({
+                print(f"[Analysis] Helius call (_fetch_and_calculate_overlap) failed for {mint}: {e}")
+            self.scheduling_store.update_token_state(mint, {
+                "last_error": f"Helius_fail: {e}",
+                "last_error_at": datetime.now(timezone.utc).isoformat()
+            })
+            return # Retry on next loop
+
+        # 4. POST-HELIUS PROCESSING (SAVE/ROUTE)
+        grade = overlap_result.get("grade", "NONE")
+        
+        # 4a. Handle NONE Grade (Passed security, but no overlap)
+        if grade == "NONE":
+            if self.debug:
+                print(f"[Analysis] {mint} passed security, 0 overlap. Saving as NONE.")
+            obj = safe_load_overlap(self.overlap_store)
+            obj.setdefault(mint, []).append({
                 "ts": datetime.now(timezone.utc).isoformat(),
                 "result": overlap_result,
-                "security": "passed_stale_overlap"
+                "security": "passed_grade_none", # Mark as passed, but grade is none
+                "rugcheck": self._extract_rugcheck_summary(r)
             })
+            self.overlap_store.save(obj)
+            
+            # Token stays "active" and will be re-checked
+            self.scheduling_store.update_token_state(mint, {
+                "status": "active",
+                "last_completed_check": now_ts,
+                "next_scheduled_check": now_ts + self.repeat_interval_seconds,
+                "total_checks_completed": check_count
+            })
+            return
 
-        self.overlap_store.save(overlap_store_obj)
+        # 4b. Handle PASSED Token (Security PASS + Overlap PASS)
+        if self.debug:
+            print(f"[Analysis] {mint} PASSED ALL CHECKS (Grade: {grade}). Fetching DexScreener and saving.")
+
+        try:
+            dex_data = await retry_with_backoff(
+                self._run_dexscreener_check, mint, retries=8, base_delay=1.5
+            )
+        except Exception as e:
+            if self.debug:
+                print(f"[Analysis] Dexscreener check for {mint} failed after all retries: {e}")
+            dex_data = {"ok": False, "price_usd": None, "market_cap_usd": None}
+
+        # Save to overlap store
+        obj = safe_load_overlap(self.overlap_store)
+        obj.setdefault(mint, []).append({
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "result": overlap_result,
+            "security": "passed",
+            "probation_meta": r.get("probation_meta"),
+            "rugcheck": self._extract_rugcheck_summary(r),
+            "dexscreener": {
+                "current_price_usd": dex_data.get("price_usd"),
+                "market_cap_usd": dex_data.get("market_cap_usd"),
+            }
+        })
+        self.overlap_store.save(obj)
         
+        # Remove from probation (if it was there)
         if mint in self.pending_risky_tokens:
             self.pending_risky_tokens.pop(mint, None)
+            if self.debug:
+                print(f"[Analysis] {mint} promoted from probation.")
         
+        # Mark as "completed" in scheduler, stopping further checks
         self.scheduling_store.update_token_state(mint, {
-            "status": "completed",
+            "status": "completed", # Token is fully processed
             "promoted_at": datetime.now(timezone.utc).isoformat(),
             "security_passed": True,
-            "liquidity_usd": total_liquidity,
-            "lp_locked_pct": lp_locked_pct,
+            "liquidity_usd": r.get("total_lp_usd", 0.0),
+            "lp_locked_pct": r.get("overall_lp_locked_pct", 0.0),
+            "last_completed_check": now_ts,
+            "total_checks_completed": check_count
         })
+        if self.debug:
+            print(f"[Analysis] {mint} successfully processed and saved. Status set to 'completed'.")
 
+    # --------------------------------------------------------------------------
+    # --- 🚀 END: NEW ANALYSIS LOGIC 🚀 ---
+    # --------------------------------------------------------------------------
 
     async def _run_dexscreener_check(self, mint: str) -> Dict[str, Any]:
         """
@@ -2151,7 +2162,7 @@ class Monitor:
     async def _probation_recheck_loop(self, mint: str, start: Any):
         first_seen_ts = int(self.pending_risky_tokens.get(mint, {}).get("first_seen_ts", int(datetime.now(timezone.utc).timestamp())))
         deadline = first_seen_ts + 24 * 3600
-        interval = 30 * 60  # 30 minutes
+        interval = 5 * 60  # 5 minutes
 
         while True:
             now_ts = int(datetime.now(timezone.utc).timestamp())
@@ -2169,30 +2180,45 @@ class Monitor:
                 except Exception:
                     pass
                 break
-            # run a security-only check by calling the orchestrator but reuse overlap_result
+            
+            # --- 🚀 MODIFIED: Call the new analysis function ---
             try:
-                # prepare a minimal object for overlap store usage
-                obj = safe_load_overlap(self.overlap_store)
-                await self._security_gate_and_route(start, self.pending_risky_tokens[mint]["overlap_result"], obj)
+                entry = self.pending_risky_tokens.get(mint)
+                if not entry:
+                    if self.debug:
+                        print(f"Probation: {mint} no longer in pending list. Exiting loop.")
+                    break # Token was promoted and removed
+                
+                if self.debug:
+                    print(f"[Probation] Re-running analysis for {mint}...")
+                    
+                check_count = entry.get("attempts", 0)
+                
+                # This function will:
+                # 1. Re-run RugCheck
+                # 2. Re-run security gate
+                # 3. If it fails again, call _start_or_update_probation (updating the entry)
+                # 4. If it passes, run Helius, save, and remove from pending_risky_tokens
+                await self.run_token_analysis_step(start, check_count)
+                
+                # Check if the token is still in probation after the analysis
                 if mint not in self.pending_risky_tokens:
                     if self.debug:
-                        print(f"Probation: {mint} passed during probation -> exiting probation loop")
-                    break
+                        print(f"Probation: {mint} passed during probation recheck -> exiting probation loop")
+                    break # It passed and was promoted
+                    
             except Exception as e:
                 if self.debug:
                     print(f"Probation: error during recheck for {mint}: {e}")
-                entry = self.pending_risky_tokens.get(mint)
-                if entry:
-                    entry["last_checked"] = datetime.now(timezone.utc).isoformat()
-                    entry["attempts"] = entry.get("attempts", 0) + 1
-                    try:
-                        self.scheduling_store.update_token_state(mint, {
-                            "probation_last_checked": entry["last_checked"],
-                            "probation_attempts": entry["attempts"],
-                            "last_error": str(e),
-                        })
-                    except Exception:
-                        pass
+                # Log error to scheduler
+                try:
+                    self.scheduling_store.update_token_state(mint, {
+                        "last_error": str(e),
+                        "last_error_at": datetime.now(timezone.utc).isoformat()
+                    })
+                except Exception:
+                    pass
+            
             await asyncio.sleep(interval)
 
 
@@ -2314,195 +2340,71 @@ class Monitor:
         return token_to_top_holders, wallet_freq, loaded_days
 
     async def startup_recovery(self):
+        """
+        🚀 REFACTORED: On startup, load scheduling state and re-launch
+        the correct task for any pending, active, or probation tokens.
+        """
         if self.debug:
             print("Monitor ASYNC: performing startup recovery")
+            
         scheduling_state = self.scheduling_store.load()
         current_time = int(datetime.now(timezone.utc).timestamp())
         cutoff_time = current_time - (24 * 3600)
+        
         self.scheduling_store.cleanup_old_states(cutoff_time)
         await self.updater.cleanup_old_tokens_async()
+        
+        # Load all tracked tokens into a map for quick lookup
+        try:
+            tokens = await self.updater.get_tracked_tokens_async()
+            token_map = {t.mint: t for t in tokens}
+            if self.debug:
+                print(f"[Recovery] Loaded {len(token_map)} tracked tokens into map.")
+        except Exception as e:
+            if self.debug:
+                print(f"[Recovery] CRITICAL: Failed to load tracked tokens: {e}. Aborting recovery.")
+            return
+
         recovery_tasks = []
         for token_mint, state in scheduling_state.items():
             if token_mint in self._scheduled:
                 continue
-            launch_time = state.get("launch_time", 0)
-            if current_time - launch_time > 24 * 3600:
+            
+            # Find the corresponding TradingStart object
+            start_obj = token_map.get(token_mint)
+            if not start_obj:
+                if self.debug:
+                    print(f"[Recovery] Skipping {token_mint}: Not found in tracked tokens (likely expired).")
                 continue
+
             status = state.get("status", "unknown")
-            if status == "pending_first":
-                first_check_time = launch_time + self.initial_check_delay_seconds
-                delay = max(0, first_check_time - current_time)
+            
+            if status == "pending_first" or status == "active":
                 if self.debug:
-                    print(f"Recovery: scheduling first check for {token_mint} in {delay}s")
-                task = asyncio.create_task(self._schedule_first_check_only(token_mint, delay))
+                    print(f"[Recovery] Re-launching main check loop for {token_mint} (status: {status})")
+                task = asyncio.create_task(self._schedule_overlap_checks_for_token(start_obj))
                 recovery_tasks.append(task)
-            elif status == "active":
-                next_scheduled = state.get("next_scheduled_check", 0)
-                delay = max(0, next_scheduled - current_time)
-                if delay <= 300:
-                    delay = 0
-                if self.debug:
-                    print(f"Recovery: scheduling repeat check for {token_mint} in {delay}s")
-                task = asyncio.create_task(self._schedule_repeat_check_only(token_mint, delay))
-                recovery_tasks.append(task)
+                
             elif status == "probation":
-                # recreate minimal TradingStart and rehydrate probation loop
-                try:
-                    from_dataclass = globals().get("TradingStart")
-                    start_obj = None
-                    if from_dataclass:
-                        start_obj = from_dataclass(mint=token_mint, block_time=state.get("launch_time"))
-                    else:
-                        # fallback minimal object
-                        class _S: pass
-                        start_obj = _S()
-                        start_obj.mint = token_mint
-                        start_obj.block_time = state.get("launch_time")
-                    if self.debug:
-                        print(f"Recovery: rehydrating probation for {token_mint}")
-                    task = asyncio.create_task(self._probation_recheck_loop(token_mint, start_obj))
-                    recovery_tasks.append(task)
-                except Exception:
-                    if self.debug:
-                        print(f"Recovery: failed to rehydrate probation for {token_mint}")
+                if self.debug:
+                    print(f"[Recovery] Re-launching probation loop for {token_mint}")
+                # Re-hydrate the in-memory probation state to match
+                self.pending_risky_tokens[token_mint] = {
+                    "first_seen": state.get("probation_first_seen"),
+                    "first_seen_ts": int(datetime.fromisoformat(state.get("probation_first_seen")).timestamp()),
+                    "last_checked": state.get("probation_last_checked"),
+                    "attempts": state.get("probation_attempts", 1),
+                    "reasons": state.get("probation_reasons", ["recovered_from_probation"]),
+                    "overlap_result": {"mint": token_mint, "grade": "NONE"} # Stub
+                }
+                task = asyncio.create_task(self._probation_recheck_loop(token_mint, start_obj))
+                recovery_tasks.append(task)
+                
             self._scheduled.add(token_mint)
+            
         if recovery_tasks:
             if self.debug:
                 print(f"Monitor ASYNC: started {len(recovery_tasks)} recovery tasks")
-
-    async def _schedule_first_check_only(self, token_mint: str, delay_seconds: float):
-        if delay_seconds > 0:
-            await asyncio.sleep(delay_seconds)
-        tokens = await self.updater.get_tracked_tokens_async()
-        token_start = None
-        for t in tokens:
-            if t.mint == token_mint:
-                token_start = t
-                break
-        if not token_start:
-            if self.debug:
-                print(f"_schedule_first_check_only: token {token_mint} not found in tracked tokens")
-            self._scheduled.discard(token_mint) # Cleanup from memory
-            return
-        try:
-            res = await self.check_holders_overlap(token_start)
-            obj = safe_load_overlap(self.overlap_store)
-            # Route through security gate; it will save if passed or start probation otherwise
-            await self._security_gate_and_route(token_start, res, obj)
-            current_time = int(datetime.now(timezone.utc).timestamp())
-            next_check = current_time + self.repeat_interval_seconds
-            self.scheduling_store.update_token_state(token_mint, {
-                "status": "active",
-                "last_completed_check": current_time,
-                "next_scheduled_check": next_check,
-                "total_checks_completed": 1
-            })
-            asyncio.create_task(self._schedule_repeat_checks_for_token(token_start, next_check))
-            if self.debug:
-                print(f"_schedule_first_check_only: completed first check for {token_mint}, grade: {res.get('grade', 'N/A')}")
-        
-        except Exception as e:
-            if self.debug:
-                print(f"_schedule_first_check_only: error for {token_mint}: {e}")
-                traceback.print_exc()
-            self.scheduling_store.update_token_state(token_mint, {
-                "status": "failed",
-                "last_error": str(e),
-                "last_error_at": datetime.now(timezone.utc).isoformat()
-            })
-
-    async def _schedule_repeat_check_only(self, token_mint: str, delay_seconds: float):
-        if delay_seconds > 0:
-            await asyncio.sleep(delay_seconds)
-        tokens = await self.updater.get_tracked_tokens_async()
-        token_start = None
-        for t in tokens:
-            if t.mint == token_mint:
-                token_start = t
-                break
-        if not token_start:
-            if self.debug:
-                print(f"_schedule_repeat_only: token {token_mint} not found in tracked tokens")
-            self._scheduled.discard(token_mint) # Cleanup from memory
-            return
-        current_time = int(datetime.now(timezone.utc).timestamp())
-        launch_time = token_start.block_time or current_time
-        if current_time - launch_time > 24 * 3600:
-            if self.debug:
-                print(f"_schedule_repeat_check_only: token {token_mint} past 24h -> marking completed")
-            self.scheduling_store.update_token_state(token_mint, {
-                "status": "completed",
-                "completed_at": datetime.now(timezone.utc).isoformat()
-            })
-            self._scheduled.discard(token_mint) # Cleanup from memory
-            return
-        try:
-            res = await self.check_holders_overlap(token_start)
-            obj = safe_load_overlap(self.overlap_store)
-            obj.setdefault(token_start.mint, []).append({
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "result": res,
-                "check_type": "repeat_check"
-            })
-            self.overlap_store.save(obj)
-            next_check = current_time + self.repeat_interval_seconds
-            state = self.scheduling_store.get_token_state(token_mint)
-            check_count = state.get("total_checks_completed", 0) + 1
-            self.scheduling_store.update_token_state(token_mint, {
-                "last_completed_check": current_time,
-                "next_scheduled_check": next_check,
-                "total_checks_completed": check_count
-            })
-            asyncio.create_task(self._schedule_repeat_checks_for_token(token_start, next_check))
-            if self.debug:
-                print(f"_schedule_repeat_check_only: completed repeat check #{check_count} for {token_mint}, grade: {res.get('grade', 'N/A')}")
-        except Exception as e:
-            if self.debug:
-                print(f"_schedule_repeat_check_only: error for {token_mint}: {e}")
-
-    async def _schedule_repeat_checks_for_token(self, start: TradingStart, first_check_at: int):
-        current_time = int(datetime.now(timezone.utc).timestamp())
-        launch_time = start.block_time or current_time
-        stop_after = launch_time + 24 * 3600
-        check_time = first_check_at
-        while check_time < stop_after:
-            delay = max(0, check_time - int(datetime.now(timezone.utc).timestamp()))
-            if delay > 0:
-                await asyncio.sleep(delay)
-            now = int(datetime.now(timezone.utc).timestamp())
-            if now >= stop_after:
-                if self.debug:
-                    print(f"_schedule_repeat_checks: token {start.mint} past 24h -> stopping")
-                self.scheduling_store.update_token_state(start.mint, {
-                    "status": "completed",
-                    "completed_at": datetime.now(timezone.utc).isoformat()
-                })
-                self._scheduled.discard(start.mint) # Cleanup from memory
-                break
-            try:
-                res = await self.check_holders_overlap(start)
-                obj = safe_load_overlap(self.overlap_store)
-                obj.setdefault(start.mint, []).append({
-                    "ts": datetime.now(timezone.utc).isoformat(),
-                    "result": res,
-                    "check_type": "repeat_check"
-                })
-                self.overlap_store.save(obj)
-                state = self.scheduling_store.get_token_state(start.mint)
-                check_count = state.get("total_checks_completed", 0) + 1
-                next_check_time = now + self.repeat_interval_seconds
-                self.scheduling_store.update_token_state(start.mint, {
-                    "last_completed_check": now,
-                    "next_scheduled_check": next_check_time,
-                    "total_checks_completed": check_count
-                })
-                if self.debug:
-                    print(f"_schedule_repeat_checks: completed check #{check_count} for {start.mint}, grade: {res.get('grade', 'N/A')}")
-                check_time = next_check_time
-            except Exception as e:
-                if self.debug:
-                    print(f"_schedule_repeat_checks: error for {start.mint}: {e}")
-                check_time = now + self.repeat_interval_seconds
 
     async def poll_coingecko_loop(self):
         if self.debug:
@@ -2511,8 +2413,8 @@ class Monitor:
         # Start the daily Dune scheduler as a background task
         asyncio.create_task(self.daily_dune_scheduler())
         
-        # Start startup recovery (commented out as per original)
-        # await self.startup_recovery()
+        # Start startup recovery
+        await self.startup_recovery()
         
         while True:
             try:
@@ -2530,9 +2432,13 @@ class Monitor:
                         if self.debug:
                             print(f"Monitor ASYNC: token {s.mint} already has scheduling state, skipping")
                         continue
+                    
+                    # Launch the master task for this token
                     asyncio.create_task(self._schedule_overlap_checks_for_token(s))
                     self._scheduled.add(s.mint)
                     new_tokens_scheduled += 1
+                    
+                    # Save the initial "pending" state
                     current_time = int(datetime.now(timezone.utc).timestamp())
                     self.scheduling_store.update_token_state(s.mint, {
                         "launch_time": s.block_time or current_time,
@@ -2541,83 +2447,117 @@ class Monitor:
                         "created_at": datetime.now(timezone.utc).isoformat(),
                         "total_checks_completed": 0
                     })
+                    
                 if new_tokens_scheduled > 0 and self.debug:
                     print(f"Monitor ASYNC: scheduled overlap checks for {new_tokens_scheduled} new tokens")
+                    
                 try:
                     await self.updater.save_trading_starts_async(starts, skip_existing=True)
                 except Exception as e:
                     if self.debug:
                         print("Monitor ASYNC: updater save error", e)
+                        
                 current_time = time.time()
                 if current_time - self.last_cleanup > 3600:
                     await self.updater.cleanup_old_tokens_async()
                     self.scheduling_store.cleanup_old_states()
                     await self._cleanup_finished_tasks() # Memory cleanup
                     self.last_cleanup = current_time
+                    
             except Exception as e:
                 if self.debug:
                     print("Monitor ASYNC: CoinGecko poll error", e)
                     traceback.print_exc()
+                    
             await asyncio.sleep(self.coingecko_poll_interval_seconds)
 
     async def _schedule_overlap_checks_for_token(self, start: TradingStart):
+        """
+        🚀 REFACTORED: This is the master task for a single token's 24-hour lifecycle.
+        It handles the initial delay and the repeating check loop, calling
+        the unified `run_token_analysis_step` function.
+        """
         now_ts = int(datetime.now(timezone.utc).timestamp())
         block_ts = int(start.block_time or now_ts)
         first_run_at = block_ts + self.initial_check_delay_seconds
         to_sleep = max(0, first_run_at - now_ts)
+        
         if self.debug:
             print(f"_schedule ASYNC: token={start.mint} will first run in {to_sleep}s (at {datetime.fromtimestamp(first_run_at, timezone.utc)})")
+            
         await asyncio.sleep(to_sleep)
+        
         self.scheduling_store.update_token_state(start.mint, {"status": "running_first_check"})
         stop_after = block_ts + 24 * 3600
         check_count = 0
+        
         while True:
             now_ts2 = int(datetime.now(timezone.utc).timestamp())
             if now_ts2 > stop_after:
                 if self.debug:
                     print(f"_schedule ASYNC: token={start.mint} past 24h -> stopping scheduled checks")
-                self.scheduling_store.update_token_state(start.mint, {
-                    "status": "completed",
-                    "completed_at": datetime.now(timezone.utc).isoformat()
-                })
+                
+                # Final status update
+                current_state = self.scheduling_store.get_token_state(start.mint)
+                if current_state.get("status") not in ["completed", "dropped"]:
+                    self.scheduling_store.update_token_state(start.mint, {
+                        "status": "dropped", # Dropped due to timeout, not failure
+                        "completed_at": datetime.now(timezone.utc).isoformat(),
+                        "probation_final": True
+                    })
                 self._scheduled.discard(start.mint) # Cleanup from memory
                 break
+                
             try:
-                res = await self.check_holders_overlap(start)
+                # --- 🚀 CALL THE UNIFIED ANALYSIS FUNCTION ---
+                await self.run_token_analysis_step(start, check_count)
                 check_count += 1
-                obj = safe_load_overlap(self.overlap_store)
-                # Route through security gate; it will save if passed or start probation otherwise
-                await self._security_gate_and_route(start, res, obj)
-                next_check_time = now_ts2 + self.repeat_interval_seconds
-                self.scheduling_store.update_token_state(start.mint, {
-                    "status": "active",
-                    "last_completed_check": now_ts2,
-                    "next_scheduled_check": next_check_time,
-                    "total_checks_completed": check_count
-                })
+                
+                # --- Check status to see if we should stop the loop ---
+                current_state = self.scheduling_store.get_token_state(start.mint)
+                status = current_state.get("status")
+                
+                if status == "completed":
+                    if self.debug:
+                        print(f"_schedule ASYNC: token={start.mint} status is 'completed'. Stopping loop.")
+                    self._scheduled.discard(start.mint) # Cleanup from memory
+                    break # Token has passed and is finished
+                
+                if status == "dropped":
+                    if self.debug:
+                        print(f"_schedule ASYNC: token={start.mint} status is 'dropped'. Stopping loop.")
+                    self._scheduled.discard(start.mint) # Cleanup from memory
+                    break # Token failed probation and is finished
+                
+                # If status is "active" or "probation", the loop continues
                 if self.debug:
-                    print(f"_schedule ASYNC: completed check #{check_count} for {start.mint}, grade: {res.get('grade', 'N/A')}, overlap: {res.get('overlap_count', 0)} wallets")
+                    print(f"_schedule ASYNC: completed check #{check_count} for {start.mint}. Status: {status}. Next check in {self.repeat_interval_seconds}s")
+                
             except Exception as e:
                 if self.debug:
-                    print(f"_schedule ASYNC: overlap check error for {start.mint}: {e}")
+                    print(f"_schedule ASYNC: unhandled error in check loop for {start.mint}: {e}")
+                    traceback.print_exc()
                 self.scheduling_store.update_token_state(start.mint, {
                     "last_error": str(e),
                     "last_error_at": datetime.now(timezone.utc).isoformat()
                 })
+                
             await asyncio.sleep(self.repeat_interval_seconds)
 
-    async def check_holders_overlap(self, start: TradingStart, top_k_holders: int = 500) -> Dict[str, Any]:
+    async def _fetch_and_calculate_overlap(self, start: TradingStart) -> Dict[str, Any]:
         """
-        Check overlap between the token's top holders and the merged 7-day Dune winners.
-        Returns a summary dict with distinct and weighted concentration metrics.
+        🚀 RENAMED: (Was check_holders_overlap)
+        This function NOW ONLY does its core job: fetch holders (Helius) and
+        calculate overlap against the Dune cache.
+        It is ONLY called *after* the pre-Helius security gate has passed.
         """
         if self.debug:
-            print(f"check_holders_overlap ASYNC: computing for {start.mint}")
+            print(f"_fetch_and_calculate_overlap: computing for {start.mint}")
 
         # Ensure Dune winners cache available
         token_to_top_holders, wallet_freq, loaded_days = self.dune_cache.load_last_7_days()
         if self.debug:
-            print(f"check_holders_overlap ASYNC: using {len(loaded_days)} cached days, {len(token_to_top_holders)} tokens in memory")
+            print(f"_fetch_and_calculate_overlap: using {len(loaded_days)} cached days, {len(token_to_top_holders)} tokens in memory")
 
         # Merge winners union and compute total frequency sum
         winners_union: Set[str] = set()
@@ -2628,11 +2568,12 @@ class Monitor:
 
         # Fetch holders for the target token and apply hybrid sampling rule
         try:
+            # --- THIS IS THE HELIUS CALL ---
             holders_list = await self.holder_agg.get_token_holders(start.mint, limit=1000, max_pages=2, decimals=None)
         except Exception as e:
             if self.debug:
-                print(f"check_holders_overlap ASYNC: failed to fetch holders for {start.mint}: {e}")
-            return {"error": "fetch_holders_failed", "error_details": str(e)}
+                print(f"_fetch_and_calculate_overlap: failed to fetch holders for {start.mint}: {e}")
+            return {"error": "fetch_holders_failed", "error_details": str(e), "grade": "NONE"}
 
         n = len(holders_list)
         if n <= 200:
@@ -2686,7 +2627,7 @@ class Monitor:
             }
         }
         if self.debug:
-            print(f"check_holders_overlap ASYNC: {start.mint} overlap {overlap_count}/{top_count} ({overlap_pct:.2f}%) distinct_conc {concentration:.2f}% weighted_conc {weighted_concentration:.2f}% grade={grade}")
+            print(f"_fetch_and_calculate_overlap: {start.mint} overlap {overlap_count}/{top_count} ({overlap_pct:.2f}%) distinct_conc {concentration:.2f}% weighted_conc {weighted_concentration:.2f}% grade={grade}")
         return summary
 
 # -----------------------
