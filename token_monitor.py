@@ -518,7 +518,7 @@ class TokenDiscovery:
         return []
 
     # ---------------- CoinGecko ----------------
-    async def _fetch_coingecko_new_pools(self, limit: int = 500, timeout: int = 15) -> List[Dict[str, Any]]:
+    async def _fetch_coingecko_new_pools(self, limit: int = 500, timeout: int = 30) -> List[Dict[str, Any]]: # <<< CORRECTION: Increased timeout
         """Fetch the latest 20 pools from CoinGecko and print their mint addresses, ignoring cache."""
         headers = {"accept": "application/json", "x-cg-pro-api-key": self.coingecko_pro_api_key}
         url = self.coingecko_url  # No pagination
@@ -602,7 +602,19 @@ class TokenDiscovery:
         )
 
     async def get_tokens_created_today(self, limit: int = 500) -> List[TradingStart]:
-        pools = await self._fetch_coingecko_new_pools(limit=limit)
+        # <<< CORRECTION: Added retry_with_backoff to make this call robust
+        try:
+            pools = await retry_with_backoff(
+                self._fetch_coingecko_new_pools,
+                limit=limit,
+                retries=3,
+                base_delay=2.0
+            )
+        except Exception as e:
+            if self.debug:
+                print(f"[CoinGecko] CRITICAL: Failed to fetch new pools after all retries: {e}. Loop will continue.")
+            return [] # Return empty list on failure
+
         out = []
         now = int(datetime.now(timezone.utc).timestamp())
         cutoff = now - 24 * 3600  # only include pools launched in last 24 hours
@@ -1782,13 +1794,17 @@ class Monitor:
         session = self.http_session
         async with self._api_sema:
             try:
-                async with session.get(url, timeout=15) as resp:
+                # <<< CORRECTION: Increased timeout, improved error handling
+                async with session.get(url, timeout=30) as resp:
                     if resp.status != 200:
                         text = await resp.text()
                         return {"ok": False, "error": f"rugcheck_status_{resp.status}", "error_text": text}
                     data = await resp.json()
+            except asyncio.TimeoutError:
+                return {"ok": False, "error": "rugcheck_timeout", "error_text": "API call timed out after 30s"}
             except Exception as e:
-                return {"ok": False, "error": "rugcheck_exception", "error_text": str(e)}
+                return {"ok": False, "error": "rugcheck_exception", "error_text": f"{type(e).__name__}: {str(e)}"}
+            # <<< END CORRECTION
 
         # Extract key security metrics
         # --- Probation Check ---
@@ -2064,7 +2080,8 @@ class Monitor:
         session = self.http_session
         async with self._api_sema:
             # Let retry_with_backoff handle exceptions from this block
-            async with session.get(url, timeout=15) as resp:
+            # <<< CORRECTION: Increased timeout
+            async with session.get(url, timeout=30) as resp:
                 if resp.status == 429:
                     # Specific error for rate limiting to make logs clearer
                     raise aiohttp.ClientResponseError(
