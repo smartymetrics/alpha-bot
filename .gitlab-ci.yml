@@ -1,13 +1,16 @@
-image: python:3.10
+image: python:3.11
+
+stages:
+  - deploy
 
 pages:
   stage: deploy
-  only:
-    - main
   script:
-    - pip install -r requirements.txt
-    - mkdocs build --strict --verbose
-    - mv site public
+    - pip install --upgrade pip
+    - pip install mkdocs mkdocs-material
+    - mkdocs build -d public
   artifacts:
     paths:
       - public
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
