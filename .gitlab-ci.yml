@@ -1,0 +1,13 @@
+image: python:3.10
+
+pages:
+  stage: deploy
+  only:
+    - main
+  script:
+    - pip install -r requirements.txt
+    - mkdocs build --strict --verbose
+    - mv site public
+  artifacts:
+    paths:
+      - public

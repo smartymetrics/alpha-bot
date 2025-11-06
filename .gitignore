@@ -1,2 +1,8 @@
 *.env
 degen/
+site/
+.cache/
+__pycache__/
+*.pyc
+venv/
+.env

@@ -1,6 +1,6 @@
 site_name: iSmarty Bot User Guide
 site_description: Complete documentation for iSmarty Bot
-site_url: https://smartymetrics.gitlab.io/your-repo-name
+site_url: https://smartymetrics.gitlab.io/alpha-bot
 
 theme:
   name: material

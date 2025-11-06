@@ -1,0 +1,80 @@
+site_name: iSmarty User Guide
+site_description: Complete documentation for iSmarty Bot and Web Dashboard
+site_author: smartymetrics
+site_url: https://smartymetrics.gitlab.io/alpha-bot
+
+# repo_name: smartymetrics/alpha-bot
+# repo_url: https://gitlab.com/smartymetrics/alpha-bot
+
+site_url: https://smartymetrics.gitlab.io/alpha-bot
+
+
+
+theme:
+  name: material
+  language: en
+  
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: cyan
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      accent: cyan
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  
+  font:
+    text: Roboto
+    code: Roboto Mono
+  
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.tabs.link
+  
+  icon:
+    logo: material/robot
+    repo: fontawesome/brands/gitlab
+
+nav:
+  - Home: index.md
+  - Telegram Bot: telegram_bot.md
+  - Web Dashboard: web_dashboard.md
+
+plugins:
+  - search
+  - glightbox
+  - minify:
+      minify_html: true
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+
+extra_css:
+  - stylesheets/extra.css
