@@ -33,6 +33,9 @@ import random
 
 from typing import List, Set
 
+import sqlite3
+import threading
+
 load_dotenv()
 
 PROBATION_TOP_N = int(os.getenv("PROBATION_TOP_N", "10"))
@@ -1084,109 +1087,216 @@ def _normalize(obj: Any) -> Any:
 # -----------------------
 # JobLibTokenUpdater
 # -----------------------
+# --- BEGIN REPLACEMENT ---
+# This is the new SQLite-backed version of JobLibTokenUpdater.
+
 class JobLibTokenUpdater:
     def __init__(self, data_dir: str = "./data/token_data", expiry_hours: int = 24, debug: bool = False):
         self.data_dir = os.path.abspath(data_dir)
         os.makedirs(self.data_dir, exist_ok=True)
-        self.tokens_file = os.path.join(self.data_dir, "tokens.pkl")
+        
+        # Use SQLite database file instead of a pickle file
+        self.db_file = os.path.join(self.data_dir, "tokens.db")
         self.expiry_hours = expiry_hours
         self.debug = debug
+        # Use a lock for thread-safe database writes from asyncio.to_thread
+        self.lock = threading.Lock()
+        self._init_db()
+        if self.debug:
+            print(f"JobLibTokenUpdater: Initialized with SQLite db at {self.db_file}")
 
-    def _load_tokens(self) -> List[Any]:
-        if os.path.exists(self.tokens_file):
+    def _init_db(self):
+        """Initializes the SQLite database and table."""
+        with self.lock:
             try:
-                data = joblib.load(self.tokens_file)
-                if isinstance(data, list):
-                    return data
-            except Exception as e:
+                with sqlite3.connect(self.db_file) as conn:
+                    cursor = conn.cursor()
+                    # Create table:
+                    # - mint: Primary key for automatic existence checks
+                    # - block_time: Indexed for fast cleanup and sorting
+                    # - data: JSON blob of the full TradingStart object
+                    cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS tokens (
+                        mint TEXT PRIMARY KEY,
+                        block_time INTEGER,
+                        data TEXT
+                    )
+                    """)
+                    # Create index for fast sorting and cleanup
+                    cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_block_time
+                    ON tokens (block_time)
+                    """)
+                    conn.commit()
+            except sqlite3.Error as e:
                 if self.debug:
-                    print("JobLibTokenUpdater: load error", e)
-        return []
-
-    def _save_tokens(self, tokens: List[Any]):
-        try:
-            safe_tokens = [_normalize(t) for t in tokens]
-            joblib.dump(safe_tokens, self.tokens_file)
-        except Exception as e:
-            print("JobLibTokenUpdater: save error", e)
-            traceback.print_exc()
-            debug_path = self.tokens_file + ".debug.json"
-            try:
-                with open(debug_path, "w", encoding="utf-8") as f:
-                    json.dump([asdict(t) if isinstance(t, TradingStart) else str(t) for t in tokens], f, indent=2, default=str)
-                print(f"Saved debug snapshot to {debug_path}")
-            except Exception as ee:
-                print("Also failed to dump debug snapshot:", ee)
+                    print(f"JobLibTokenUpdater: Database init error: {e}")
 
     async def save_trading_starts_async(self, trading_starts: List[TradingStart], skip_existing: bool = True) -> Dict[str, int]:
-        existing = self._load_tokens()
-        existing_mints: Set[str] = set()
-        for t in existing:
-            if isinstance(t, dict):
-                m = t.get("mint")
-            elif isinstance(t, TradingStart):
-                m = t.mint
-            else:
-                m = None
-            if m:
-                existing_mints.add(m)
+        """
+        Asynchronously saves a list of TradingStart objects to the SQLite database.
+        This operation is run in a separate thread to avoid blocking asyncio.
+        """
+        # Run the blocking DB operations in a separate thread
+        return await asyncio.to_thread(
+            self._save_tokens_sync, trading_starts, skip_existing
+        )
 
+    def _save_tokens_sync(self, trading_starts: List[TradingStart], skip_existing: bool) -> Dict[str, int]:
+        """Synchronous (blocking) implementation for saving tokens."""
         saved = 0
         skipped = 0
         errors = 0
+        
+        # Prepare data for insertion
+        data_to_insert = []
         for s in trading_starts:
-            try:
-                if skip_existing and s.mint in existing_mints:
-                    skipped += 1
-                    continue
-                existing.append(s)
-                saved += 1
-            except Exception:
+            if not s.mint:
                 errors += 1
-        self._save_tokens(existing)
+                continue
+            try:
+                # Normalize and serialize the full object to JSON
+                s_dict = asdict(s)
+                # Use the existing _normalize helper to handle NaN/Inf
+                s_json = json.dumps(_normalize(s_dict)) 
+                data_to_insert.append((s.mint, s.block_time or 0, s_json))
+            except Exception as e:
+                if self.debug:
+                    print(f"JobLibTokenUpdater: Serialization error for {s.mint}: {e}")
+                errors += 1
+        
+        if not data_to_insert:
+            return {"saved": 0, "skipped": 0, "errors": errors}
+
+        # Use a lock to ensure thread-safe database access
+        with self.lock:
+            try:
+                # Use a context manager for the connection
+                with sqlite3.connect(self.db_file) as conn:
+                    cursor = conn.cursor()
+                    
+                    if skip_existing:
+                        # INSERT OR IGNORE = skip if mint (PRIMARY KEY) already exists
+                        # This is the SQL equivalent of the previous logic
+                        cursor.executemany(
+                            "INSERT OR IGNORE INTO tokens (mint, block_time, data) VALUES (?, ?, ?)",
+                            data_to_insert
+                        )
+                        saved = cursor.rowcount
+                        skipped = len(data_to_insert) - saved
+                    else:
+                        # INSERT OR REPLACE = overwrite if mint (PRIMARY KEY) already exists
+                        cursor.executemany(
+                            "INSERT OR REPLACE INTO tokens (mint, block_time, data) VALUES (?, ?, ?)",
+                            data_to_insert
+                        )
+                        saved = cursor.rowcount # This counts all successful inserts/replacements
+                    
+                    conn.commit()
+                    
+            except sqlite3.Error as e:
+                if self.debug:
+                    print(f"JobLibTokenUpdater: DB save error: {e}")
+                errors += len(data_to_insert) # Assume all failed on batch error
+                saved = 0
+                skipped = 0
+        
         if self.debug:
-            print(f"JobLibTokenUpdater: saved={saved} skipped={skipped} errors={errors} total_now={len(existing)}")
+            # We can't easily get the total_now without another query, so we report the action
+            print(f"JobLibTokenUpdater: saved={saved} skipped={skipped} errors={errors}")
+
         return {"saved": saved, "skipped": skipped, "errors": errors}
 
     async def cleanup_old_tokens_async(self) -> int:
-        tokens = self._load_tokens()
-        if not tokens:
-            return 0
+        """
+        Asynchronously cleans up old tokens from the database based on expiry_hours.
+        This operation is run in a separate thread.
+        """
+        return await asyncio.to_thread(self._cleanup_sync)
+
+    def _cleanup_sync(self) -> int:
+        """Synchronous (blocking) implementation for cleaning up old tokens."""
         now = datetime.now(timezone.utc)
         cutoff = int((now - timedelta(hours=self.expiry_hours)).timestamp())
-        kept: List[Any] = []
-        for t in tokens:
-            ts = 0
-            if isinstance(t, dict):
-                ts = int(t.get("block_time", 0) or 0)
-            elif isinstance(t, TradingStart):
-                ts = int(t.block_time or 0)
-            if ts > cutoff:
-                kept.append(t)
-        deleted = len(tokens) - len(kept)
-        if deleted:
-            self._save_tokens(kept)
-            if self.debug:
-                print(f"JobLibTokenUpdater: cleaned {deleted} tokens older than {self.expiry_hours} hours")
+        deleted = 0
+        
+        with self.lock:
+            try:
+                with sqlite3.connect(self.db_file) as conn:
+                    cursor = conn.cursor()
+                    # Delete rows where block_time is older than the cutoff
+                    cursor.execute("DELETE FROM tokens WHERE block_time < ?", (cutoff,))
+                    deleted = cursor.rowcount
+                    conn.commit()
+            except sqlite3.Error as e:
+                if self.debug:
+                    print(f"JobLibTokenUpdater: DB cleanup error: {e}")
+        
+        if deleted > 0 and self.debug:
+             print(f"JobLibTokenUpdater: cleaned {deleted} tokens older than {self.expiry_hours} hours")
+        
         return deleted
 
     async def get_tracked_tokens_async(self, limit: Optional[int] = None) -> List[TradingStart]:
-        tokens = self._load_tokens()
+        """
+        Asynchronously retrieves tracked tokens from the database.
+        This operation is run in a separate thread.
+        """
+        return await asyncio.to_thread(self._get_tokens_sync, limit)
+
+    def _get_tokens_sync(self, limit: Optional[int]) -> List[TradingStart]:
+        """Synchronous (blocking) implementation for fetching tokens."""
+        rows = []
+        with self.lock:
+            try:
+                with sqlite3.connect(self.db_file) as conn:
+                    # Use row_factory to get dict-like rows (though we only need one column)
+                    conn.row_factory = sqlite3.Row
+                    cursor = conn.cursor()
+                    
+                    # Select the JSON data, already sorted by block_time by the DB
+                    query = "SELECT data FROM tokens ORDER BY block_time DESC"
+                    params = []
+                    
+                    if limit:
+                        query += " LIMIT ?"
+                        params.append(limit)
+                        
+                    cursor.execute(query, params)
+                    rows = cursor.fetchall()
+            except sqlite3.Error as e:
+                if self.debug:
+                    print(f"JobLibTokenUpdater: DB read error: {e}")
+                return [] # Return empty on error
+        
+        # --- DESERIALIZATION (Copied from original class) ---
         norm: List[TradingStart] = []
-        for t in tokens:
-            if isinstance(t, TradingStart):
-                norm.append(t)
-            elif isinstance(t, dict):
-                try:
-                    norm.append(TradingStart(**t))
-                except Exception:
-                    allowed = {"mint","block_time","program_id","detected_via","extra","fdv_usd","volume_usd","source_dex","price_change_percentage"}
-                    clean = {k:v for k,v in t.items() if k in allowed}
-                    norm.append(TradingStart(**clean))
-        norm.sort(key=lambda x: x.block_time or 0, reverse=True)
-        if limit:
-            norm = norm[:limit]
+        for row in rows:
+            try:
+                data_json = row["data"]
+                t = json.loads(data_json) # t is a dict
+                
+                # Original logic to convert dict back to TradingStart
+                if isinstance(t, TradingStart):
+                     norm.append(t) # Should not happen from JSON, but good safety
+                elif isinstance(t, dict):
+                    try:
+                        norm.append(TradingStart(**t))
+                    except Exception:
+                        # Handle dicts that might have extra/missing keys
+                        allowed = {"mint","block_time","program_id","detected_via","extra","fdv_usd","volume_usd","source_dex","price_change_percentage"}
+                        clean = {k:v for k,v in t.items() if k in allowed}
+                        norm.append(TradingStart(**clean))
+                        
+            except Exception as e:
+                if self.debug:
+                    print(f"JobLibTokenUpdater: Deserialization error: {e}")
+
+        # No need to sort, SQL's `ORDER BY` already did it.
         return norm
+
+# --- END REPLACEMENT ---
+
 
 class DuneHolderCache:
     def __init__(self, cache_file: str = "./data/dune_holders.pkl", cache_max_days: int = 7, debug: bool = False):
@@ -2369,10 +2479,12 @@ class Monitor:
         cutoff_time = current_time - (24 * 3600)
         
         self.scheduling_store.cleanup_old_states(cutoff_time)
+        # Use the new async cleanup method
         await self.updater.cleanup_old_tokens_async()
         
         # Load all tracked tokens into a map for quick lookup
         try:
+            # Use the new async getter
             tokens = await self.updater.get_tracked_tokens_async()
             token_map = {t.mint: t for t in tokens}
             if self.debug:
@@ -2469,6 +2581,7 @@ class Monitor:
                     print(f"Monitor ASYNC: scheduled overlap checks for {new_tokens_scheduled} new tokens")
                     
                 try:
+                    # Use the new async save method
                     await self.updater.save_trading_starts_async(starts, skip_existing=True)
                 except Exception as e:
                     if self.debug:
@@ -2476,6 +2589,7 @@ class Monitor:
                         
                 current_time = time.time()
                 if current_time - self.last_cleanup > 3600:
+                    # Use the new async cleanup method
                     await self.updater.cleanup_old_tokens_async()
                     self.scheduling_store.cleanup_old_states()
                     await self._cleanup_finished_tasks() # Memory cleanup
@@ -2542,7 +2656,7 @@ class Monitor:
                 
                 if status == "dropped":
                     if self.debug:
-                        print(f"_schedule ASYNC: token={start.mint} status is 'dropped'. Stopping loop.")
+                        print(f"_schedule ASYC: token={start.mint} status is 'dropped'. Stopping loop.")
                     self._scheduled.discard(start.mint) # Cleanup from memory
                     break # Token failed probation and is finished
                 
@@ -2668,7 +2782,9 @@ async def main_loop():
                 debug=True
             )
             holder_agg = HolderAggregator(sol_client, debug=True)
+            # --- UPDATER INSTANCE: This now uses the new SQLite class ---
             updater = JobLibTokenUpdater(data_dir="./data/token_data", expiry_hours=24, debug=True)
+            # ---
             dune_cache = DuneWinnersCache(cache_dir="./data/dune_cache", debug=True)
             dune_builder = DuneWinnersBuilder(cache=dune_cache, debug=True, max_concurrency=8)
             overlap_store = OverlapStore(filepath="./data/overlap_results.pkl", debug=True)
