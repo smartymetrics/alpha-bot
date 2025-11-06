@@ -45,7 +45,7 @@ This section shows the best-performing tokens from the selected signal type and 
 
 This tool allows you to run a custom analysis to find the **most profitable traders** for a specific token (or set of tokens max of three with token age less than 2Days).
 
-![Trader Roi](images/icons/screenshots/trader_roi.jpeg)
+![Trader Roi](images/screenshots/trader_roi.jpeg)
 
 ### How to Use
 
