@@ -32,20 +32,20 @@ This section shows the aggregated performance of all signals. It is powered by t
 
 This table shows the *current* state of tokens being monitored by the `token discovery` service. It is a live-updating feed, not a historical analysis.
 
-![Live Token Feed](images\screenshots\Live_feed.jpeg)
+![Live Token Feed](images/screenshots/Live_feed.jpeg)
 
 ### Top Performing Tokens
 
 This section shows the best-performing tokens from the selected signal type and timeframe. This is a historical list of "greatest hits".
 
-![Top tokens](images\screenshots\Top_tokens.jpeg)
+![Top tokens](images/screenshots/Top_tokens.jpeg)
 
 
 ## 2. Trader ROI Analysis
 
 This tool allows you to run a custom analysis to find the **most profitable traders** for a specific token (or set of tokens max of three with token age less than 2Days).
 
-![Trader Roi](images\screenshots\trader_roi.jpeg)
+![Trader Roi](images/icons/screenshots/trader_roi.jpeg)
 
 ### How to Use
 
@@ -60,7 +60,7 @@ This tool allows you to run a custom analysis to find the **most profitable trad
 
 The output is a ranked table of wallets, showing their **Total P&L**, **ROI**, and **Win Rate** for the analyzed token(s).
 
-![roi](images\screenshots\roi.jpeg)
+![roi](images/screenshots/roi.jpeg)
 
 ## 3. Wallet Analyzer
 
@@ -72,7 +72,7 @@ The Wallet Analyzer is a powerful, standalone tool for a deep-dive analysis of a
 2.  **Click Analyze:** The system will fetch and process the wallet's history. This may take a few moments.
 3.  **Select Interval:** You can Choose the time period you want to analyze after analysis has finished running (1D, 7D, 30D, All).
 
-![Wallet Analysis](images\screenshots\wallet_analysis.jpeg)
+![Wallet Analysis](images/screenshots/wallet_analysis.jpeg)
 
 ### Understanding the Report
 
@@ -85,7 +85,7 @@ The report is broken down into several tabs:
     * **P&L Distribution:** A pie chart showing what percentage of their trades fall into different profit brackets (e.g., >500%, 0-200%, < -50%).
     * **Trading Behavior:** Quick metrics on fast flips, airdrop sells, etc.
     
-    ![overview](images\screenshots\overview.jpeg)
+    ![overview](images/screenshots/overview.jpeg)
 
 * **Token PnL:** A detailed, token-by-token breakdown of performance. It shows the P&L for every asset the wallet has traded, ranked by the last trade time.
 
@@ -98,4 +98,4 @@ The report is broken down into several tabs:
     * **Negative Balance Tokens:** Tokens where the wallet sold more than it ever bought.
     * **Quick Flips:** Trades sold within 5 seconds of buying.
 
-    ![Risks](images\screenshots\risks.jpeg)
+    ![Risks](images/screenshots/risks.jpeg)
