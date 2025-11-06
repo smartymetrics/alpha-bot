@@ -1,0 +1,57 @@
+site_name: iSmarty Bot User Guide
+site_description: Complete documentation for iSmarty Bot
+site_url: https://smartymetrics.gitlab.io/your-repo-name
+
+theme:
+  name: material
+  language: en
+  
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+  
+  icon:
+    logo: material/robot
+
+nav:
+  - Home: index.md
+  - Telegram Bot: telegram_bot.md
+  - Web Dashboard: web_dashboard.md
+
+plugins:
+  - search
+  - glightbox
+  - minify:
+      minify_html: true
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
