@@ -25,7 +25,7 @@ import tempfile
 from typing import Optional, Dict, Any, Union
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv() 
 
 BUCKET_NAME = "monitor-data"
 
