@@ -9,6 +9,11 @@ Supports dune cache file uploads under dune_cache/.
 
 NEW: Added support for 'alpha' overlap results with
      upload_alpha_overlap_results().
+
+REVISION:
+- Download functions now use signed URLs and 'If-Modified-Since' / 'If-None-Match' (ETag)
+  headers to work with private buckets and avoid re-downloading unchanged files.
+- An in-memory cache stores 'Last-Modified' and 'ETag' times for conditional GETs.
 """
 
 import os
@@ -17,6 +22,10 @@ import pickle
 import requests
 from supabase import create_client, Client
 import tempfile
+from typing import Optional, Dict, Any, Union
+from dotenv import load_dotenv
+
+load_dotenv()
 
 BUCKET_NAME = "monitor-data"
 
@@ -30,6 +39,10 @@ OVERLAP_ALPHA_JSON_NAME = "overlap_results_alpha.json"
 
 MAX_SIZE_MB = 1.7
 
+# --- In-Memory Cache for Conditional Fetching ---
+# This dictionary will store 'Last-Modified' and 'ETag' headers for each file path.
+_file_cache_headers: Dict[str, Dict[str, str]] = {}
+
 
 # -------------------
 # Supabase Client
@@ -37,7 +50,7 @@ MAX_SIZE_MB = 1.7
 def get_supabase_client() -> Client:
     """Create and return a Supabase client. Uses env vars with local fallback."""
     SUPABASE_URL = os.getenv("SUPABASE_URL", "https://ldraroaloinsesjoayxc.supabase.co")
-    SUPABASE_KEY = os.getenv("SUPABASE_KEY", "SUPABASE_KEY")
+    SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
     if not SUPABASE_URL or not SUPABASE_KEY:
         raise RuntimeError("❌ Missing SUPABASE_URL or SUPABASE_KEY in environment variables")
@@ -214,7 +227,7 @@ def prepare_json_from_pkl(pkl_path: str, debug: bool = True) -> bytes:
 
 
 # -------------------
-# Upload Functions
+# Upload Functions (Private bucket compatible)
 # -------------------
 def upload_file(file_path: str, bucket: str = BUCKET_NAME, remote_path: str = None, debug: bool = True) -> bool:
     """Upload a raw file to Supabase Storage."""
@@ -229,11 +242,13 @@ def upload_file(file_path: str, bucket: str = BUCKET_NAME, remote_path: str = No
     try:
         supabase.storage.from_(bucket).remove([file_name])
     except Exception:
-        pass
+        pass # Fails if file doesn't exist, which is fine
 
     try:
         with open(file_path, "rb") as f:
             data = f.read()
+        # Uploading with the service key (from get_supabase_client)
+        # automatically works for private buckets.
         supabase.storage.from_(bucket).upload(file_name, data)
         if debug:
             print(f"✅ Uploaded {file_name} ({len(data)/1024:.2f} KB)")
@@ -313,26 +328,109 @@ def upload_alpha_overlap_results(file_path: str, bucket: str = BUCKET_NAME, debu
 
 
 # -------------------
-# Download Functions
+# MODIFIED: Download Functions (Private + Conditional)
 # -------------------
-def download_file(save_path: str, file_name: str, bucket: str = BUCKET_NAME) -> bool:
-    """Download any file from Supabase Storage."""
+def download_file(save_path: str, file_name: str, bucket: str = BUCKET_NAME) -> Optional[bytes]:
+    """
+    Download file from private Supabase Storage using signed URL and
+    conditional GET with 'If-Modified-Since' and 'If-None-Match' (ETag).
+    If not modified (304), loads from local `save_path`.
+    If modified (200), downloads, saves to `save_path`, and returns content.
+    Returns file content as bytes if successful, None otherwise.
+    """
+    global _file_cache_headers
+    supabase = get_supabase_client()
+
     try:
-        supabase = get_supabase_client()
-        data = supabase.storage.from_(bucket).download(file_name)
-        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
-        with open(save_path, "wb") as f:
-            f.write(data)
-        print(f"✅ Downloaded {file_name} → {save_path}")
-        return True
+        # 1. Generate a 60-second signed URL for the private file
+        signed_url_response = supabase.storage.from_(bucket).create_signed_url(file_name, 60)
+        signed_url = signed_url_response.get('signedURL')
+        if not signed_url:
+            print(f"Error: Could not generate signed URL for '{file_name}'. Response: {signed_url_response}")
+            return None
+
+        # 2. Prepare headers for conditional GET using ETag and Last-Modified
+        headers = {}
+        cached_headers = _file_cache_headers.get(file_name, {})
+        if cached_headers.get('Last-Modified'):
+            headers['If-Modified-Since'] = cached_headers['Last-Modified']
+        if cached_headers.get('ETag'):
+            headers['If-None-Match'] = cached_headers['ETag']
+
+        # 3. Perform the HTTP request
+        response = requests.get(signed_url, headers=headers, timeout=15)
+
+        # 4. Handle the response
+        if response.status_code == 304:
+            # 304 Not Modified: File hasn't changed
+            print(f"File '{file_name}': No change detected (304 Not Modified).")
+            if os.path.exists(save_path):
+                print(f"Loading from local cache: '{save_path}'")
+                with open(save_path, "rb") as f:
+                    return f.read()
+            else:
+                # File not modified, but local copy is missing. Force re-download.
+                print(f"File '{file_name}' not modified, but local file '{save_path}' missing. Forcing re-download.")
+                headers.pop('If-Modified-Since', None)
+                headers.pop('If-None-Match', None)
+                _file_cache_headers.pop(file_name, None)
+                response = requests.get(signed_url, headers=headers, timeout=15)
+                # Allow to fall through to 200 logic
+
+        if response.status_code == 200:
+            # 200 OK: File is new or has been updated
+            print(f"File '{file_name}': File updated — new data loaded.")
+            data = response.content
+
+            # Update our cache with the new 'Last-Modified' and 'ETag' headers
+            new_last_modified = response.headers.get('Last-Modified')
+            new_etag = response.headers.get('ETag')
+            
+            new_headers_to_cache = {}
+            if new_last_modified:
+                new_headers_to_cache['Last-Modified'] = new_last_modified
+            if new_etag:
+                new_headers_to_cache['ETag'] = new_etag
+                
+            if new_headers_to_cache:
+                _file_cache_headers[file_name] = new_headers_to_cache
+                print(f"File '{file_name}': Updated cache headers (ETag: {new_etag}, Last-Modified: {new_last_modified}).")
+
+            # Save the new file content locally
+            os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+            with open(save_path, "wb") as f:
+                f.write(data)
+            print(f"Downloaded and saved '{file_name}' -> '{save_path}'")
+            return data
+
+        else:
+            # Handle other errors (404 Not Found, 403 Forbidden, 500, etc.)
+            print(f"File '{file_name}': Error fetching file. Status: {response.status_code}, Response: {response.text[:100]}...")
+            # Check if file exists locally as a last resort
+            if os.path.exists(save_path):
+                print(f"Loading from local cache as fallback: '{save_path}'")
+                with open(save_path, "rb") as f:
+                    return f.read()
+            return None
+
+    except requests.exceptions.RequestException as e:
+        print(f"File '{file_name}': Network or request error. {e}")
     except Exception as e:
-        msg = str(e).lower()
-        if "404" not in msg and "not found" not in msg:
-            print(f"⚠️ Download failed for {file_name}: {e}")
-        return False
+        print(f"File '{file_name}': An unexpected error occurred. {e}")
+
+    # Fallback: Try to load from local cache if any error occurs
+    if os.path.exists(save_path):
+        print(f"Loading from local cache as fallback: '{save_path}'")
+        try:
+            with open(save_path, "rb") as f:
+                return f.read()
+        except Exception as e:
+            print(f"Failed to read local fallback file: {e}")
+
+    return None
 
 
-def download_overlap_results(save_path: str, bucket: str = BUCKET_NAME) -> bool:
+def download_overlap_results(save_path: str, bucket: str = BUCKET_NAME) -> Optional[bytes]:
     """Download overlap_results.pkl specifically."""
     return download_file(save_path, OVERLAP_FILE_NAME, bucket)
 
@@ -346,7 +444,7 @@ def upload_dune_cache_file(file_path: str, bucket: str = BUCKET_NAME) -> bool:
     return upload_file(file_path, bucket, f"dune_cache/{filename}")
 
 
-def download_dune_cache_file(save_path: str, filename: str, bucket: str = BUCKET_NAME) -> bool:
+def download_dune_cache_file(save_path: str, filename: str, bucket: str = BUCKET_NAME) -> Optional[bytes]:
     """Download a dune cache file from dune_cache/ folder."""
     return download_file(save_path, f"dune_cache/{filename}", bucket)
 
@@ -379,12 +477,22 @@ def upload_wallet_data(wallet: str, data: dict, bucket: str = BUCKET_NAME, debug
 
 def download_wallet_data(wallet: str, bucket: str = BUCKET_NAME, debug: bool = True) -> dict | None:
     """Download wallet JSON from Supabase and return as dict."""
-    save_path = f"/tmp/{wallet}.json"
-    if not download_file(save_path, wallet_file_name(wallet), bucket=bucket):
+    save_path = f"/tmp/{wallet}.json" # Use temp dir for local save
+    
+    data_bytes = download_file(save_path, wallet_file_name(wallet), bucket=bucket)
+    
+    if not data_bytes:
+        if debug:
+            print(f"Failed to download wallet data for {wallet}")
         return None
+        
     try:
-        with open(save_path, "r") as f:
-            return json.load(f)
+        # Decode bytes and load as JSON
+        return json.loads(data_bytes.decode('utf-8'))
+    except json.JSONDecodeError as e:
+        if debug:
+            print(f"⚠️ Failed to parse wallet JSON {wallet}: {e}")
+        return None
     except Exception as e:
         if debug:
             print(f"⚠️ Failed to parse wallet JSON {wallet}: {e}")
@@ -410,6 +518,9 @@ if __name__ == "__main__":
     test_pkl_path = r"C:\Users\HP USER\Documents\Data Analyst\degen smart\overlap_results (3).pkl"
     if os.path.exists(test_pkl_path):
         upload_overlap_results(test_pkl_path)
+        print("\n--- Testing Main Download (1st time) ---")
+        download_overlap_results("./downloaded_overlap_results.pkl")
+        print("\n--- Testing Main Download (2nd time, should be 304) ---")
         download_overlap_results("./downloaded_overlap_results.pkl")
     else:
         print(f"Test file not found: {test_pkl_path}")
@@ -419,6 +530,9 @@ if __name__ == "__main__":
     if os.path.exists(test_alpha_path):
         print("\nTesting Alpha Upload...")
         upload_alpha_overlap_results(test_alpha_path)
+        print("\n--- Testing Alpha Download (1st time) ---")
+        download_file("./downloaded_alpha.pkl", OVERLAP_ALPHA_FILE_NAME)
+        print("\n--- Testing Alpha Download (2nd time, should be 304) ---")
         download_file("./downloaded_alpha.pkl", OVERLAP_ALPHA_FILE_NAME)
     else:
         print(f"\nTest file not found: {test_alpha_path}")
@@ -433,6 +547,9 @@ if __name__ == "__main__":
                 pickle.dump(dummy_data, f)
             print("Created dummy alpha file for testing.")
             upload_alpha_overlap_results(test_alpha_path)
+            print("\n--- Testing Alpha Download (1st time) ---")
+            download_file("./downloaded_alpha.pkl", OVERLAP_ALPHA_FILE_NAME)
+            print("\n--- Testing Alpha Download (2nd time, should be 304) ---")
             download_file("./downloaded_alpha.pkl", OVERLAP_ALPHA_FILE_NAME)
         except Exception as e:
             print(f"Failed to create/upload dummy alpha file: {e}")
