@@ -1091,7 +1091,7 @@ def _normalize(obj: Any) -> Any:
 # This is the new SQLite-backed version of JobLibTokenUpdater.
 
 class JobLibTokenUpdater:
-    def __init__(self, data_dir: str = "./data/token_data", expiry_hours: int = 24, debug: bool = False):
+    def __init__(self, data_dir: str = "./data/token_data", expiry_hours: int = 6, debug: bool = False):
         self.data_dir = os.path.abspath(data_dir)
         os.makedirs(self.data_dir, exist_ok=True)
         
@@ -1363,7 +1363,7 @@ class DuneHolderCache:
 # -----------------------
 
 
-def prune_old_overlap_entries(data: dict, expiry_hours: int = 24) -> dict:
+def prune_old_overlap_entries(data: dict, expiry_hours: int = 6) -> dict:
     """
     Robust pruning of overlap entries.
     - Accepts several input shapes (mapping mint->list, DataFrame-like dicts, lists).
@@ -1465,7 +1465,7 @@ class OverlapStore:
                     print("OverlapStore: load failed", e)
         return {}
 
-    def save(self, obj: Dict[str, Any], expiry_hours: int = 24):
+    def save(self, obj: Dict[str, Any], expiry_hours: int = 6):
         """
         Save overlap results to disk and periodically upload to Supabase.
         Always filters NONE grades before uploading.
@@ -1490,7 +1490,7 @@ class OverlapStore:
                 # Always save the pruned, normalized object locally
                 joblib.dump(_sanitize_maybe(pruned), self.filepath)
 
-                # throttle uploads to Supabase (once every 2 minutes)
+                # throttle uploads to Supabase (once every 120 secs)
                 if now - self._last_upload < 120:
                     if self.debug:
                         print("OverlapStore: save throttled (recent upload). Local save completed.")
@@ -1547,7 +1547,7 @@ class SchedulingStore:
     def cleanup_old_states(self, cutoff_timestamp: int = None):
         current_state = self.load()
         now = datetime.now(timezone.utc)
-        cutoff = cutoff_timestamp or int((now - timedelta(hours=24)).timestamp())
+        cutoff = cutoff_timestamp or int((now - timedelta(hours=6)).timestamp())
         cleaned_state = {}
         for token_mint, state in current_state.items():
             launch_time = state.get("launch_time", 0)
@@ -1856,7 +1856,7 @@ class Monitor:
     async def _cleanup_finished_tasks(self):
         """Periodically cleans up finished tasks and states from internal memory."""
         now_ts = int(datetime.now(timezone.utc).timestamp())
-        cutoff_ts = now_ts - (24 * 3600)  # 24 hours ago
+        cutoff_ts = now_ts - (6 * 3600)  # 4 hours ago
 
         # --- Cleanup _probation_tasks ---
         finished_probation_tasks = [
@@ -2295,7 +2295,7 @@ class Monitor:
             now_ts = int(datetime.now(timezone.utc).timestamp())
             if now_ts >= deadline:
                 if self.debug:
-                    print(f"Probation: {mint} exceeded 24h probation -> dropping")
+                    print(f"Probation: {mint} exceeded 6h probation -> dropping")
                 self.pending_risky_tokens.pop(mint, None)
                 try:
                     self.scheduling_store.update_token_state(mint, {
@@ -2476,7 +2476,7 @@ class Monitor:
             
         scheduling_state = self.scheduling_store.load()
         current_time = int(datetime.now(timezone.utc).timestamp())
-        cutoff_time = current_time - (24 * 3600)
+        cutoff_time = current_time - (6 * 3600)
         
         self.scheduling_store.cleanup_old_states(cutoff_time)
         # Use the new async cleanup method
@@ -2619,14 +2619,14 @@ class Monitor:
         await asyncio.sleep(to_sleep)
         
         self.scheduling_store.update_token_state(start.mint, {"status": "running_first_check"})
-        stop_after = block_ts + 24 * 3600
+        stop_after = block_ts + 6 * 3600
         check_count = 0
         
         while True:
             now_ts2 = int(datetime.now(timezone.utc).timestamp())
             if now_ts2 > stop_after:
                 if self.debug:
-                    print(f"_schedule ASYNC: token={start.mint} past 24h -> stopping scheduled checks")
+                    print(f"_schedule ASYNC: token={start.mint} past 6h -> stopping scheduled checks")
                 
                 # Final status update
                 current_state = self.scheduling_store.get_token_state(start.mint)
@@ -2783,7 +2783,7 @@ async def main_loop():
             )
             holder_agg = HolderAggregator(sol_client, debug=True)
             # --- UPDATER INSTANCE: This now uses the new SQLite class ---
-            updater = JobLibTokenUpdater(data_dir="./data/token_data", expiry_hours=24, debug=True)
+            updater = JobLibTokenUpdater(data_dir="./data/token_data", expiry_hours=6, debug=True)
             # ---
             dune_cache = DuneWinnersCache(cache_dir="./data/dune_cache", debug=True)
             dune_builder = DuneWinnersBuilder(cache=dune_cache, debug=True, max_concurrency=8)

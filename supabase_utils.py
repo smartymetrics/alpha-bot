@@ -23,12 +23,9 @@ import requests
 from supabase import create_client, Client
 import tempfile
 from typing import Optional, Dict, Any, Union
-from dotenv import load_dotenv
-
-load_dotenv() 
 
 BUCKET_NAME = "monitor-data"
- 
+
 # Original overlap files
 OVERLAP_FILE_NAME = "overlap_results.pkl"
 OVERLAP_JSON_NAME = "overlap_results.json"
@@ -433,6 +430,17 @@ def download_file(save_path: str, file_name: str, bucket: str = BUCKET_NAME) -> 
 def download_overlap_results(save_path: str, bucket: str = BUCKET_NAME) -> Optional[bytes]:
     """Download overlap_results.pkl specifically."""
     return download_file(save_path, OVERLAP_FILE_NAME, bucket)
+
+
+# -------------------
+# --- ADDED THIS FUNCTION ---
+# -------------------
+def download_alpha_overlap_results(save_path: str, bucket: str = BUCKET_NAME) -> Optional[bytes]:
+    """Download overlap_results_alpha.pkl specifically."""
+    return download_file(save_path, OVERLAP_ALPHA_FILE_NAME, bucket)
+# -------------------
+# --- END OF ADDITION ---
+# -------------------
 
 
 # -------------------

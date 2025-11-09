@@ -58,7 +58,7 @@ PROBATION_TOP_N = int(os.getenv("PROBATION_TOP_N", "3"))
 PROBATION_THRESHOLD_PCT = float(os.getenv("PROBATION_THRESHOLD_PCT", "40"))
 
 # --- Monitoring Window Config ---
-TOKEN_MONITORING_WINDOW_HOURS = int(os.getenv("TOKEN_MONITORING_WINDOW_HOURS", "24"))
+TOKEN_MONITORING_WINDOW_HOURS = int(os.getenv("TOKEN_MONITORING_WINDOW_HOURS", "6"))
 
 # --- MINIMUM SECURITY REQUIREMENTS ---
 MIN_HOLDER_COUNT = 50
@@ -1228,7 +1228,7 @@ class WinnerMonitor:
         *,
         poll_interval_seconds: int = 900,
         top_n_wallets: int = 50,
-        monitoring_window_hours: int = 24,
+        monitoring_window_hours: int = 6,
         debug: bool = False
     ):
         self.http_session = http_session
@@ -1475,9 +1475,9 @@ class WinnerMonitor:
                 await asyncio.sleep(3600)
 
     async def recheck_tokens_loop(self):
-        """Background task: Recheck all tracked tokens every 1 hour."""
+        """Background task: Recheck all tracked tokens every 30 minutes."""
         while True:
-            await asyncio.sleep(3600)
+            await asyncio.sleep(1800)
             
             try:
                 if self.debug:
@@ -1602,19 +1602,19 @@ class WinnerMonitor:
         )
         self._monitoring_tasks[mint] = task
         if self.debug:
-            print(f"[Monitoring] 🔍 Started 24h monitoring for {mint} [Grade: {grade}]; reasons={self.pending_tokens[mint]['reasons']}")
+            print(f"[Monitoring] 🔍 Started 6h monitoring for {mint} [Grade: {grade}]; reasons={self.pending_tokens[mint]['reasons']}")
 
     async def _monitoring_recheck_loop(
         self, mint: str
     ):
-        """Recheck token every hour for 24 hours (applies to ALL grades including NONE) that failed the gate."""
+        """Recheck token every 30 mins for 6 hours (applies to ALL grades including NONE) that failed the gate."""
         entry = self.pending_tokens.get(mint)
         if not entry:
             return
             
         first_seen_ts = entry["first_seen_ts"]
         deadline = first_seen_ts + self.monitoring_window_hours * 3600
-        interval = 3600  # 1 hour
+        interval = 1800  # 30 mins
 
         while True:
             now_ts = int(datetime.now(timezone.utc).timestamp())
@@ -1622,7 +1622,7 @@ class WinnerMonitor:
                 if self.debug:
                     final_grade = entry.get("grade", "NONE")
                     final_reasons = ", ".join(entry.get("reasons", ["no_reason"]))
-                    print(f"[Monitoring] ⏰ {mint} completed 24h monitoring [Final Grade: {final_grade}, Reasons: {final_reasons}] -> NOT uploading to Supabase.")
+                    print(f"[Monitoring] ⏰ {mint} completed 6h monitoring [Final Grade: {final_grade}, Reasons: {final_reasons}] -> NOT uploading to Supabase.")
                 
                 # Remove from monitoring memory
                 self.pending_tokens.pop(mint, None)
