@@ -1,0 +1,23 @@
+[
+  "price_usd",
+  "fdv_usd",
+  "liquidity_usd",
+  "volume_h24_usd",
+  "price_change_h24_pct",
+  "creator_balance_pct",
+  "top_10_holders_pct",
+  "total_lp_locked_usd",
+  "has_mint_authority",
+  "has_freeze_authority",
+  "is_lp_locked_95_plus",
+  "time_of_day_utc",
+  "day_of_week_utc",
+  "is_weekend_utc",
+  "is_public_holiday_any",
+  "signal_source",
+  "grade",
+  "token_age_at_signal_seconds",
+  "volume_to_liquidity_ratio",
+  "fdv_to_liquidity_ratio",
+  "is_new_token"
+]

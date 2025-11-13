@@ -1,0 +1,43 @@
+{
+  "model_type": "XGBClassifier",
+  "trained_at": "2025-11-12T18:08:25.384593",
+  "training_samples": 45,
+  "test_samples": 12,
+  "features": [
+    "price_usd",
+    "fdv_usd",
+    "liquidity_usd",
+    "volume_h24_usd",
+    "price_change_h24_pct",
+    "creator_balance_pct",
+    "top_10_holders_pct",
+    "total_lp_locked_usd",
+    "has_mint_authority",
+    "has_freeze_authority",
+    "is_lp_locked_95_plus",
+    "time_of_day_utc",
+    "day_of_week_utc",
+    "is_weekend_utc",
+    "is_public_holiday_any",
+    "signal_source",
+    "grade",
+    "token_age_at_signal_seconds",
+    "volume_to_liquidity_ratio",
+    "fdv_to_liquidity_ratio",
+    "is_new_token"
+  ],
+  "performance": {
+    "train_accuracy": 0.8666666666666667,
+    "test_accuracy": 0.75,
+    "train_auc": 0.887,
+    "test_auc": 0.8125,
+    "cv_auc_mean": NaN,
+    "cv_auc_std": NaN
+  },
+  "hyperparameters": {
+    "max_depth": 6,
+    "learning_rate": 0.1,
+    "n_estimators": 200,
+    "scale_pos_weight": 1.25
+  }
+}

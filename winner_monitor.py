@@ -10,6 +10,11 @@ Tracks high-frequency winner wallets and monitors their latest token purchases.
 - Tokens that fail RugCheck, fail security requirements, or are in probation do NOT get overlap checks.
 - Failed tokens stay in memory for 24h hourly rechecks (NOT uploaded to Supabase).
 - ONLY tokens passing ALL RugCheck requirements AND having NON-ZERO overlap get uploaded to Supabase.
+
+*** MODIFIED: ***
+- Now fetches and embeds Dexscreener data for all tokens that pass security and overlap checks.
+- This provides the market data (price, etc.) for collector.py, removing the need
+  for the collector to make a separate, failing live API call.
 """
 
 import asyncio
@@ -21,6 +26,7 @@ import json
 import threading
 import pandas as pd
 import math
+import random
 from dotenv import load_dotenv
 from collections import defaultdict
 from dataclasses import asdict
@@ -157,6 +163,21 @@ def safe_load_overlap(overlap_store_or_obj: Any) -> Dict[str, List[Dict]]:
 
     print(f"⚠️ safe_load_overlap: Unknown data type {type(obj)}, returning empty dict.")
     return {}
+
+
+async def retry_with_backoff(func, *args, retries: int = 5, base_delay: float = 0.5, **kwargs):
+    """Retry an async function with exponential backoff and jitter."""
+    for attempt in range(1, retries + 1):
+        try:
+            return await func(*args, **kwargs)
+        except Exception as e:
+            wait = base_delay * (2 ** (attempt - 1)) + random.uniform(0, 0.3)
+            if hasattr(func, '__name__'):
+                print(f"[Retry] {func.__name__} failed (attempt {attempt}/{retries}): {e}. Retrying in {wait:.2f}s")
+            else:
+                print(f"[Retry] A function failed (attempt {attempt}/{retries}): {e}. Retrying in {wait:.2f}s")
+            await asyncio.sleep(wait)
+    raise RuntimeError(f"Function failed after {retries} retries")
 
 
 def prune_old_overlap_entries(data: dict, expiry_hours: int = 24) -> dict:
@@ -790,6 +811,7 @@ class AlphaTokenAnalyzer:
         dune_cache: DuneWinnersCache,
         helius_limiter: AsyncRateLimiter,
         rugcheck_client: RugCheckClient,
+        dex_limiter: AsyncRateLimiter, # Add new limiter
         debug: bool = False
     ):
         self.http_session = http_session
@@ -798,6 +820,7 @@ class AlphaTokenAnalyzer:
         self.helius_limiter = helius_limiter
         self.rugcheck_client = rugcheck_client
         self.debug = debug
+        self.dex_limiter = dex_limiter # Store new limiter
         
         if self.debug:
             print("[TokenAnalyzer] Initialized.")
@@ -875,6 +898,60 @@ class AlphaTokenAnalyzer:
             "probation": probation_result["probation"],
             "probation_meta": probation_result,
             "raw": data
+        }
+
+    async def _run_dexscreener_check(self, mint: str) -> Dict[str, Any]:
+        """
+        Fetches token data from DexScreener.
+        Designed to be used with `retry_with_backoff`, so it raises exceptions on failure
+        (HTTP errors, no pairs found, invalid price) to trigger retries.
+        """
+        url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
+        session = self.http_session
+        async with self.dex_limiter: # Use the new Dexscreener limiter
+            # Let retry_with_backoff handle exceptions from this block
+            async with session.get(url, timeout=30) as resp:
+                if resp.status == 429:
+                    # Specific error for rate limiting to make logs clearer
+                    raise aiohttp.ClientResponseError(
+                        resp.request_info, resp.history, status=resp.status,
+                        message=f"Rate limited by DexScreener for {mint}"
+                    )
+                # Raise an exception for any other 4xx/5xx status
+                resp.raise_for_status()
+                data = await resp.json()
+
+        pairs = data.get("pairs") or []
+        if not pairs:
+            # A successful response but no data is a retryable condition
+            raise ValueError(f"DexScreener: No pairs found for mint {mint}")
+
+        # Use the first pair as the canonical source
+        p0 = pairs[0]
+        
+        # Validate priceUsd: must exist and be a positive float
+        try:
+            price_str = p0.get("priceUsd")
+            if price_str is None:
+                raise ValueError("priceUsd is null")
+            price_usd = float(price_str)
+            if price_usd <= 0:
+                raise ValueError(f"price is zero or negative: {price_usd}")
+        except (ValueError, TypeError, KeyError) as e:
+            # Re-raise a more informative error to trigger retry
+            raise ValueError(f"DexScreener: Could not parse valid price for {mint}. Raw value: '{price_str}'. Details: {e}") from e
+
+        # Extract liquidity, converting to float safely
+        try:
+            liquidity = float(p0.get("liquidity", {}).get("usd", 0.0) or 0.0)
+        except (ValueError, TypeError):
+            liquidity = 0.0
+
+        return {
+            "ok": True,
+            "pair_exists": True,
+            "price_usd": price_usd,
+            "raw": p0
         }
 
     async def analyze_token(self, mint: str) -> Dict[str, Any]:
@@ -1166,6 +1243,23 @@ class AlphaTokenAnalyzer:
                  print(f"[TokenAnalyzer] ⚠️ {mint} passed security but ZERO overlap - setting to monitoring.")
             
         
+        # --- DEXSCREENER FETCH (NEW) ---
+        # If the token passed all checks (i.e., not monitoring), fetch Dexscreener data
+        dex_data = None # Default
+        if not final_needs_monitoring:
+            if self.debug:
+                print(f"[TokenAnalyzer] 💎 {mint} PASSED (Grade: {grade}), fetching DexScreener data...")
+            try:
+                dex_data_result = await retry_with_backoff(
+                    self._run_dexscreener_check, mint, retries=8, base_delay=1.5
+                )
+                dex_data = dex_data_result # Store the whole result dict
+            except Exception as e:
+                if self.debug:
+                    print(f"[TokenAnalyzer] ⚠️ {mint} Dexscreener fetch failed after retries: {e}")
+                dex_data = {"ok": False, "error": str(e)}
+        # --- END DEXSCREENER FETCH ---
+        
         result = {
             "mint": mint,
             "checked_at": datetime.now(timezone.utc).isoformat(),
@@ -1178,7 +1272,8 @@ class AlphaTokenAnalyzer:
             "overlap_wallets_sample": list(overlap)[:20],
             "security": security_report,
             "needs_monitoring": final_needs_monitoring, # Only False if overlap > 0
-            "skip_reason": final_skip_reason
+            "skip_reason": final_skip_reason,
+            "dexscreener": dex_data # Embed Dexscreener data
         }
         
         if self.debug and not final_needs_monitoring:
@@ -1744,6 +1839,14 @@ async def main():
         )
         rugcheck_limiter.name = "RugCheckLimiter"
         
+        dex_limiter = AsyncRateLimiter(
+            rate=2,
+            per=1.0,
+            min_interval=0.5,
+            debug=debug_mode
+        )
+        dex_limiter.name = "DexLimiter"
+        
         rugcheck_client = RugCheckClient(
             session=http_session,
             rate_limiter=rugcheck_limiter,
@@ -1757,6 +1860,7 @@ async def main():
             dune_cache=dune_cache,
             helius_limiter=helius_limiter,
             rugcheck_client=rugcheck_client,
+            dex_limiter=dex_limiter, # Pass new limiter
             debug=debug_mode
         )
         
