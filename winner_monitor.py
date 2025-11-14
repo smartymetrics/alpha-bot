@@ -1286,14 +1286,11 @@ class AlphaTokenAnalyzer:
                 dex_data = {"ok": False, "error": str(e)}
         # --- END DEXSCREENER FETCH ---
         
-        # 
-        # (*** NEW BLOCK: ML PREDICTOR INTEGRATION ***)
-        # 
         win_probability = None
         result_checked_at_iso = datetime.now(timezone.utc).isoformat() # Capture timestamp
 
         # Only run predictor if token is *passing* (not needs_monitoring)
-        if not final_needs_monitoring: 
+        if not final_needs_monitoring and grade not in ("NONE", "UNKNOWN"):
             try:
                 # Construct the data_dict for the predictor
                 predictor_data_dict = {
