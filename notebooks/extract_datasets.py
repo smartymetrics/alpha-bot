@@ -9,7 +9,8 @@ This script:
 1. Downloads labeled datasets from Supabase
 2. Extracts ONLY features that exist in collector.py
 3. Creates derived features
-4. Saves to CSV for training
+4. Applies 'first-per-tracking-period' cleaning logic (24h/168h)
+5. Saves to CSV for training
 
 Usage:
     # Extract ALL available data (automatic)
@@ -85,6 +86,13 @@ class FeatureExtractor:
         
         # Identifier
         'mint': 'mint',
+        
+        # ---
+        # NOTE: This is an internal-only mapping used by the extractor
+        # It is NOT a feature used by the model, but is required
+        # for the cleaning logic.
+        'checked_at_utc': 'checked_at_utc',
+        'token_age_hours_at_signal': 'token_age_hours_at_signal',
     }
     
     def __init__(self):
@@ -398,14 +406,14 @@ class FeatureExtractor:
                                     'creator_balance_pct', 'top_10_holders_pct',
                                     'total_lp_locked_usd', 'token_age_at_signal_seconds',
                                     'time_of_day_utc', 'day_of_week_utc',
-                                    'checked_at_timestamp']:
+                                    'checked_at_timestamp', 'token_age_hours_at_signal']:
                         value = 0.0
                     elif ml_feature in ['has_mint_authority', 'has_freeze_authority',
                                     'is_lp_locked_95_plus', 'is_weekend_utc',
                                     'is_public_holiday_any']:
                         value = 0
                     elif ml_feature in ['rugcheck_risk_level', 'signal_source', 
-                                    'grade', 'mint']:
+                                    'grade', 'mint', 'checked_at_utc']:
                         value = 'UNKNOWN'
                 
                 features_dict[ml_feature] = value
@@ -539,10 +547,75 @@ class FeatureExtractor:
         # Convert to DataFrame
         df = pd.DataFrame(all_features)
         
-        # Remove duplicates (same mint + timestamp)
-        if 'mint' in df.columns and 'checked_at_timestamp' in df.columns:
-            df = df.drop_duplicates(subset=['mint', 'checked_at_timestamp'])
-            logger.info(f"After deduplication: {len(df)} samples")
+        # --- [START] MODIFIED SECTION: Apply 'first-per-tracking-period' cleaning ---
+        if 'checked_at_utc' in df.columns and 'mint' in df.columns:
+            logger.info(f"Applying 'first-per-tracking-period' deduplication logic (24h/168h)...")
+            
+            # 1. Define the helper function for complex deduplication
+            def filter_by_tracking_period(group):
+                rows_to_keep = []
+                tracking_end_time = pd.NaT  # Not a Time
+
+                # The group is already sorted by 'checked_at_utc'
+                for index, row in group.iterrows():
+                    current_time = row['checked_at_utc']
+                    
+                    # Skip rows with invalid timestamps
+                    if pd.isna(current_time):
+                        continue
+                        
+                    # Check if this row is the start of a new tracking period
+                    # (Either the very first row, or it's after the last tracking period ended)
+                    if pd.isna(tracking_end_time) or current_time >= tracking_end_time:
+                        # 1. Keep this row
+                        rows_to_keep.append(index)
+                        
+                        # 2. Calculate the *new* tracking period based on this row
+                        token_age = row['token_age_hours_at_signal']
+                        
+                        # Note: (np.nan < 12) evaluates to False.
+                        # This correctly defaults tokens with unknown age to the 168h period.
+                        is_new_token = (token_age < 12)
+                        
+                        tracking_duration_hours = 24 if is_new_token else 168
+                        
+                        # 3. Set the end time for this new period
+                        tracking_end_time = current_time + pd.Timedelta(hours=tracking_duration_hours)
+                    
+                    # else: (current_time < tracking_end_time)
+                    # This row is inside an active tracking period, so we drop it
+                    # by not adding its index to rows_to_keep.
+                
+                # Return only the rows we've selected
+                return group.loc[rows_to_keep]
+
+            # 2. Ensure checked_at_utc is datetime
+            #    Handle 'UNKNOWN' values by converting them to NaT
+            df['checked_at_utc'] = pd.to_datetime(df['checked_at_utc'], errors='coerce')
+            
+            # 3. Sort by mint and timestamp (CRITICAL for the filter logic)
+            df = df.sort_values(by=['mint', 'checked_at_utc'], ascending=[True, True])
+            
+            # 4. Apply the custom filter function
+            original_count = len(df)
+            # We group by 'mint' and apply our custom logic to each group
+            df = df.groupby('mint').apply(filter_by_tracking_period)
+            
+            # 5. Clean up the DataFrame
+            # .apply() creates a multi-index; remove it.
+            df = df.reset_index(drop=True)
+            cleaned_count = len(df)
+            
+            logger.info(f"After 'first-per-tracking-period' deduplication: {cleaned_count} samples ({original_count - cleaned_count} duplicates removed)")
+
+        else:
+            logger.warning("Could not apply 'first-per-tracking-period' cleaning: 'mint' or 'checked_at_utc' missing.")
+            # Fallback to original deduplication just in case
+            if 'mint' in df.columns and 'checked_at_timestamp' in df.columns:
+                df = df.drop_duplicates(subset=['mint', 'checked_at_timestamp'])
+                logger.info(f"After (fallback) timestamp deduplication: {len(df)} samples")
+        # --- [END] MODIFIED SECTION ---
+        
         
         # Remove unlabeled samples
         df = df[df['label_status'].isin(['win', 'loss'])]
@@ -582,10 +655,8 @@ class FeatureExtractor:
         
         # Print feature list
         logger.info("\n📋 Features extracted:")
-        feature_cols = [c for c in df.columns if c not in ['label_status', 'label_ath_roi', 
-                                                            'label_final_roi', 'label_hit_50_percent',
-                                                            'label_token_age_hours', 
-                                                            'label_tracking_duration_hours']]
+        feature_cols = [c for c in df.columns if not c.startswith('label_') and c != 'checked_at_date']
+        
         for i, col in enumerate(feature_cols, 1):
             logger.info(f"  {i:2}. {col}")
         

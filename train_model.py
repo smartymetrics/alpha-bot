@@ -5,463 +5,415 @@ import seaborn as sns
 from datetime import datetime
 import joblib
 import json
+import os
 
 # ML libraries
-from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
+from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import (
-    classification_report, confusion_matrix, roc_auc_score, 
-    roc_curve, precision_recall_curve, average_precision_score
+    classification_report, confusion_matrix, roc_auc_score,
+    precision_recall_curve, average_precision_score
 )
 import xgboost as xgb
+import lightgbm as lgb
+from catboost import CatBoostClassifier
 
 import warnings
 warnings.filterwarnings('ignore')
 
-import os
-
-# Create output directories
-os.makedirs('outputs', exist_ok=True)
+# Create directories
 os.makedirs('models', exist_ok=True)
-os.makedirs('data', exist_ok=True)
+os.makedirs('outputs', exist_ok=True)
 
-print("✅ Created output directories")
-
-sns.set_style('whitegrid')
-plt.rcParams['figure.figsize'] = (12, 6)
-
-#  load dataset
+# Load data
 df = pd.read_csv('data/token_datasets.csv')
 
-print(f"📊 Dataset loaded: {df.shape[0]} rows × {df.shape[1]} columns")
-print(f"\n🎯 Target distribution:")
-print(df['label_status'].value_counts())
-print(f"\nWin rate: {(df['label_status'] == 'win').mean() * 100:.2f}%")
+print(f"📊 Dataset: {df.shape[0]} samples")
+print(f"🎯 Win rate: {(df['label_status'] == 'win').mean() * 100:.2f}%")
 
-
-# ----------------------------------------------------------------------------
-# MARKET FEATURES (Used in ML)
-# ----------------------------------------------------------------------------
-MARKET_FEATURES = [
-    'fdv_usd',
-    'liquidity_usd',
-    'volume_h24_usd',
-    'price_change_h24_pct',
-]
-
-# ----------------------------------------------------------------------------
-# SECURITY FEATURES (Used in ML)
-# ----------------------------------------------------------------------------
-SECURITY_FEATURES = [
-    'has_mint_authority',
-    'has_freeze_authority',
-    'creator_balance_pct',
-    'top_10_holders_pct',
-    'is_lp_locked_95_plus',
-    'total_lp_locked_usd',
-]
-
-# ----------------------------------------------------------------------------
-# ADDITIONAL SECURITY FEATURES (Not in ML model)
-# ----------------------------------------------------------------------------
-ADDITIONAL_SECURITY_FEATURES = [
-    'total_insider_networks',
-    'largest_insider_network_size',
-    'total_insider_token_amount',
-    'rugcheck_risk_level',
-]
-
-# ----------------------------------------------------------------------------
-# TIME FEATURES (Used in ML)
-# ----------------------------------------------------------------------------
-TIME_FEATURES = [
-    'time_of_day_utc',
-    'day_of_week_utc',
-    'is_weekend_utc',
-    'is_public_holiday_any',
-]
-
-# ----------------------------------------------------------------------------
-# SIGNAL FEATURES 
-# ----------------------------------------------------------------------------
-SIGNAL_FEATURES = [
-    'signal_source',  # discovery or alpha
-    'grade'          # CRITICAL, HIGH, MEDIUM, LOW
-]
-
-# ----------------------------------------------------------------------------
-# TOKEN AGE FEATURES 
-# ----------------------------------------------------------------------------
-ADDITIONAL_TOKEN_AGE_FEATURES = [
-    'token_age_at_signal_seconds'
-]
-
-# ----------------------------------------------------------------------------
-# DERIVED SMART MONEY FEATURES 
-# ----------------------------------------------------------------------------
-DERIVED_SMART_MONEY_FEATURES = [
-    'overlap_quality_score',
-    'winner_wallet_density'
-]
-
-# ----------------------------------------------------------------------------
-# DERIVED CONCENTRATION FEATURES
-# ----------------------------------------------------------------------------
-DERIVED_CONCENTRATION_FEATURES = [
-    'whale_concentration_score',
-]
-
-# ----------------------------------------------------------------------------
-# DERIVED RISK FEATURES
-# ----------------------------------------------------------------------------
-DERIVED_RISK_FEATURES = [
-    'pump_dump_risk_score'
-]
-
-# ----------------------------------------------------------------------------
-# ADDITIONAL DERIVED RISK FEATURES
-# ----------------------------------------------------------------------------
-ADDITIONAL_DERIVED_RISK_FEATURES = [
-    'authority_risk_score',
-    'creator_dumped',
-]
-
-# ----------------------------------------------------------------------------
-# DERIVED TEMPORAL FEATURES (Used in ML)
-# ----------------------------------------------------------------------------
-DERIVED_TEMPORAL_FEATURES = [
-    'hour_category',
-    'is_last_day_of_week'
-]
-
-# ----------------------------------------------------------------------------
-# ML TRAINING FEATURES
-# ----------------------------------------------------------------------------
-ML_TRAINING_FEATURES = (
-    MARKET_FEATURES + 
-    SECURITY_FEATURES + 
-    TIME_FEATURES + 
-    SIGNAL_FEATURES + 
-    DERIVED_SMART_MONEY_FEATURES +
-    DERIVED_CONCENTRATION_FEATURES +
-    DERIVED_RISK_FEATURES +
-    DERIVED_TEMPORAL_FEATURES
-)
-
-# ----------------------------------------------------------------------------
-# ALL FEATURES (Everything extracted from snapshot)
-# ----------------------------------------------------------------------------
-FEATURE_COLS = (
-    MARKET_FEATURES +
-    SECURITY_FEATURES +
-    ADDITIONAL_SECURITY_FEATURES +
-    TIME_FEATURES +
-    SIGNAL_FEATURES +
-    ADDITIONAL_TOKEN_AGE_FEATURES +
-    DERIVED_SMART_MONEY_FEATURES +
-    DERIVED_CONCENTRATION_FEATURES +
-    DERIVED_RISK_FEATURES +
-    ADDITIONAL_DERIVED_RISK_FEATURES +
-    DERIVED_TEMPORAL_FEATURES 
-)
-
-print(f"✅ Using {len(FEATURE_COLS)} features from dataset:")
-print("\nFeatures:")
-for f in FEATURE_COLS:
-    print(f"  - {f}")
-
-# Data Preprocessing
-df_clean = df.copy()
-
-# Handle missing values
-print("🔍 Checking for missing values...")
-df_clean[FEATURE_COLS].isnull().sum()
-
-df_clean.dtypes
-
-# Encode categorical features
-print("\n🏷️  Encoding categorical features...")
-
-label_encoders = {}
-df_encoded = df_clean.copy()
-
-for col in FEATURE_COLS:
-    if df_encoded[col].dtype == 'object':
-        print(f"  Encoding: {col}")
-        le = LabelEncoder()
-        df_encoded[col] = le.fit_transform(df_encoded[col].astype(str))
-        label_encoders[col] = le
-
-print(f"✅ Encoded {len(label_encoders)} categorical features")
+# ============================================================================
+# FEATURE ENGINEERING - MUST MATCH ml_predictor.py
+# ============================================================================
 
 # Encode target
-print("\n🎯 Encoding target variable...")
-le_target = LabelEncoder()
-df_encoded['target'] = le_target.fit_transform(df_clean['label_status'])
-label_encoders['target'] = le_target
+df['target'] = (df['label_status'] == 'win').astype(int)
 
-print(f"  0 = {le_target.classes_[0]}")
-print(f"  1 = {le_target.classes_[1]}")
+# Better temporal features (NEW - added to predictor)
+df['is_asia_prime'] = df['time_of_day_utc'].between(6, 14).astype(int)
+df['is_us_prime'] = df['time_of_day_utc'].between(13, 21).astype(int)
+df['is_eu_prime'] = df['time_of_day_utc'].between(8, 16).astype(int)
+df['is_dead_hours'] = df['time_of_day_utc'].between(0, 6).astype(int)
 
-# Create derived features
-print("\n🔬 Creating derived features...")
-
-df_encoded['volume_to_liquidity_ratio'] = np.where(
-    df_encoded['liquidity_usd'] > 0,
-    df_encoded['volume_h24_usd'] / df_encoded['liquidity_usd'],
+# Derived market features (already in predictor)
+df['volume_to_liquidity_ratio'] = np.where(
+    df['liquidity_usd'] > 0,
+    df['volume_h24_usd'] / df['liquidity_usd'],
     0
 )
 
-df_encoded['fdv_to_liquidity_ratio'] = np.where(
-    df_encoded['liquidity_usd'] > 0,
-    df_encoded['fdv_usd'] / df_encoded['liquidity_usd'],
+df['fdv_to_liquidity_ratio'] = np.where(
+    df['liquidity_usd'] > 0,
+    df['fdv_usd'] / df['liquidity_usd'],
     0
 )
 
-df_encoded['is_new_token'] = (df_encoded['token_age_at_signal_seconds'] < 43200).astype(int)  # <12 hours
+df['is_new_token'] = (df['token_age_at_signal_seconds'] < 43200).astype(int)
 
-# Add derived features to feature list
-FEATURE_COLS.extend([
+# Risk interaction features (NEW - added to predictor)
+df['high_risk_combo'] = (
+    (df['pump_dump_risk_score'] > 30) & 
+    (df['authority_risk_score'] > 15)
+).astype(int)
+
+df['critical_signal_quality'] = (
+    (df['grade'] == 'CRITICAL') & 
+    (df['signal_source'] == 'alpha')
+).astype(int)
+
+# ============================================================================
+# FEATURE DEFINITIONS - MATCHES ml_predictor.py
+# ============================================================================
+
+NUMERIC_FEATURES = [
+    # Market features (at signal time)
+    'fdv_usd', 
+    'liquidity_usd', 
+    'volume_h24_usd', 
+    'price_change_h24_pct',
+    
+    # Security features
+    'creator_balance_pct', 
+    'top_10_holders_pct', 
+    'total_lp_locked_usd',
+    
+    # Smart money features
+    'overlap_quality_score', 
+    'winner_wallet_density',
+    
+    # Risk features
+    'whale_concentration_score', 
+    'pump_dump_risk_score',
+    'authority_risk_score',
+    
+    # Derived features
     'volume_to_liquidity_ratio',
-    'fdv_to_liquidity_ratio', 
-    'is_new_token'
-])
+    'fdv_to_liquidity_ratio',
+    
+    # Temporal features
+    'time_of_day_utc', 
+    'day_of_week_utc',
+    'is_asia_prime', 
+    'is_us_prime', 
+    'is_eu_prime', 
+    'is_dead_hours',
+    
+    # Token features
+    'is_new_token',
+    
+    # Interaction features
+    'high_risk_combo', 
+    'critical_signal_quality'
+]
 
-print(f"✅ Total features: {len(FEATURE_COLS)}")
+CATEGORICAL_FEATURES = [
+    'signal_source',        # alpha or discovery
+    'grade',                # CRITICAL, HIGH, MEDIUM, LOW
+    'hour_category',        # dead_hours, asia_hours, eu_hours, us_hours
+    'rugcheck_risk_level'   # from probation_meta
+]
 
-# Time-Series Train-Test Split
-# Sort by timestamp
-print("📅 Sorting by timestamp...")
-df_encoded = df_encoded.sort_values('checked_at_timestamp')
-print(f"  Date range: {df_encoded['checked_at_timestamp'].min()} to {df_encoded['checked_at_timestamp'].max()}")
+ALL_FEATURES = NUMERIC_FEATURES + CATEGORICAL_FEATURES
 
-# Time-series split: 80% train, 20% test
-# Test set is the MOST RECENT data
-split_idx = int(len(df_encoded) * 0.8)
+print(f"\n✅ Using {len(ALL_FEATURES)} features:")
+print(f"   - {len(NUMERIC_FEATURES)} numeric")
+print(f"   - {len(CATEGORICAL_FEATURES)} categorical")
 
-train_df = df_encoded.iloc[:split_idx]
-test_df = df_encoded.iloc[split_idx:]
+# Handle missing values
+for col in NUMERIC_FEATURES:
+    if col in df.columns:
+        df[col] = df[col].fillna(0)
+    else:
+        print(f"⚠️  Missing column in data: {col}, creating with default value 0")
+        df[col] = 0
 
-print(f"\n✂️  Train-Test Split:")
-print(f"  Training samples: {len(train_df)} ({len(train_df)/len(df_encoded)*100:.1f}%)")
-print(f"  Test samples: {len(test_df)} ({len(test_df)/len(df_encoded)*100:.1f}%)")
+for col in CATEGORICAL_FEATURES:
+    if col in df.columns:
+        df[col] = df[col].fillna('UNKNOWN')
+    else:
+        print(f"⚠️  Missing column in data: {col}, creating with default value 'UNKNOWN'")
+        df[col] = 'UNKNOWN'
 
-# Check distribution
-print(f"\n📊 Distribution:")
-print(f"  Training win rate: {train_df['target'].mean()*100:.2f}%")
-print(f"  Test win rate: {test_df['target'].mean()*100:.2f}%")
+# ============================================================================
+# TIME-SERIES SPLIT
+# ============================================================================
 
-# Prepare X and y
-X_train = train_df[FEATURE_COLS].copy()
+df_sorted = df.sort_values('checked_at_timestamp').reset_index(drop=True)
+
+split_idx = int(len(df_sorted) * 0.8)
+train_df = df_sorted.iloc[:split_idx].copy()
+test_df = df_sorted.iloc[split_idx:].copy()
+
+print(f"\n✂️ Train: {len(train_df)} | Test: {len(test_df)}")
+print(f"Train win rate: {train_df['target'].mean()*100:.2f}%")
+print(f"Test win rate: {test_df['target'].mean()*100:.2f}%")
+
+X_train = train_df[ALL_FEATURES].copy()
 y_train = train_df['target'].copy()
-
-X_test = test_df[FEATURE_COLS].copy()
+X_test = test_df[ALL_FEATURES].copy()
 y_test = test_df['target'].copy()
 
-print(f"  X_train: {X_train.shape}")
-print(f"  X_test: {X_test.shape}")
+# ============================================================================
+# LABEL ENCODING FOR CATEGORICAL FEATURES
+# ============================================================================
 
-# Feature Correlation with target
-print("🔍 Top 15 Features Correlated with Target:")
-print("-" * 60)
+X_train_encoded = X_train.copy()
+X_test_encoded = X_test.copy()
 
-correlations = train_df[FEATURE_COLS + ['target']].corr()['target'].drop('target').sort_values(ascending=False)
+label_encoders = {}
+for col in CATEGORICAL_FEATURES:
+    le = LabelEncoder()
+    X_train_encoded[col] = le.fit_transform(X_train_encoded[col].astype(str))
+    X_test_encoded[col] = le.transform(X_test_encoded[col].astype(str))
+    label_encoders[col] = le
+    print(f"  Encoded {col}: {list(le.classes_)}")
 
-for i, (feature, corr) in enumerate(correlations.head(15).items(), 1):
-    print(f"{i:2}. {feature:40} | r = {corr:6.3f}")
+# ============================================================================
+# MODEL 1: XGBoost
+# ============================================================================
 
-# Plot
-plt.figure(figsize=(12, 8))
-correlations.head(20).plot(kind='barh')
-plt.xlabel('Correlation with Target')
-plt.title('Top 20 Features Correlated with Win/Loss')
-plt.tight_layout()
-plt.savefig('outputs/feature_correlations.png', dpi=150, bbox_inches='tight')
-plt.show()
+print("\n" + "="*60)
+print("🔷 MODEL 1: XGBoost")
+print("="*60)
 
-print("\n✅ Feature correlation analysis complete")
-
-print("🚀 Training XGBoost Model...")
-print("-" * 60)
-
-# Calculate scale_pos_weight for class imbalance
 scale_pos_weight = (y_train == 0).sum() / (y_train == 1).sum()
-print(f"Class imbalance ratio: {scale_pos_weight:.2f}")
+print(f"Class weight ratio: {scale_pos_weight:.2f}")
 
-# Initialize XGBoost
-model = xgb.XGBClassifier(
-    max_depth=6,
-    learning_rate=0.1,
-    n_estimators=200,
-    objective='binary:logistic',
-    eval_metric='auc',
+xgb_model = xgb.XGBClassifier(
+    max_depth=4,
+    learning_rate=0.05,
+    n_estimators=100,
+    min_child_weight=5,
     subsample=0.8,
     colsample_bytree=0.8,
-    scale_pos_weight=scale_pos_weight,  
+    scale_pos_weight=scale_pos_weight,
     random_state=42,
-    early_stopping_rounds=20,
-    n_jobs=-1
+    eval_metric='auc'
 )
 
-# Train with validation set
-eval_set = [(X_train, y_train), (X_test, y_test)]
+xgb_model.fit(X_train_encoded, y_train, verbose=False)
 
-model.fit(
-    X_train, y_train,
-    eval_set=eval_set,
-    verbose=True
+xgb_train_pred = xgb_model.predict(X_train_encoded)
+xgb_test_pred = xgb_model.predict(X_test_encoded)
+xgb_test_proba = xgb_model.predict_proba(X_test_encoded)[:, 1]
+
+xgb_train_acc = (xgb_train_pred == y_train).mean()
+xgb_test_acc = (xgb_test_pred == y_test).mean()
+xgb_test_auc = roc_auc_score(y_test, xgb_test_proba)
+
+print(f"Training Accuracy: {xgb_train_acc:.4f}")
+print(f"Test Accuracy: {xgb_test_acc:.4f}")
+print(f"Test AUC: {xgb_test_auc:.4f}")
+print(f"Overfit Gap: {abs(xgb_train_acc - xgb_test_acc):.4f}")
+
+# ============================================================================
+# MODEL 2: LightGBM
+# ============================================================================
+
+print("\n" + "="*60)
+print("🔶 MODEL 2: LightGBM")
+print("="*60)
+
+lgb_model = lgb.LGBMClassifier(
+    num_leaves=15,
+    max_depth=4,
+    learning_rate=0.05,
+    n_estimators=100,
+    min_child_samples=10,
+    min_split_gain=0.01,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    class_weight='balanced',
+    random_state=42,
+    verbose=-1
 )
 
-print("\n✅ Model training complete!")
+lgb_model.fit(X_train_encoded, y_train)
 
-# Cross-Validation
+lgb_train_pred = lgb_model.predict(X_train_encoded)
+lgb_test_pred = lgb_model.predict(X_test_encoded)
+lgb_test_proba = lgb_model.predict_proba(X_test_encoded)[:, 1]
 
-print("🔄 Running 5-Fold Time-Series Cross-Validation...")
+lgb_train_acc = (lgb_train_pred == y_train).mean()
+lgb_test_acc = (lgb_test_pred == y_test).mean()
+lgb_test_auc = roc_auc_score(y_test, lgb_test_proba)
 
-# Use TimeSeriesSplit for proper time-series CV
-from sklearn.model_selection import TimeSeriesSplit
+print(f"Training Accuracy: {lgb_train_acc:.4f}")
+print(f"Test Accuracy: {lgb_test_acc:.4f}")
+print(f"Test AUC: {lgb_test_auc:.4f}")
+print(f"Overfit Gap: {abs(lgb_train_acc - lgb_test_acc):.4f}")
+
+# ============================================================================
+# MODEL 3: CatBoost
+# ============================================================================
+
+print("\n" + "="*60)
+print("🔸 MODEL 3: CatBoost")
+print("="*60)
+
+# CatBoost needs original categorical values, not encoded
+X_train_cat = X_train.copy()
+X_test_cat = X_test.copy()
+
+cat_feature_indices = [X_train_cat.columns.get_loc(col) for col in CATEGORICAL_FEATURES]
+
+cat_model = CatBoostClassifier(
+    iterations=100,
+    depth=4,
+    learning_rate=0.05,
+    l2_leaf_reg=10,
+    min_data_in_leaf=10,
+    auto_class_weights='Balanced',
+    cat_features=cat_feature_indices,
+    random_state=42,
+    verbose=False
+)
+
+cat_model.fit(X_train_cat, y_train)
+
+cat_train_pred = cat_model.predict(X_train_cat)
+cat_test_pred = cat_model.predict(X_test_cat)
+cat_test_proba = cat_model.predict_proba(X_test_cat)[:, 1]
+
+cat_train_acc = (cat_train_pred == y_train).mean()
+cat_test_acc = (cat_test_pred == y_test).mean()
+cat_test_auc = roc_auc_score(y_test, cat_test_proba)
+
+print(f"Training Accuracy: {cat_train_acc:.4f}")
+print(f"Test Accuracy: {cat_test_acc:.4f}")
+print(f"Test AUC: {cat_test_auc:.4f}")
+print(f"Overfit Gap: {abs(cat_train_acc - cat_test_acc):.4f}")
+
+# ============================================================================
+# CROSS-VALIDATION (5 folds)
+# ============================================================================
+
+print("\n" + "="*60)
+print("📊 5-FOLD TIME-SERIES CROSS-VALIDATION")
+print("="*60)
 
 tscv = TimeSeriesSplit(n_splits=5)
-cv_scores = []
+cv_scores = {'xgb': [], 'lgb': [], 'cat': []}
 
 for fold, (train_idx, val_idx) in enumerate(tscv.split(X_train), 1):
-    X_fold_train = X_train.iloc[train_idx]
-    y_fold_train = y_train.iloc[train_idx]
-    X_fold_val = X_train.iloc[val_idx]
-    y_fold_val = y_train.iloc[val_idx]
-    
-    # Train
-    fold_model = xgb.XGBClassifier(
-        max_depth=6, learning_rate=0.1, n_estimators=200,
-        scale_pos_weight=scale_pos_weight, random_state=42
+    # XGBoost
+    fold_xgb = xgb.XGBClassifier(
+        max_depth=4, learning_rate=0.05, n_estimators=100,
+        scale_pos_weight=scale_pos_weight, random_state=42, eval_metric='auc'
     )
-    fold_model.fit(X_fold_train, y_fold_train, verbose=False)
+    fold_xgb.fit(X_train_encoded.iloc[train_idx], y_train.iloc[train_idx], verbose=False)
+    score = roc_auc_score(y_train.iloc[val_idx], 
+                          fold_xgb.predict_proba(X_train_encoded.iloc[val_idx])[:, 1])
+    cv_scores['xgb'].append(score)
     
-    # Evaluate
-    score = roc_auc_score(y_fold_val, fold_model.predict_proba(X_fold_val)[:, 1])
-    cv_scores.append(score)
-    print(f"  Fold {fold}: AUC = {score:.4f}")
+    # LightGBM
+    fold_lgb = lgb.LGBMClassifier(
+        num_leaves=15, max_depth=4, learning_rate=0.05, n_estimators=100,
+        class_weight='balanced', random_state=42, verbose=-1
+    )
+    fold_lgb.fit(X_train_encoded.iloc[train_idx], y_train.iloc[train_idx])
+    score = roc_auc_score(y_train.iloc[val_idx],
+                          fold_lgb.predict_proba(X_train_encoded.iloc[val_idx])[:, 1])
+    cv_scores['lgb'].append(score)
+    
+    # CatBoost
+    fold_cat = CatBoostClassifier(
+        iterations=100, depth=4, learning_rate=0.05,
+        auto_class_weights='Balanced', cat_features=cat_feature_indices,
+        random_state=42, verbose=False
+    )
+    fold_cat.fit(X_train_cat.iloc[train_idx], y_train.iloc[train_idx])
+    score = roc_auc_score(y_train.iloc[val_idx],
+                          fold_cat.predict_proba(X_train_cat.iloc[val_idx])[:, 1])
+    cv_scores['cat'].append(score)
+    
+    print(f"Fold {fold} | XGB: {cv_scores['xgb'][-1]:.3f} | "
+          f"LGB: {cv_scores['lgb'][-1]:.3f} | CAT: {cv_scores['cat'][-1]:.3f}")
 
-print(f"\n📊 Cross-Validation Results:")
-print(f"  Mean AUC: {np.mean(cv_scores):.4f} ± {np.std(cv_scores):.4f}")
+print(f"\nCV AUC (mean ± std):")
+print(f"  XGBoost:  {np.mean(cv_scores['xgb']):.3f} ± {np.std(cv_scores['xgb']):.3f}")
+print(f"  LightGBM: {np.mean(cv_scores['lgb']):.3f} ± {np.std(cv_scores['lgb']):.3f}")
+print(f"  CatBoost: {np.mean(cv_scores['cat']):.3f} ± {np.std(cv_scores['cat']):.3f}")
 
-# Model Evaluation
+# ============================================================================
+# MODEL COMPARISON & SELECTION
+# ============================================================================
 
-print("="*60)
-print("📊 MODEL EVALUATION")
-print("="*60)
-
-# Predictions
-y_train_pred = model.predict(X_train)
-y_test_pred = model.predict(X_test)
-
-y_train_proba = model.predict_proba(X_train)[:, 1]
-y_test_proba = model.predict_proba(X_test)[:, 1]
-
-# Accuracy
-train_acc = (y_train_pred == y_train).mean()
-test_acc = (y_test_pred == y_test).mean()
-
-print(f"\n📈 Accuracy:")
-print(f"  Training: {train_acc:.4f} ({train_acc*100:.2f}%)")
-print(f"  Test:     {test_acc:.4f} ({test_acc*100:.2f}%)")
-print(f"  Gap:      {abs(train_acc - test_acc):.4f}")
-
-# AUC
-train_auc = roc_auc_score(y_train, y_train_proba)
-test_auc = roc_auc_score(y_test, y_test_proba)
-
-print(f"\n📈 ROC AUC:")
-print(f"  Training: {train_auc:.4f}")
-print(f"  Test:     {test_auc:.4f}")
-
-# Confusion Matrix
 print("\n" + "="*60)
-print("📋 CONFUSION MATRIX")
+print("🏆 MODEL COMPARISON")
 print("="*60)
 
-cm_train = confusion_matrix(y_train, y_train_pred)
-cm_test = confusion_matrix(y_test, y_test_pred)
-
-print("\nTraining Set:")
-print(cm_train)
-print(f"  TN: {cm_train[0][0]}, FP: {cm_train[0][1]}")
-print(f"  FN: {cm_train[1][0]}, TP: {cm_train[1][1]}")
-
-print("\nTest Set:")
-print(cm_test)
-print(f"  TN: {cm_test[0][0]}, FP: {cm_test[0][1]}")
-print(f"  FN: {cm_test[1][0]}, TP: {cm_test[1][1]}")
-
-# Classification Report
-print("\n" + "="*60)
-print("📊 CLASSIFICATION REPORT")
-print("="*60)
-
-print("\nTest Set:")
-print(classification_report(
-    y_test, y_test_pred,
-    target_names=['Loss', 'Win'],
-    digits=4
-))
-
-# Get feature importance
-feature_importance = pd.DataFrame({
-    'feature': FEATURE_COLS,
-    'importance': model.feature_importances_
-}).sort_values('importance', ascending=False)
-# Prediction Analysis
-
-print("="*60)
-print("🔍 PREDICTION ANALYSIS")
-print("="*60)
-
-# Analyze predictions by confidence
-test_df_pred = test_df.copy()
-test_df_pred['predicted_proba'] = y_test_proba
-test_df_pred['predicted_class'] = y_test_pred
-test_df_pred['correct'] = (y_test_pred == y_test).astype(int)
-
-# Group by confidence bins
-bins = [0, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
-test_df_pred['confidence_bin'] = pd.cut(test_df_pred['predicted_proba'], bins=bins)
-
-print("\n📊 Performance by Confidence Level:")
-print("-" * 60)
-conf_analysis = test_df_pred.groupby('confidence_bin').agg({
-    'correct': ['count', 'sum', 'mean'],
-    'target': 'mean'
+results = pd.DataFrame({
+    'Model': ['XGBoost', 'LightGBM', 'CatBoost'],
+    'Train Acc': [xgb_train_acc, lgb_train_acc, cat_train_acc],
+    'Test Acc': [xgb_test_acc, lgb_test_acc, cat_test_acc],
+    'Test AUC': [xgb_test_auc, lgb_test_auc, cat_test_auc],
+    'Overfit Gap': [
+        abs(xgb_train_acc - xgb_test_acc),
+        abs(lgb_train_acc - lgb_test_acc),
+        abs(cat_train_acc - cat_test_acc)
+    ],
+    'CV AUC': [
+        np.mean(cv_scores['xgb']),
+        np.mean(cv_scores['lgb']),
+        np.mean(cv_scores['cat'])
+    ]
 })
-print(conf_analysis)
 
-# High confidence predictions
-high_conf = test_df_pred[test_df_pred['predicted_proba'] >= 0.7]
-print(f"\n🎯 High Confidence Predictions (>=0.7):")
-print(f"  Count: {len(high_conf)}")
-print(f"  Accuracy: {high_conf['correct'].mean():.4f}")
-print(f"  Win rate: {high_conf['target'].mean():.4f}")
+# Calculate composite score (prioritize test accuracy and low overfitting)
+results['Score'] = (
+    results['Test Acc'] * 0.5 +
+    (1 - results['Overfit Gap']) * 0.3 +
+    results['CV AUC'] * 0.2
+)
 
-# Misclassifications
-misclassified = test_df_pred[test_df_pred['correct'] == 0]
-print(f"\n❌ Misclassified Samples: {len(misclassified)}")
+print(results.to_string(index=False))
 
-if len(misclassified) > 0:
-    print("\nMisclassification Analysis:")
-    print(f"  False Positives (predicted win, actual loss): {((misclassified['predicted_class'] == 1) & (misclassified['target'] == 0)).sum()}")
-    print(f"  False Negatives (predicted loss, actual win): {((misclassified['predicted_class'] == 0) & (misclassified['target'] == 1)).sum()}")
+print("\n📊 Model Ranking:")
+ranked = results.sort_values('Score', ascending=False)
+print(ranked[['Model', 'Test Acc', 'Overfit Gap', 'Score']].to_string(index=False))
 
-# Save Model for Production
+best_model_idx = results['Score'].idxmax()
+best_model_name = results.iloc[best_model_idx]['Model']
 
-print("="*60)
+print(f"\n✅ Best Model: {best_model_name}")
+
+# Select best model
+if best_model_name == 'XGBoost':
+    best_model = xgb_model
+    X_test_final = X_test_encoded
+elif best_model_name == 'LightGBM':
+    best_model = lgb_model
+    X_test_final = X_test_encoded
+else:
+    best_model = cat_model
+    X_test_final = X_test_cat
+
+# Classification report
+print(f"\n📋 Detailed Classification Report ({best_model_name}):")
+print(classification_report(y_test, best_model.predict(X_test_final), 
+                          target_names=['Loss', 'Win'], digits=3))
+
+# ============================================================================
+# SAVE MODEL - COMPATIBLE WITH ml_predictor.py
+# ============================================================================
+
+print("\n" + "="*60)
 print("💾 SAVING MODEL FOR PRODUCTION")
 print("="*60)
 
-import os
-os.makedirs('models', exist_ok=True)
-
-# Save model
+# IMPORTANT: Save with the exact filename that ml_predictor.py expects
 model_path = 'models/xgboost_signal_classifier.pkl'
-joblib.dump(model, model_path)
+joblib.dump(best_model, model_path)
 print(f"✅ Model saved: {model_path}")
 
 # Save label encoders
@@ -469,33 +421,36 @@ encoders_path = 'models/label_encoders.pkl'
 joblib.dump(label_encoders, encoders_path)
 print(f"✅ Label encoders saved: {encoders_path}")
 
-# Save feature names
+# Save feature names (exact order matters!)
 features_path = 'models/feature_names.json'
 with open(features_path, 'w') as f:
-    json.dump(FEATURE_COLS, f, indent=2)
+    json.dump(ALL_FEATURES, f, indent=2)
 print(f"✅ Feature names saved: {features_path}")
 
-# Save metadata
+# Save detailed metadata
 metadata = {
-    'model_type': 'XGBClassifier',
+    'model_type': best_model_name,
     'trained_at': datetime.now().isoformat(),
     'training_samples': len(X_train),
     'test_samples': len(X_test),
-    'features': FEATURE_COLS,
-    'performance': {
-        'train_accuracy': float(train_acc),
-        'test_accuracy': float(test_acc),
-        'train_auc': float(train_auc),
-        'test_auc': float(test_auc),
-        'cv_auc_mean': float(np.mean(cv_scores)),
-        'cv_auc_std': float(np.std(cv_scores))
+    'num_features': len(ALL_FEATURES),
+    'features': {
+        'numeric': NUMERIC_FEATURES,
+        'categorical': CATEGORICAL_FEATURES,
+        'all': ALL_FEATURES
     },
-    'hyperparameters': {
-        'max_depth': 6,
-        'learning_rate': 0.1,
-        'n_estimators': 200,
-        'scale_pos_weight': float(scale_pos_weight)
-    }
+    'categorical_encodings': {
+        col: list(label_encoders[col].classes_) 
+        for col in CATEGORICAL_FEATURES
+    },
+    'performance': {
+        'train_accuracy': float(results.loc[results['Model'] == best_model_name, 'Train Acc'].iloc[0]),
+        'test_accuracy': float(results.loc[results['Model'] == best_model_name, 'Test Acc'].iloc[0]),
+        'test_auc': float(results.loc[results['Model'] == best_model_name, 'Test AUC'].iloc[0]),
+        'overfit_gap': float(results.loc[results['Model'] == best_model_name, 'Overfit Gap'].iloc[0]),
+        'cv_auc_mean': float(results.loc[results['Model'] == best_model_name, 'CV AUC'].iloc[0]),
+    },
+    'all_models_comparison': results.to_dict('records')
 }
 
 metadata_path = 'models/model_metadata.json'
@@ -503,6 +458,26 @@ with open(metadata_path, 'w') as f:
     json.dump(metadata, f, indent=2)
 print(f"✅ Metadata saved: {metadata_path}")
 
+# Verification
 print("\n" + "="*60)
-print("✅ MODEL READY FOR PRODUCTION DEPLOYMENT!")
+print("🔍 VERIFICATION")
+print("="*60)
+
+print(f"Model file: {os.path.basename(model_path)}")
+print(f"Features count: {len(ALL_FEATURES)}")
+print(f"Categorical encoders: {list(label_encoders.keys())}")
+
+# Test loading (simulate what ml_predictor.py does)
+try:
+    loaded_model = joblib.load(model_path)
+    loaded_encoders = joblib.load(encoders_path)
+    loaded_features = json.load(open(features_path, 'r'))
+    print(f"\n✅ Model loads successfully!")
+    print(f"   Loaded {len(loaded_features)} features")
+    print(f"   Loaded {len(loaded_encoders)} encoders")
+except Exception as e:
+    print(f"\n❌ ERROR loading model: {e}")
+
+print("\n" + "="*60)
+print("✅ TRAINING COMPLETE - Model ready for ml_predictor.py!")
 print("="*60)
