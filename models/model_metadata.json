@@ -1,6 +1,6 @@
 {
   "model_type": "XGBClassifier",
-  "trained_at": "2025-11-13T17:37:48.837669",
+  "trained_at": "2025-11-14T01:08:58.177557",
   "training_samples": 522,
   "test_samples": 131,
   "features": [

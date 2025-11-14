@@ -9,12 +9,12 @@ Tracks high-frequency winner wallets and monitors their latest token purchases.
 - Applies RugCheck security validation for tokens with LOW+ grades
 - Tokens that fail RugCheck, fail security requirements, or are in probation do NOT get overlap checks.
 - Failed tokens stay in memory for 24h hourly rechecks (NOT uploaded to Supabase).
-- ONLY tokens passing ALL RugCheck requirements AND having NON-ZERO overlap get uploaded to Supabase.
 
 *** MODIFIED: ***
 - Now fetches and embeds Dexscreener data for all tokens that pass security and overlap checks.
-- This provides the market data (price, etc.) for collector.py, removing the need
-  for the collector to make a separate, failing live API call.
+- (*** NEW ***) Integrates ml_predictor.py to add a 'ml_win_probability' score.
+- (*** NEW ***) ONLY tokens that pass ALL security/overlap checks AND have an
+  'ml_win_probability' >= 0.7 are uploaded to Supabase.
 """
 
 import asyncio
@@ -47,6 +47,8 @@ from token_monitor import (
     calculate_overlap_grade,
     evaluate_probation_from_rugcheck
 )
+# (*** NEW ***) Import the prediction function from ml_predictor.py
+from ml_predictor import predict_token_win_probability
 
 load_dotenv()
 
@@ -72,6 +74,8 @@ MIN_LIQUIDITY_USD = 15000.0
 MIN_LP_LOCKED_PCT = 95.0 
 MAX_TRANSFER_FEE_PCT = 5
 MAX_CREATOR_BALANCE = 0.0 # Must be exactly 0
+
+ML_WIN_PROBABILITY_THRESHOLD = 0.7
 
 # -----------------------------------------------
 # Re-usable Helpers
@@ -747,14 +751,19 @@ class AlphaOverlapStore:
                         grade = entry.get("result", {}).get("grade", "NONE")
                         is_graded = grade not in ("NONE", "UNKNOWN")
                         
-                        # Only keep entries that pass BOTH checks
-                        if is_security_passed and is_graded:
+                        # (*** MODIFIED ***) 3. Check for ML score
+                        ml_prob = entry.get("result", {}).get("ml_win_probability")
+                        is_ml_passed = (ml_prob is not None and ml_prob >= ML_WIN_PROBABILITY_THRESHOLD)
+                        
+                        # Only keep entries that pass ALL THREE checks
+                        if is_security_passed and is_graded and is_ml_passed:
                             valid_entries.append(entry)
                             has_uploadable_data = True # Set flag for upload check
                         elif self.debug:
                             security = entry.get("security", "N/A")
                             ts = entry.get("ts", "N/A")
-                            print(f"[AlphaOverlapStore] 🗑️ Discarding old/failed entry from PKL for {mint} (TS: {ts}, Sec: {security}, Grade: {grade})")
+                            ml_score_str = f"ML: {ml_prob*100:.2f}%" if ml_prob is not None else "ML: N/A"
+                            print(f"[AlphaOverlapStore] 🗑️ Discarding old/failed entry from PKL for {mint} (TS: {ts}, Sec: {security}, Grade: {grade}, {ml_score_str})")
                             
                     if valid_entries:
                         filtered_for_quality[mint] = valid_entries
@@ -771,7 +780,7 @@ class AlphaOverlapStore:
                 # Use the flag set during filtering
                 if not has_uploadable_data:
                      if self.debug:
-                         print("[AlphaOverlapStore] ⚠️ Upload skipped (no new PASSED/GRADED tokens since last upload)")
+                         print("[AlphaOverlapStore] ⚠️ Upload skipped (no new PASSED/GRADED/ML_PASSED tokens since last upload)")
                      return
 
                 if self.debug:
@@ -959,6 +968,7 @@ class AlphaTokenAnalyzer:
         Comprehensive token analysis.
         If RugCheck fails OR probation=True OR security requirements fail, returns immediately without checking overlap.
         Failed tokens enter 24h monitoring loop and are NOT uploaded to Supabase.
+        (*** MODIFIED ***) Now calls ML predictor before returning.
         """
         if self.debug:
             print(f"[TokenAnalyzer] 🔬 Analyzing token: {mint}")
@@ -969,7 +979,8 @@ class AlphaTokenAnalyzer:
             "probation": False,
             "probation_reason": None,
             "rugcheck": {},
-            "rugcheck_raw": None
+            "rugcheck_raw": None,
+            "probation_meta": None # (*** NEW ***) Initialize as None
         }
         
         try:
@@ -979,6 +990,8 @@ class AlphaTokenAnalyzer:
             if rugcheck and rugcheck.get("ok"):
                 security_report["rugcheck_passed"] = True
                 security_report["probation"] = rugcheck.get("probation", False)
+                # (*** BUG FIX ***) This is the new line that fixes the crash
+                security_report["probation_meta"] = rugcheck.get("probation_meta")
                 security_report["probation_reason"] = (
                     rugcheck.get("probation_meta", {}).get("explanation")
                     if security_report["probation"] else None
@@ -998,7 +1011,7 @@ class AlphaTokenAnalyzer:
             else:
                 security_report["rugcheck_passed"] = False
                 if self.debug:
-                    print(f"[TokenAnalyzer] ❌ RugCheck API call failed for {mint}: {rugcheck.get('error')}")
+                    print(f"[TokenAnalyzer] ⚠️ RugCheck API call failed for {mint}: {rugcheck.get('error')}")
                     
         except Exception as e:
             security_report["rugcheck_passed"] = False
@@ -1023,7 +1036,9 @@ class AlphaTokenAnalyzer:
                 "overlap_wallets_sample": [],
                 "security": security_report,
                 "needs_monitoring": True, # Keep in memory for recheck
-                "skip_reason": "rugcheck_api_failed"
+                "skip_reason": "rugcheck_api_failed",
+                "dexscreener": None, 
+                "ml_win_probability": None 
             }
         
         # 3. CHECK RUGGED STATUS
@@ -1042,7 +1057,9 @@ class AlphaTokenAnalyzer:
                 "overlap_wallets_sample": [],
                 "security": security_report,
                 "needs_monitoring": True, # Keep in memory for recheck
-                "skip_reason": "rugged"
+                "skip_reason": "rugged",
+                "dexscreener": None, 
+                "ml_win_probability": None 
             }
         
         # 4. CHECK PROBATION STATUS
@@ -1062,7 +1079,9 @@ class AlphaTokenAnalyzer:
                 "overlap_wallets_sample": [],
                 "security": security_report,
                 "needs_monitoring": True, # Keep in memory for recheck
-                "skip_reason": "probation"
+                "skip_reason": "probation",
+                "dexscreener": None, 
+                "ml_win_probability": None 
             }
         
         # 5. CHECK MINIMUM SECURITY REQUIREMENTS (User-Requested Filtering)
@@ -1111,7 +1130,9 @@ class AlphaTokenAnalyzer:
                 "security": security_report,
                 "needs_monitoring": True, # Keep in memory for recheck
                 "skip_reason": "security_requirements_failed",
-                "security_failures": security_failures
+                "security_failures": security_failures,
+                "dexscreener": None, 
+                "ml_win_probability": None 
             }
         
         # --- END PRE-OVERLAP SECURITY GATE ---
@@ -1142,7 +1163,9 @@ class AlphaTokenAnalyzer:
                 "security": security_report,
                 "error": f"Holder fetch failed: {e}",
                 "needs_monitoring": True, # Should retry holder fetch
-                "skip_reason": "holder_fetch_failed"
+                "skip_reason": "holder_fetch_failed",
+                "dexscreener": None, 
+                "ml_win_probability": None 
             }
 
         # HYBRID SAMPLING RULE
@@ -1175,7 +1198,9 @@ class AlphaTokenAnalyzer:
                 "security": security_report,
                 "error": "No holders found",
                 "needs_monitoring": True, # Keep monitoring in case of delayed data
-                "skip_reason": "zero_holders"
+                "skip_reason": "zero_holders",
+                "dexscreener": None, 
+                "ml_win_probability": None 
             }
 
         try:
@@ -1201,7 +1226,9 @@ class AlphaTokenAnalyzer:
                 "security": security_report,
                 "error": f"Dune cache load failed: {e}",
                 "needs_monitoring": True, # Should retry later
-                "skip_reason": "dune_cache_failed"
+                "skip_reason": "dune_cache_failed",
+                "dexscreener": None, 
+                "ml_win_probability": None 
             }
 
         # 7. OVERLAP CALCULATION
@@ -1244,7 +1271,6 @@ class AlphaTokenAnalyzer:
             
         
         # --- DEXSCREENER FETCH (NEW) ---
-        # If the token passed all checks (i.e., not monitoring), fetch Dexscreener data
         dex_data = None # Default
         if not final_needs_monitoring:
             if self.debug:
@@ -1260,9 +1286,75 @@ class AlphaTokenAnalyzer:
                 dex_data = {"ok": False, "error": str(e)}
         # --- END DEXSCREENER FETCH ---
         
+        # 
+        # (*** NEW BLOCK: ML PREDICTOR INTEGRATION ***)
+        # 
+        win_probability = None
+        result_checked_at_iso = datetime.now(timezone.utc).isoformat() # Capture timestamp
+
+        # Only run predictor if token is *passing* (not needs_monitoring)
+        if not final_needs_monitoring: 
+            try:
+                # Construct the data_dict for the predictor
+                predictor_data_dict = {
+                    "checked_at": result_checked_at_iso,
+                    "grade": grade,
+                    "overlap_count": overlap_count,
+                    "weighted_concentration": weighted_concentration,
+                    "total_winner_wallets": total_winner_wallets,
+                    
+                    # Pass the raw RugCheck response
+                    "raw_rugcheck": security_report.get("rugcheck_raw"),
+                    
+                    # Pass the raw Dexscreener response
+                    "raw_dexscreener": dex_data.get("raw") if dex_data else None,
+
+                    # Pass extracted fields as fallbacks
+                    "holder_count": security_report.get("rugcheck", {}).get("total_holders"),
+                    "top1_holder_pct": security_report.get("rugcheck", {}).get("top1_holder_pct"),
+                    "top_10_holders_pct": security_report.get("probation_meta", {}).get("top_n_pct"), # Best guess
+                    "has_mint_authority": security_report.get("rugcheck", {}).get("mint_authority") is not None,
+                    "has_freeze_authority": security_report.get("rugcheck", {}).get("freeze_authority") is not None,
+                    "creator_balance_pct": security_report.get("rugcheck", {}).get("creator_balance"), # Predictor handles %
+                    "overall_lp_locked_pct": security_report.get("rugcheck", {}).get("lp_locked_pct"),
+                    "total_lp_usd": security_report.get("rugcheck", {}).get("total_liquidity_usd"),
+                    "transfer_fee_pct": security_report.get("rugcheck", {}).get("transfer_fee_pct"),
+                    "probation_meta": security_report.get("probation_meta"),
+                    
+                    # Pass price data as fallbacks
+                    "price_usd": dex_data.get("price_usd") if dex_data else None,
+                    "fdv_usd": dex_data.get("raw", {}).get("fdv") if dex_data else None,
+                    "liquidity_usd": dex_data.get("raw", {}).get("liquidity", {}).get("usd") if dex_data else None,
+                    "volume_h24_usd": dex_data.get("raw", {}).get("volume", {}).get("h24") if dex_data else None,
+                    "price_change_h24_pct": dex_data.get("raw", {}).get("priceChange", {}).get("h24") if dex_data else None,
+                }
+                
+                if self.debug:
+                    print(f"[TokenAnalyzer] 🔮 Running ML predictor for {mint}...")
+                
+                # self.http_session is available in AlphaTokenAnalyzer
+                win_probability = await predict_token_win_probability(
+                    predictor_data_dict,
+                    "alpha", # This is the winner_monitor, so signal_source is 'alpha'
+                    self.http_session
+                )
+                
+                if self.debug:
+                    if win_probability is not None:
+                        print(f"[TokenAnalyzer] 🔮 ML Predictor Result for {mint}: {win_probability*100:.2f}% win prob.")
+                    else:
+                        print(f"[TokenAnalyzer] ⚠️ ML Predictor for {mint} returned None (error).")
+
+            except Exception as e:
+                if self.debug:
+                    print(f"[TokenAnalyzer] ❌ ML Predictor failed for {mint}: {e}")
+                    import traceback
+                    traceback.print_exc() # Print full stack trace for debugging
+        # --- END ML PREDICTOR INTEGRATION ---
+        
         result = {
             "mint": mint,
-            "checked_at": datetime.now(timezone.utc).isoformat(),
+            "checked_at": result_checked_at_iso, # Use captured timestamp
             "overlap_count": overlap_count,
             "overlap_percentage": round(overlap_pct, 2),
             "concentration": round(concentration, 2),
@@ -1273,7 +1365,8 @@ class AlphaTokenAnalyzer:
             "security": security_report,
             "needs_monitoring": final_needs_monitoring, # Only False if overlap > 0
             "skip_reason": final_skip_reason,
-            "dexscreener": dex_data # Embed Dexscreener data
+            "dexscreener": dex_data, # Embed Dexscreener data
+            "ml_win_probability": win_probability # Add the new field
         }
         
         if self.debug and not final_needs_monitoring:
@@ -1368,9 +1461,12 @@ class WinnerMonitor:
         check_type: str = "new_discovery"
     ) -> bool:
         """
+        (*** MODIFIED with 0.7 ML Threshold ***)
+        
         Properly handles tokens that need monitoring vs. upload.
-        - Tokens with needs_monitoring=True: Enter 24h monitoring loop (NOT uploaded to Supabase)
-        - Tokens passing ALL requirements AND overlap_count > 0: Uploaded to Supabase immediately
+        - Tokens with needs_monitoring=True: Enter monitoring loop (NOT uploaded)
+        - Tokens passing ALL requirements AND overlap_count > 0 AND
+          ml_win_probability >= 0.7: Uploaded to Supabase
         """
         mint = overlap_result.get("mint")
         if not mint:
@@ -1381,6 +1477,9 @@ class WinnerMonitor:
         security_failures = overlap_result.get("security_failures", [])
         grade = overlap_result.get("grade", "NONE")
         overlap_count = overlap_result.get("overlap_count", 0)
+        
+        # (*** NEW ***) Extract the ML probability
+        ml_prob = overlap_result.get("ml_win_probability") # This will be None if it failed or was skipped
         
         # 1. CRITICAL: If needs_monitoring flag is set, do NOT upload. Start monitoring.
         if needs_monitoring:
@@ -1395,16 +1494,26 @@ class WinnerMonitor:
             await self._start_or_update_monitoring(mint, overlap_result, reasons, grade)
             return False  # Return False to prevent Supabase upload
 
-        # 2. Token passed ALL checks (RugCheck, Probation, Security, AND has overlap > 0) - upload
-        # THIS IS THE ONLY PATH TO PERSISTENT STORAGE
+        # 2. Token passed all security checks. Now check overlap, grade, AND ML score.
         if overlap_count > 0 and grade not in ("NONE", "UNKNOWN"):
             
-            # Build entry for storage
+            # (*** NEW REQUIREMENT ***)
+            # Check if the ML probability is valid and meets the threshold
+            if ml_prob is None or ml_prob < ML_WIN_PROBABILITY_THRESHOLD:
+                if self.debug:
+                    if ml_prob is None:
+                        print(f"[SecurityGate] ⚠️ Token {mint} passed security/overlap but ML prediction failed. Not uploading.")
+                    else:
+                        print(f"[SecurityGate] ⚠️ Token {mint} passed security/overlap but FAILED ML check [Prob: {ml_prob*100:.2f}% < {ML_WIN_PROBABILITY_THRESHOLD*100}%]. Not uploading.")
+                # Silently drop it. It passed security but failed the ML quality bar.
+                return False # Do not upload
+
+            # 3. Token passed ALL checks (Security, Overlap, Grade, AND ML Score) - UPLOAD
             entry = {
                 "ts": datetime.now(timezone.utc).isoformat(),
-                "result": overlap_result,
+                "result": overlap_result, # Pass the whole dict
                 "check_type": check_type,
-                "security": "passed"  # This is the "passed" status checked by Requirement 2
+                "security": "passed"  
             }
             
             current_store_state.setdefault(mint, []).append(entry)
@@ -1419,11 +1528,11 @@ class WinnerMonitor:
                     task.cancel()
             
             if self.debug:
-                print(f"[SecurityGate] ✅ Token {mint} PASSED ALL CHECKS - uploading to Supabase [Grade: {grade}]")
+                print(f"[SecurityGate] ✅✅ Token {mint} PASSED ALL GATES - uploading to Supabase [Grade: {grade}, ML Prob: {ml_prob*100:.2f}%]")
             
             return True  # Upload to Supabase
 
-        # 3. If here, needs_monitoring was False, but overlap_count was 0 or grade was NONE.
+        # 4. If here, it passed security but had zero overlap or NONE grade.
         if self.debug:
             print(f"[SecurityGate] ⚠️ Token {mint} passed security/probation but has ZERO overlap or {grade} grade. Not uploading.")
             
@@ -1596,8 +1705,12 @@ class WinnerMonitor:
                         latest_entry = entries[-1]
                         latest_grade = latest_entry.get("result", {}).get("grade", "NONE")
                         
-                        # Recheck tokens that have a grade higher than NONE AND passed security
-                        if latest_grade not in ("NONE", "UNKNOWN") and latest_entry.get("security") == "passed":
+                        # (*** MODIFIED ***) Also check ML score
+                        ml_prob = latest_entry.get("result", {}).get("ml_win_probability")
+                        is_ml_passed = (ml_prob is not None and ml_prob >= ML_WIN_PROBABILITY_THRESHOLD)
+
+                        # Recheck tokens that have a grade higher than NONE AND passed security AND passed ML
+                        if latest_grade not in ("NONE", "UNKNOWN") and latest_entry.get("security") == "passed" and is_ml_passed:
                             tokens_to_recheck.append(mint)
                             
                     except Exception:
@@ -1610,7 +1723,7 @@ class WinnerMonitor:
                     continue
                 
                 if self.debug:
-                    print(f"[RecheckLoop] Rechecking {len(tokens_to_recheck)} (non-NONE/UNKNOWN) tokens...")
+                    print(f"[RecheckLoop] Rechecking {len(tokens_to_recheck)} (non-NONE/UNKNOWN/ML_PASSED) tokens...")
                     
                 results = await self.token_analyzer.batch_analyze_tokens(tokens_to_recheck)
                 
@@ -1636,6 +1749,11 @@ class WinnerMonitor:
                     security_check_passed = not res.get("needs_monitoring", False)
                     overlap_check_passed = res.get("overlap_count", 0) > 0
                     
+                    # (*** NEW ***) Check ML score from the fresh result
+                    new_ml_prob = res.get("ml_win_probability")
+                    ml_check_passed = (new_ml_prob is not None and new_ml_prob >= ML_WIN_PROBABILITY_THRESHOLD)
+
+                    
                     # If the security status is now failing (e.g. market cap drop, new authority)
                     if not security_check_passed:
                         if self.debug:
@@ -1647,12 +1765,17 @@ class WinnerMonitor:
                         )
                         # We don't mark as changed yet, as this is purely an in-memory change.
                         
-                    # If the grade or overlap changed
-                    elif latest_grade != new_grade or (latest_grade not in ("NONE", "UNKNOWN") and overlap_check_passed):
+                    # If the grade or overlap changed, OR the ML score failed
+                    elif (latest_grade != new_grade) or (not ml_check_passed):
                         if self.debug:
-                            print(f"[RecheckLoop] 📊 Status change {mint}: {latest_grade} -> {new_grade}")
+                             if not ml_check_passed:
+                                 ml_prob_str = f"{new_ml_prob*100:.2f}%" if new_ml_prob is not None else "N/A"
+                                 print(f"[RecheckLoop] ⚠️ {mint} FAILED ML on recheck (Prob: {ml_prob_str})")
+                             else:
+                                 print(f"[RecheckLoop] 📊 Status change {mint}: {latest_grade} -> {new_grade}")
                         
-                        # Use the security gate, which will append a new entry with "security": "passed"
+                        # Use the security gate. It will correctly filter out the
+                        # ML failure OR append the new passing entry.
                         gated = await self._security_gate_and_save(
                             res, current_store, "hourly_recheck"
                         )
@@ -1741,7 +1864,8 @@ class WinnerMonitor:
                 fresh_result = await self.token_analyzer.analyze_token(mint)
                 
                 # The crucial difference: we use the security gate.
-                # If it passes the gate (meaning security passes AND overlap > 0), it gets uploaded and removed from monitoring.
+                # If it passes the gate (meaning security passes AND overlap > 0 AND ML >= 0.7),
+                # it gets uploaded and removed from monitoring.
                 
                 store = self.overlap_store.load()
                 uploaded = await self._security_gate_and_save(
@@ -1752,10 +1876,12 @@ class WinnerMonitor:
                     self.overlap_store.save(store)
                     # _security_gate_and_save already removes it from pending_tokens and monitoring_tasks
                     if self.debug:
-                        print(f"[Monitoring] 🎉 {mint} PASSED ALL REQUIREMENTS (recheck) - Uploaded and removed from monitoring!")
+                        win_prob_pct = fresh_result.get('ml_win_probability', -1.0)
+                        if win_prob_pct is None: win_prob_pct = -1.0
+                        print(f"[Monitoring] 🎉 {mint} PASSED ALL REQUIREMENTS (recheck) - Uploaded [ML Prob: {win_prob_pct*100:.2f}%] and removed from monitoring!")
                     break 
                 else:
-                    # Still failing to pass all requirements for upload (security/probation fail OR zero overlap)
+                    # Still failing to pass all requirements for upload (security/probation fail OR zero overlap OR ML fail)
                     # Update monitoring state if it's still in pending_tokens
                     if mint in self.pending_tokens:
                         if self.debug:
@@ -1772,6 +1898,13 @@ class WinnerMonitor:
                         if fresh_result.get("security_failures"):
                             new_reasons.extend(fresh_result.get("security_failures"))
                         
+                        # (*** NEW ***) Add ML fail reason
+                        ml_prob = fresh_result.get("ml_win_probability")
+                        if ml_prob is not None and ml_prob < ML_WIN_PROBABILITY_THRESHOLD:
+                            new_reasons.append(f"ml_fail_prob_{ml_prob*100:.2f}%")
+                        elif ml_prob is None and not fresh_result.get("needs_monitoring"):
+                             new_reasons.append("ml_fail_prediction_error")
+
                         if new_reasons:
                             entry["reasons"] = list(dict.fromkeys(new_reasons))
                         entry["grade"] = fresh_result.get("grade", "NONE")

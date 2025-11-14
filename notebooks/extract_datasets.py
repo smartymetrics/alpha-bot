@@ -145,76 +145,290 @@ class FeatureExtractor:
             return []
     
     def extract_features_from_snapshot(self, snapshot: dict) -> dict:
-        """
-        Extract ML features from a single snapshot.
-        Returns a flat dict with all features needed for training.
-        """
-        features_dict = {}
-        
-        # Get features from snapshot
-        snapshot_features = snapshot.get('features', {})
-        
-        # Extract all mapped features
-        for ml_feature, snapshot_key in self.FEATURE_MAPPING.items():
-            value = snapshot_features.get(snapshot_key)
+            """
+            Extract ML features from a single snapshot.
+            Returns a flat dict with all features needed for training.
             
-            # Handle boolean -> int conversion
-            if isinstance(value, bool):
-                value = int(value)
+            This is a corrected function that merges the robust feature
+            engineering from 'datasets.ipynb' with the structure of
+            'extract_datasets.py'.
+            """
             
-            # Handle None
-            if value is None:
-                if ml_feature in ['price_usd', 'fdv_usd', 'liquidity_usd', 
-                                 'volume_h24_usd', 'price_change_h24_pct',
-                                 'creator_balance_pct', 'top_10_holders_pct',
-                                 'total_lp_locked_usd', 'token_age_at_signal_seconds',
-                                 'time_of_day_utc', 'day_of_week_utc',
-                                 'checked_at_timestamp']:
-                    value = 0.0
-                elif ml_feature in ['has_mint_authority', 'has_freeze_authority',
-                                   'is_lp_locked_95_plus', 'is_weekend_utc',
-                                   'is_public_holiday_any']:
-                    value = 0
-                elif ml_feature in ['rugcheck_risk_level', 'signal_source', 
-                                   'grade', 'mint']:
-                    value = 'UNKNOWN'
+            # --- [START] Logic from datasets.ipynb: flatten_snapshot_to_row ---
             
-            features_dict[ml_feature] = value
-        
-        # Add derived features (computed from existing features)
-        features_dict['volume_to_liquidity_ratio'] = (
-            features_dict['volume_h24_usd'] / features_dict['liquidity_usd']
-            if features_dict['liquidity_usd'] > 0 else 0
-        )
-        
-        features_dict['fdv_to_liquidity_ratio'] = (
-            features_dict['fdv_usd'] / features_dict['liquidity_usd']
-            if features_dict['liquidity_usd'] > 0 else 0
-        )
-        
-        features_dict['is_new_token'] = int(
-            features_dict['token_age_at_signal_seconds'] < 43200  # <12 hours
-        )
-        
-        # Add label if available
-        label = snapshot.get('label', {})
-        if label:
-            features_dict['label_status'] = label.get('status', 'unknown')
-            features_dict['label_ath_roi'] = label.get('ath_roi', 0)
-            features_dict['label_final_roi'] = label.get('final_roi', 0)
-            features_dict['label_hit_50_percent'] = int(label.get('hit_50_percent', False))
-            features_dict['label_token_age_hours'] = label.get('token_age_hours', 0)
-            features_dict['label_tracking_duration_hours'] = label.get('tracking_duration_hours', 0)
-        else:
-            # Expired/unlabeled
-            features_dict['label_status'] = 'expired'
-            features_dict['label_ath_roi'] = 0
-            features_dict['label_final_roi'] = 0
-            features_dict['label_hit_50_percent'] = 0
-            features_dict['label_token_age_hours'] = 0
-            features_dict['label_tracking_duration_hours'] = 0
-        
-        return features_dict
+            features_dict = {}
+            
+            # 1. Define a helper function for safe division
+            def safe_divide(a, b, default=None):
+                if a is None or b is None or b == 0:
+                    return default
+                try:
+                    return float(a) / float(b)
+                except (ValueError, TypeError):
+                    return default
+
+            # 2. Get Raw Input Data Sources
+            inputs = snapshot.get('inputs', {})
+            signal_data = inputs.get('signal_data', {})
+            signal_data_result = signal_data.get('result', {})
+            security_data = signal_data_result.get('security', {})
+            rugcheck_data = security_data.get('rugcheck', {})
+            dexscreener_data = signal_data_result.get('dexscreener', {})
+            holiday_check = inputs.get('holiday_check', {})
+            rugcheck_raw_data = inputs.get('rugcheck_raw', {})
+            dexscreener_raw = inputs.get('dexscreener_raw', {})
+            
+            dex_pairs = dexscreener_raw.get('pairs')
+            primary_dex_pair = dex_pairs[0] if dex_pairs and isinstance(dex_pairs, list) and len(dex_pairs) > 0 else {}
+            primary_dex_liquidity = primary_dex_pair.get('liquidity', {})
+            primary_dex_volume = primary_dex_pair.get('volume', {})
+            primary_dex_price_change = primary_dex_pair.get('priceChange', {})
+
+            # 3. Features (Robust Population with Fallbacks)
+            # Get base features from 'features' block, with fallbacks to raw inputs
+            
+            features = snapshot.get('features', {})
+            
+            features_dict['mint'] = features.get('mint', signal_data_result.get('mint'))
+            features_dict['signal_source'] = features.get('signal_source')
+            features_dict['grade'] = features.get('grade', signal_data_result.get('grade'))
+            features_dict['checked_at_utc'] = features.get('checked_at_utc', signal_data_result.get('checked_at'))
+            features_dict['checked_at_timestamp'] = features.get('checked_at_timestamp')
+            
+            features_dict['time_of_day_utc'] = features.get('time_of_day_utc')
+            features_dict['day_of_week_utc'] = features.get('day_of_week_utc')
+            features_dict['is_weekend_utc'] = features.get('is_weekend_utc')
+            features_dict['is_public_holiday_any'] = features.get('is_public_holiday_any', holiday_check.get('is_holiday'))
+
+            # Market features (with fallbacks)
+            features_dict['price_usd'] = features.get('price_usd')
+            if features_dict['price_usd'] is None:
+                features_dict['price_usd'] = primary_dex_pair.get('priceUsd')
+                if features_dict['price_usd'] is None:
+                    features_dict['price_usd'] = dexscreener_data.get('current_price_usd')
+            
+            features_dict['fdv_usd'] = features.get('fdv_usd')
+            if features_dict['fdv_usd'] is None:
+                features_dict['fdv_usd'] = primary_dex_pair.get('fdv')
+
+            features_dict['liquidity_usd'] = features.get('liquidity_usd')
+            if features_dict['liquidity_usd'] is None:
+                features_dict['liquidity_usd'] = primary_dex_liquidity.get('usd')
+                if features_dict['liquidity_usd'] is None:
+                    features_dict['liquidity_usd'] = rugcheck_data.get('total_liquidity_usd')
+
+            features_dict['volume_h24_usd'] = features.get('volume_h24_usd')
+            if features_dict['volume_h24_usd'] is None:
+                features_dict['volume_h24_usd'] = primary_dex_volume.get('h24')
+
+            features_dict['price_change_h24_pct'] = features.get('price_change_h24_pct')
+            if features_dict['price_change_h24_pct'] is None:
+                features_dict['price_change_h24_pct'] = primary_dex_price_change.get('h24')
+
+            pair_created_at_ms = primary_dex_pair.get('pairCreatedAt')
+            pair_created_at_ts_from_dex = safe_divide(pair_created_at_ms, 1000)
+            features_dict['pair_created_at_timestamp'] = features.get('pair_created_at_timestamp', pair_created_at_ts_from_dex)
+
+            # Security features (with fallbacks)
+            features_dict['rugcheck_risk_level'] = features.get('rugcheck_risk_level')
+            
+            features_dict['has_mint_authority'] = features.get('has_mint_authority')
+            if features_dict['has_mint_authority'] is None:
+                raw_mint_auth = rugcheck_raw_data.get('mintAuthority', rugcheck_data.get('mint_authority'))
+                features_dict['has_mint_authority'] = raw_mint_auth is not None
+                
+            features_dict['has_freeze_authority'] = features.get('has_freeze_authority')
+            if features_dict['has_freeze_authority'] is None:
+                raw_freeze_auth = rugcheck_raw_data.get('freezeAuthority', rugcheck_data.get('freeze_authority'))
+                features_dict['has_freeze_authority'] = raw_freeze_auth is not None
+
+            token_supply_from_raw = rugcheck_raw_data.get('token', {}).get('supply', 0)
+            creator_balance_from_raw = rugcheck_raw_data.get('creatorBalance', rugcheck_data.get('creator_balance'))
+            creator_balance_pct_from_raw = safe_divide(creator_balance_from_raw, token_supply_from_raw, 0) * 100
+            features_dict['creator_balance_pct'] = features.get('creator_balance_pct', creator_balance_pct_from_raw)
+
+            top_holders_from_raw = rugcheck_raw_data.get('topHolders', [])
+            top_10_pct_from_raw = sum(h.get('pct', 0) for h in top_holders_from_raw[:10]) if top_holders_from_raw else 0
+            features_dict['top_10_holders_pct'] = features.get('top_10_holders_pct', top_10_pct_from_raw)
+
+            lp_locked_pct_from_inputs = rugcheck_data.get('lp_locked_pct')
+            is_lp_locked_95_plus_from_inputs = (lp_locked_pct_from_inputs >= 95) if lp_locked_pct_from_inputs is not None else None
+            features_dict['is_lp_locked_95_plus'] = features.get('is_lp_locked_95_plus', is_lp_locked_95_plus_from_inputs)
+
+            total_lp_locked_usd_from_raw = rugcheck_raw_data.get('total_lp_usd')
+            if total_lp_locked_usd_from_raw is None:
+                markets_from_raw = rugcheck_raw_data.get('markets', [])
+                if markets_from_raw:
+                    total_lp_locked_usd_from_raw = sum(m.get('lp', {}).get('lpLockedUSD', 0) for m in markets_from_raw)
+            features_dict['total_lp_locked_usd'] = features.get('total_lp_locked_usd', total_lp_locked_usd_from_raw)
+            
+            # Token age
+            token_age_at_signal_seconds_from_inputs = None
+            if features_dict['checked_at_timestamp'] and features_dict['pair_created_at_timestamp']:
+                token_age_at_signal_seconds_from_inputs = features_dict['checked_at_timestamp'] - features_dict['pair_created_at_timestamp']
+            features_dict['token_age_at_signal_seconds'] = features.get('token_age_at_signal_seconds', token_age_at_signal_seconds_from_inputs)
+
+            # 4. Get Additional Data for Derived Features
+            finalization = snapshot.get('finalization', {})
+            features_dict['token_age_hours_at_signal'] = finalization.get('token_age_hours_at_signal')
+            
+            if len(top_holders_from_raw) >= 3:
+                features_dict['top_3_holders_pct'] = sum(h.get('pct', 0) for h in top_holders_from_raw[:3])
+            else:
+                features_dict['top_3_holders_pct'] = None
+            
+            insider_networks = rugcheck_raw_data.get('insiderNetworks') or []
+            features_dict['total_insider_networks'] = len(insider_networks)
+            if insider_networks:
+                features_dict['largest_insider_network_size'] = max(n.get('size', 0) for n in insider_networks)
+                features_dict['total_insider_token_amount'] = sum(n.get('tokenAmount', 0) for n in insider_networks)
+            else:
+                features_dict['largest_insider_network_size'] = 0
+                features_dict['total_insider_token_amount'] = 0
+            
+            features_dict['token_supply'] = rugcheck_raw_data.get('token', {}).get('supply')
+
+            # 5. DERIVED FEATURES
+            
+            # Smart Money & Overlap Metrics
+            overlap_count = signal_data_result.get('overlap_count') or 0
+            weighted_concentration = signal_data_result.get('weighted_concentration') or 0
+            total_winner_wallets = signal_data_result.get('total_winner_wallets') or 1
+            holder_count = rugcheck_data.get('holder_count') or 1
+            
+            features_dict['overlap_quality_score'] = safe_divide(overlap_count * weighted_concentration, total_winner_wallets, 0)
+            features_dict['winner_wallet_density'] = safe_divide(overlap_count, holder_count, 0)
+            
+            # Liquidity & Volume Metrics (replaces originals)
+            total_liquidity = features_dict['liquidity_usd'] or 0
+            fdv_usd = features_dict['fdv_usd'] or 0
+            volume_h24 = features_dict['volume_h24_usd'] or 0
+            
+            features_dict['volume_to_liquidity_ratio'] = safe_divide(volume_h24, total_liquidity, 0)
+            features_dict['fdv_to_liquidity_ratio'] = safe_divide(fdv_usd, total_liquidity, 0)
+            
+            # Holder Concentration
+            top1_pct = rugcheck_data.get('top1_holder_pct') or 0
+            top10_pct = features_dict['top_10_holders_pct'] or 0
+            features_dict['whale_concentration_score'] = (top1_pct * 3) + (top10_pct - top1_pct) if top10_pct >= top1_pct else top1_pct * 3
+            
+            # Token Age (replaces original)
+            token_age_hours = features_dict['token_age_hours_at_signal']
+            if token_age_hours is not None:
+                features_dict['is_new_token'] = int(token_age_hours < 12) # < 12 hours
+            else:
+                ts_age = features_dict['token_age_at_signal_seconds']
+                features_dict['is_new_token'] = int(ts_age < 43200) if ts_age is not None else 0
+
+            # Risk Scores
+            has_mint_auth = features_dict['has_mint_authority']
+            has_freeze_auth = features_dict['has_freeze_authority']
+            transfer_fee = rugcheck_data.get('transfer_fee_pct') or 0
+            
+            features_dict['authority_risk_score'] = (
+                (50 if has_mint_auth else 0) + 
+                (50 if has_freeze_auth else 0) + 
+                (transfer_fee * 100 if transfer_fee else 0)
+            )
+            
+            creator_balance_pct = features_dict['creator_balance_pct'] or 0
+            features_dict['creator_dumped'] = (creator_balance_pct == 0) and (token_age_hours is not None and token_age_hours < 24)
+
+            # Composite Pump & Dump Risk Score
+            pump_dump_components = []
+            insider_size = features_dict.get('largest_insider_network_size') or 0
+            if insider_size > 100: pump_dump_components.append(30)
+            elif insider_size > 50: pump_dump_components.append(20)
+            elif insider_size > 20: pump_dump_components.append(10)
+            else: pump_dump_components.append(0)
+            
+            if top1_pct > 30: pump_dump_components.append(25)
+            elif top1_pct > 20: pump_dump_components.append(15)
+            elif top1_pct > 10: pump_dump_components.append(8)
+            else: pump_dump_components.append(0)
+            
+            lp_locked_pct = lp_locked_pct_from_inputs or 0
+            if lp_locked_pct < 50: pump_dump_components.append(20)
+            elif lp_locked_pct < 80: pump_dump_components.append(12)
+            elif lp_locked_pct < 95: pump_dump_components.append(5)
+            else: pump_dump_components.append(0)
+            
+            pump_dump_components.append(min(features_dict['authority_risk_score'] / 100 * 15, 15))
+            
+            if features_dict.get('creator_dumped'): pump_dump_components.append(10)
+            elif creator_balance_pct > 10: pump_dump_components.append(7)
+            elif creator_balance_pct > 5: pump_dump_components.append(4)
+            else: pump_dump_components.append(0)
+            
+            features_dict['pump_dump_risk_score'] = sum(pump_dump_components)
+            
+            # Temporal Context Features
+            hour = features_dict['time_of_day_utc']
+            if hour is not None:
+                if 0 <= hour < 7: features_dict['hour_category'] = 'dead_hours'
+                elif 7 <= hour < 15: features_dict['hour_category'] = 'asia_hours'
+                elif 15 <= hour < 19: features_dict['hour_category'] = 'eu_hours'
+                else: features_dict['hour_category'] = 'us_hours'
+            else:
+                features_dict['hour_category'] = None
+            
+            day_of_week = features_dict['day_of_week_utc']
+            if day_of_week is not None:
+                features_dict['is_last_day_of_week'] = (day_of_week == 4)  # Friday
+            else:
+                features_dict['is_last_day_of_week'] = None         
+            
+            # 6. Apply original None/bool handling
+            # This cleans up all features in FEATURE_MAPPING for the ML model
+            
+            # We must *assume* self.FEATURE_MAPPING is available in the class.
+            for ml_feature, snapshot_key in self.FEATURE_MAPPING.items():
+                
+                # Get the value we just populated
+                value = features_dict.get(ml_feature)
+                
+                # Handle boolean -> int conversion
+                if isinstance(value, bool):
+                    value = int(value)
+                
+                # Handle None
+                if value is None:
+                    if ml_feature in ['price_usd', 'fdv_usd', 'liquidity_usd', 
+                                    'volume_h24_usd', 'price_change_h24_pct',
+                                    'creator_balance_pct', 'top_10_holders_pct',
+                                    'total_lp_locked_usd', 'token_age_at_signal_seconds',
+                                    'time_of_day_utc', 'day_of_week_utc',
+                                    'checked_at_timestamp']:
+                        value = 0.0
+                    elif ml_feature in ['has_mint_authority', 'has_freeze_authority',
+                                    'is_lp_locked_95_plus', 'is_weekend_utc',
+                                    'is_public_holiday_any']:
+                        value = 0
+                    elif ml_feature in ['rugcheck_risk_level', 'signal_source', 
+                                    'grade', 'mint']:
+                        value = 'UNKNOWN'
+                
+                features_dict[ml_feature] = value
+
+            # 7. Add label (using the robust logic from original)
+            label = snapshot.get('label', {})
+            if label:
+                features_dict['label_status'] = label.get('status', 'unknown')
+                features_dict['label_ath_roi'] = label.get('ath_roi', 0)
+                features_dict['label_final_roi'] = label.get('final_roi', 0)
+                features_dict['label_hit_50_percent'] = int(label.get('hit_50_percent', False))
+                features_dict['label_token_age_hours'] = label.get('token_age_hours', 0)
+                features_dict['label_tracking_duration_hours'] = label.get('tracking_duration_hours', 0)
+            else:
+                # Expired/unlabeled
+                features_dict['label_status'] = 'expired'
+                features_dict['label_ath_roi'] = 0
+                features_dict['label_final_roi'] = 0
+                features_dict['label_hit_50_percent'] = 0
+                features_dict['label_token_age_hours'] = 0
+                features_dict['label_tracking_duration_hours'] = 0
+                        
+            return features_dict
     
     async def extract_all_data(self, pipeline: str) -> List[Dict]:
         """
