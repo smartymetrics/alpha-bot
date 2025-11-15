@@ -75,7 +75,7 @@ MIN_LP_LOCKED_PCT = 5.0
 MAX_TRANSFER_FEE_PCT = 5
 MAX_CREATOR_BALANCE = 0.0 # Must be exactly 0
 
-ML_WIN_PROBABILITY_THRESHOLD = 0.1
+# ML_WIN_PROBABILITY_THRESHOLD = 0.1
 
 # -----------------------------------------------
 # Re-usable Helpers
@@ -751,12 +751,12 @@ class AlphaOverlapStore:
                         grade = entry.get("result", {}).get("grade", "NONE")
                         is_graded = grade not in ("NONE", "UNKNOWN")
                         
-                        # (*** MODIFIED ***) 3. Check for ML score
-                        ml_prob = entry.get("result", {}).get("ml_win_probability")
-                        is_ml_passed = (ml_prob is not None and ml_prob >= ML_WIN_PROBABILITY_THRESHOLD)
+                        # # (*** MODIFIED ***) 3. Check for ML score
+                        # ml_prob = entry.get("result", {}).get("ml_win_probability")
+                        # is_ml_passed = (ml_prob is not None and ml_prob >= ML_WIN_PROBABILITY_THRESHOLD)
                         
                         # Only keep entries that pass ALL THREE checks
-                        if is_security_passed and is_graded and is_ml_passed:
+                        if is_security_passed and is_graded # and is_ml_passed:
                             valid_entries.append(entry)
                             has_uploadable_data = True # Set flag for upload check
                         elif self.debug:
@@ -1329,12 +1329,12 @@ class AlphaTokenAnalyzer:
                 if self.debug:
                     print(f"[TokenAnalyzer] 🔮 Running ML predictor for {mint}...")
                 
-                # self.http_session is available in AlphaTokenAnalyzer
-                win_probability = await predict_token_win_probability(
-                    predictor_data_dict,
-                    "alpha", # This is the winner_monitor, so signal_source is 'alpha'
-                    self.http_session
-                )
+                # # self.http_session is available in AlphaTokenAnalyzer
+                # win_probability = await predict_token_win_probability(
+                #     predictor_data_dict,
+                #     "alpha", # This is the winner_monitor, so signal_source is 'alpha'
+                #     self.http_session
+                # )
                 
                 if self.debug:
                     if win_probability is not None:
@@ -1495,15 +1495,15 @@ class WinnerMonitor:
         if overlap_count > 0 and grade not in ("NONE", "UNKNOWN"):
             
             # (*** NEW REQUIREMENT ***)
-            # Check if the ML probability is valid and meets the threshold
-            if ml_prob is None or ml_prob < ML_WIN_PROBABILITY_THRESHOLD:
-                if self.debug:
-                    if ml_prob is None:
-                        print(f"[SecurityGate] ⚠️ Token {mint} passed security/overlap but ML prediction failed. Not uploading.")
-                    else:
-                        print(f"[SecurityGate] ⚠️ Token {mint} passed security/overlap but FAILED ML check [Prob: {ml_prob*100:.2f}% < {ML_WIN_PROBABILITY_THRESHOLD*100}%]. Not uploading.")
-                # Silently drop it. It passed security but failed the ML quality bar.
-                return False # Do not upload
+            # # Check if the ML probability is valid and meets the threshold
+            # if ml_prob is None or ml_prob < ML_WIN_PROBABILITY_THRESHOLD:
+            #     if self.debug:
+            #         if ml_prob is None:
+            #             print(f"[SecurityGate] ⚠️ Token {mint} passed security/overlap but ML prediction failed. Not uploading.")
+            #         else:
+            #             print(f"[SecurityGate] ⚠️ Token {mint} passed security/overlap but FAILED ML check [Prob: {ml_prob*100:.2f}% < {ML_WIN_PROBABILITY_THRESHOLD*100}%]. Not uploading.")
+            #     # Silently drop it. It passed security but failed the ML quality bar.
+            #     return False # Do not upload
 
             # 3. Token passed ALL checks (Security, Overlap, Grade, AND ML Score) - UPLOAD
             entry = {
@@ -1702,9 +1702,9 @@ class WinnerMonitor:
                         latest_entry = entries[-1]
                         latest_grade = latest_entry.get("result", {}).get("grade", "NONE")
                         
-                        # (*** MODIFIED ***) Also check ML score
-                        ml_prob = latest_entry.get("result", {}).get("ml_win_probability")
-                        is_ml_passed = (ml_prob is not None and ml_prob >= ML_WIN_PROBABILITY_THRESHOLD)
+                        # # (*** MODIFIED ***) Also check ML score
+                        # ml_prob = latest_entry.get("result", {}).get("ml_win_probability")
+                        # is_ml_passed = (ml_prob is not None and ml_prob >= ML_WIN_PROBABILITY_THRESHOLD)
 
                         # Recheck tokens that have a grade higher than NONE AND passed security AND passed ML
                         if latest_grade not in ("NONE", "UNKNOWN") and latest_entry.get("security") == "passed" and is_ml_passed:
@@ -1746,9 +1746,9 @@ class WinnerMonitor:
                     security_check_passed = not res.get("needs_monitoring", False)
                     overlap_check_passed = res.get("overlap_count", 0) > 0
                     
-                    # (*** NEW ***) Check ML score from the fresh result
-                    new_ml_prob = res.get("ml_win_probability")
-                    ml_check_passed = (new_ml_prob is not None and new_ml_prob >= ML_WIN_PROBABILITY_THRESHOLD)
+                    # # (*** NEW ***) Check ML score from the fresh result
+                    # new_ml_prob = res.get("ml_win_probability")
+                    # ml_check_passed = (new_ml_prob is not None and new_ml_prob >= ML_WIN_PROBABILITY_THRESHOLD)
 
                     
                     # If the security status is now failing (e.g. market cap drop, new authority)
@@ -1895,12 +1895,12 @@ class WinnerMonitor:
                         if fresh_result.get("security_failures"):
                             new_reasons.extend(fresh_result.get("security_failures"))
                         
-                        # (*** NEW ***) Add ML fail reason
-                        ml_prob = fresh_result.get("ml_win_probability")
-                        if ml_prob is not None and ml_prob < ML_WIN_PROBABILITY_THRESHOLD:
-                            new_reasons.append(f"ml_fail_prob_{ml_prob*100:.2f}%")
-                        elif ml_prob is None and not fresh_result.get("needs_monitoring"):
-                             new_reasons.append("ml_fail_prediction_error")
+                        # # (*** NEW ***) Add ML fail reason
+                        # ml_prob = fresh_result.get("ml_win_probability")
+                        # if ml_prob is not None and ml_prob < ML_WIN_PROBABILITY_THRESHOLD:
+                        #     new_reasons.append(f"ml_fail_prob_{ml_prob*100:.2f}%")
+                        # elif ml_prob is None and not fresh_result.get("needs_monitoring"):
+                        #      new_reasons.append("ml_fail_prediction_error")
 
                         if new_reasons:
                             entry["reasons"] = list(dict.fromkeys(new_reasons))

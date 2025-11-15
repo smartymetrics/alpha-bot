@@ -2194,12 +2194,12 @@ class Monitor:
             if self.debug:
                 print(f"[Analysis] 🔮 Running ML predictor for {mint}...")
             
-            # 'discovery' is the signal_source for token_monitor.py
-            win_probability = await predict_token_win_probability(
-                predictor_data_dict,
-                "discovery", 
-                self.http_session 
-            )
+            # # 'discovery' is the signal_source for token_monitor.py
+            # win_probability = await predict_token_win_probability(
+            #     predictor_data_dict,
+            #     "discovery", 
+            #     self.http_session 
+            # )
             
             if self.debug:
                 if win_probability is not None:
@@ -2217,26 +2217,26 @@ class Monitor:
         if overlap_result and isinstance(overlap_result, dict):
             overlap_result["ml_win_probability"] = win_probability
         
-        # (*** NEW ***) 6. ML PROBABILITY GATE
-        if win_probability is None or win_probability < ML_WIN_PROBABILITY_THRESHOLD:
-            if self.debug:
-                if win_probability is None:
-                    print(f"[Analysis] ⚠️ {mint} passed security/overlap but ML prediction failed. Not uploading.")
-                else:
-                    print(f"[Analysis] ⚠️ {mint} passed security/overlap but FAILED ML check [Prob: {win_probability*100:.2f}% < {ML_WIN_PROBABILITY_THRESHOLD*100}%]. Not uploading.")
+        # # (*** NEW ***) 6. ML PROBABILITY GATE
+        # if win_probability is None or win_probability < ML_WIN_PROBABILITY_THRESHOLD:
+        #     if self.debug:
+        #         if win_probability is None:
+        #             print(f"[Analysis] ⚠️ {mint} passed security/overlap but ML prediction failed. Not uploading.")
+        #         else:
+        #             print(f"[Analysis] ⚠️ {mint} passed security/overlap but FAILED ML check [Prob: {win_probability*100:.2f}% < {ML_WIN_PROBABILITY_THRESHOLD*100}%]. Not uploading.")
             
-            # Token failed ML gate. It should NOT be marked 'completed'.
-            # It should just be left as 'active' to be re-checked later,
-            # but we don't save it.
-            # Update scheduler to reflect "active" (but failed ML) state
-            self.scheduling_store.update_token_state(mint, {
-                "status": "active", # Stays active
-                "last_completed_check": now_ts,
-                "next_scheduled_check": now_ts + self.repeat_interval_seconds,
-                "total_checks_completed": check_count,
-                "last_ml_fail_prob": win_probability
-            })
-            return # Stop here, do not save
+        #     # Token failed ML gate. It should NOT be marked 'completed'.
+        #     # It should just be left as 'active' to be re-checked later,
+        #     # but we don't save it.
+        #     # Update scheduler to reflect "active" (but failed ML) state
+        #     self.scheduling_store.update_token_state(mint, {
+        #         "status": "active", # Stays active
+        #         "last_completed_check": now_ts,
+        #         "next_scheduled_check": now_ts + self.repeat_interval_seconds,
+        #         "total_checks_completed": check_count,
+        #         "last_ml_fail_prob": win_probability
+        #     })
+        #     return # Stop here, do not save
 
         if self.debug:
             print(f"[Analysis] ✅ {mint} PASSED ML GATE [Prob: {win_probability*100:.2f}%]. Saving.")
