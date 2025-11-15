@@ -36,15 +36,10 @@ from typing import List, Set
 import sqlite3
 import threading
 
-# (*** NEW ***) Import the prediction function from ml_predictor.py
-from ml_predictor import predict_token_win_probability
-
 load_dotenv()
 
 PROBATION_TOP_N = int(os.getenv("PROBATION_TOP_N", "3"))
 PROBATION_THRESHOLD_PCT = float(os.getenv("PROBATION_THRESHOLD_PCT", "90"))
-
-ML_WIN_PROBABILITY_THRESHOLD = 0.1
 
 COINGECKO_PRO_API_KEY = os.environ.get("GECKO_API")
 DUNE_API_KEY = os.environ.get("DUNE_API_KEY")
@@ -2020,10 +2015,6 @@ class Monitor:
         4. If pass, run Helius call (_fetch_and_calculate_overlap).
         5. If overlap=NONE, save and RETURN.
         6. If overlap=PASS, run DexScreener, save, and mark as completed.
-        (*** MODIFIED ***)
-        7. If overlap=PASS, run ML Predictor.
-        8. If ML < 0.7, RETURN (don't save).
-        9. If ML >= 0.7, save (with ML score) and mark as completed.
         """
         mint = start.mint
         now_ts = int(datetime.now(timezone.utc).timestamp())
@@ -2063,8 +2054,8 @@ class Monitor:
                 reasons.append(f"authorities:{','.join(authorities)}")
 
             # Rule 3: Check creator token balance
-            # if r.get("creator_balance", 0) > 0:
-            #     reasons.append(f"creator_balance:{r.get('creator_balance')}")
+            if r.get("creator_balance", 0) > 0:
+                reasons.append(f"creator_balance:{r.get('creator_balance')}")
 
             # Rule 4: Check transfer fee (must be <= 5%)
             if r.get("transfer_fee_pct", 0) > 5:
@@ -2150,104 +2141,11 @@ class Monitor:
                 print(f"[Analysis] Dexscreener check for {mint} failed after all retries: {e}")
             dex_data = {"ok": False, "price_usd": None, "market_cap_usd": None}
 
-        # (*** NEW ***) 5. RUN ML WIN PROBABILITY PREDICTOR
-        win_probability = None
-        try:
-            # Construct data_dict for the predictor
-            # This mirrors the structure in winner_monitor.py
-            predictor_data_dict = {
-                "checked_at": datetime.now(timezone.utc).isoformat(),
-                "grade": grade,
-                "overlap_count": overlap_result.get("overlap_count", 0),
-                "weighted_concentration": overlap_result.get("weighted_concentration", 0.0),
-                "total_winner_wallets": overlap_result.get("total_winner_wallets", 0),
-                
-                # Pass the raw RugCheck response (from step 1)
-                "raw_rugcheck": r.get("raw"), 
-                
-                # Pass the raw Dexscreener response
-                "raw_dexscreener": dex_data.get("raw"),
-
-                # Pass extracted fields as fallbacks
-                "holder_count": r.get("total_holders"),
-                "top1_holder_pct": r.get("top1_holder_pct"),
-                "top_10_holders_pct": r.get("probation_meta", {}).get("top_n_pct"),
-                "has_mint_authority": r.get("mint_authority") is not None,
-                "has_freeze_authority": r.get("freeze_authority") is not None,
-                "creator_balance_pct": r.get("creator_balance"),
-                "overall_lp_locked_pct": r.get("overall_lp_locked_pct"),
-                "total_lp_usd": r.get("total_lp_usd"),
-                "transfer_fee_pct": r.get("transfer_fee_pct"),
-                "probation_meta": r.get("probation_meta"),
-                
-                # Pass fields from TradingStart (start)
-                "block_time": start.block_time,
-                
-                # Pass price data from dex_data as fallbacks
-                "price_usd": dex_data.get("price_usd"),
-                "fdv_usd": dex_data.get("market_cap_usd"), # Use the one from dex_data
-                "liquidity_usd": dex_data.get("raw", {}).get("liquidity", {}).get("usd") if dex_data.get("ok") else None,
-                "volume_h24_usd": dex_data.get("raw", {}).get("volume", {}).get("h24") if dex_data.get("ok") else None,
-                "price_change_h24_pct": dex_data.get("raw", {}).get("priceChange", {}).get("h24") if dex_data.get("ok") else None,
-            }
-
-            if self.debug:
-                print(f"[Analysis] 🔮 Running ML predictor for {mint}...")
-            
-            # # 'discovery' is the signal_source for token_monitor.py
-            # win_probability = await predict_token_win_probability(
-            #     predictor_data_dict,
-            #     "discovery", 
-            #     self.http_session 
-            # )
-            
-            if self.debug:
-                if win_probability is not None:
-                    print(f"[Analysis] 🔮 ML Predictor Result for {mint}: {win_probability*100:.2f}% win prob.")
-                else:
-                    print(f"[Analysis] ⚠️ ML Predictor for {mint} returned None (error).")
-
-        except Exception as e:
-            if self.debug:
-                print(f"[Analysis] ❌ ML Predictor failed for {mint}: {e}")
-                import traceback
-                traceback.print_exc()
-
-        # (*** NEW ***) Add ML score to the result object
-        if overlap_result and isinstance(overlap_result, dict):
-            overlap_result["ml_win_probability"] = win_probability
-        
-        # # (*** NEW ***) 6. ML PROBABILITY GATE
-        # if win_probability is None or win_probability < ML_WIN_PROBABILITY_THRESHOLD:
-        #     if self.debug:
-        #         if win_probability is None:
-        #             print(f"[Analysis] ⚠️ {mint} passed security/overlap but ML prediction failed. Not uploading.")
-        #         else:
-        #             print(f"[Analysis] ⚠️ {mint} passed security/overlap but FAILED ML check [Prob: {win_probability*100:.2f}% < {ML_WIN_PROBABILITY_THRESHOLD*100}%]. Not uploading.")
-            
-        #     # Token failed ML gate. It should NOT be marked 'completed'.
-        #     # It should just be left as 'active' to be re-checked later,
-        #     # but we don't save it.
-        #     # Update scheduler to reflect "active" (but failed ML) state
-        #     self.scheduling_store.update_token_state(mint, {
-        #         "status": "active", # Stays active
-        #         "last_completed_check": now_ts,
-        #         "next_scheduled_check": now_ts + self.repeat_interval_seconds,
-        #         "total_checks_completed": check_count,
-        #         "last_ml_fail_prob": win_probability
-        #     })
-        #     return # Stop here, do not save
-
-        if self.debug:
-            print(f"[Analysis] ✅ {mint} PASSED ML GATE [Prob: {win_probability*100:.2f}%]. Saving.")
-
-        # (*** END NEW ***)
-
         # Save to overlap store
         obj = safe_load_overlap(self.overlap_store)
         obj.setdefault(mint, []).append({
             "ts": datetime.now(timezone.utc).isoformat(),
-            "result": overlap_result, # (*** NOW CONTAINS ML SCORE ***)
+            "result": overlap_result,
             "security": "passed",
             "probation_meta": r.get("probation_meta"),
             "rugcheck": self._extract_rugcheck_summary(r),
@@ -2255,7 +2153,6 @@ class Monitor:
                 "current_price_usd": dex_data.get("price_usd"),
                 "market_cap_usd": dex_data.get("market_cap_usd"),
             }
-            # Note: ml_win_probability is now inside the 'result' dict
         })
         self.overlap_store.save(obj)
         
