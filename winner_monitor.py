@@ -756,7 +756,7 @@ class AlphaOverlapStore:
                         # is_ml_passed = (ml_prob is not None and ml_prob >= ML_WIN_PROBABILITY_THRESHOLD)
                         
                         # Only keep entries that pass ALL THREE checks
-                        if is_security_passed and is_graded # and is_ml_passed:
+                        if is_security_passed and is_graded: # and is_ml_passed:
                             valid_entries.append(entry)
                             has_uploadable_data = True # Set flag for upload check
                         elif self.debug:
@@ -1707,7 +1707,7 @@ class WinnerMonitor:
                         # is_ml_passed = (ml_prob is not None and ml_prob >= ML_WIN_PROBABILITY_THRESHOLD)
 
                         # Recheck tokens that have a grade higher than NONE AND passed security AND passed ML
-                        if latest_grade not in ("NONE", "UNKNOWN") and latest_entry.get("security") == "passed" and is_ml_passed:
+                        if latest_grade not in ("NONE", "UNKNOWN") and latest_entry.get("security") == "passed": # and is_ml_passed:
                             tokens_to_recheck.append(mint)
                             
                     except Exception:
