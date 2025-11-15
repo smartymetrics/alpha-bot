@@ -1927,7 +1927,14 @@ class Monitor:
         freeze_authority = data.get("freezeAuthority")
         mint_authority = data.get("mintAuthority")
         has_authorities = bool(freeze_authority or mint_authority)
-        creator_balance = data.get("creatorBalance", 0)
+
+        # --- Handle inconsistent creatorBalance type ---
+        creator_balance_raw = data.get("creatorBalance")
+        creator_balance_pct = 0.0
+        if isinstance(creator_balance_raw, dict):
+            creator_balance_pct = float(creator_balance_raw.get('pct', 0.0) or 0.0)
+        # if it's an int (like 0) or None, pct is 0.0
+        creator_balance = creator_balance_pct # Store the float percentage
 
         # Transfer fee check
         transfer_fee_pct = data.get("transferFee", {}).get("pct", 0)
