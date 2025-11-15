@@ -83,6 +83,7 @@ def _safe_float(val, default=0.0):
 async def _prepare_features(
     data_dict: dict, 
     signal_source: str,
+    session: aiohttp.ClientSession
 ) -> pd.DataFrame | None:
     """
     Converts raw token data into model features.
@@ -278,6 +279,7 @@ async def _prepare_features(
 async def predict_token_win_probability(
     data_dict: dict,
     signal_source: str,
+    session: aiohttp.ClientSession
 ) -> float | None:
     """
     Main prediction function.
@@ -285,6 +287,7 @@ async def predict_token_win_probability(
     Args:
         data_dict: Token data from monitor
         signal_source: 'discovery' or 'alpha'
+        session: aiohttp session (kept for compatibility, not used)
         
     Returns:
         Win probability [0.0-1.0] or None on failure
@@ -293,7 +296,7 @@ async def predict_token_win_probability(
         log.error("❌ Model or feature selector not loaded")
         return None
     
-    features_array = await _prepare_features(data_dict, signal_source)
+    features_array = await _prepare_features(data_dict, signal_source, session)
     
     if features_array is None:
         return None
@@ -313,6 +316,7 @@ async def predict_token_win_probability(
 async def predict_batch(
     data_list: List[dict],
     signal_sources: List[str],
+    session: aiohttp.ClientSession
 ) -> List[Optional[float]]:
     """
     Predict win probabilities for multiple tokens.
@@ -320,6 +324,7 @@ async def predict_batch(
     Args:
         data_list: List of token data dicts
         signal_sources: List of signal sources (same length as data_list)
+        session: aiohttp session
         
     Returns:
         List of win probabilities (or None for failures)
@@ -330,7 +335,7 @@ async def predict_batch(
     
     results = []
     for data_dict, signal_source in zip(data_list, signal_sources):
-        prob = await predict_token_win_probability(data_dict, signal_source)
+        prob = await predict_token_win_probability(data_dict, signal_source, session)
         results.append(prob)
     
     return results

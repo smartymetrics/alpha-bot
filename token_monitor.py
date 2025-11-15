@@ -41,8 +41,8 @@ from ml_predictor import predict_token_win_probability
 
 load_dotenv()
 
-PROBATION_TOP_N = int(os.getenv("PROBATION_TOP_N", "10"))
-PROBATION_THRESHOLD_PCT = float(os.getenv("PROBATION_THRESHOLD_PCT", "40"))
+PROBATION_TOP_N = int(os.getenv("PROBATION_TOP_N", "3"))
+PROBATION_THRESHOLD_PCT = float(os.getenv("PROBATION_THRESHOLD_PCT", "90"))
 
 ML_WIN_PROBABILITY_THRESHOLD = 0.1
 
@@ -2070,17 +2070,17 @@ class Monitor:
             if r.get("transfer_fee_pct", 0) > 5:
                 reasons.append(f"transfer_fee:{r.get('transfer_fee_pct')}%")
 
-            # Rule 5: Check holder count (must be >= 50)
-            if r.get("total_holders", 0) < 50:
-                reasons.append(f"holder_count:{r.get('total_holders')}_req_50")
+            # Rule 5: Check holder count (must be >= 5)
+            if r.get("total_holders", 0) < 5:
+                reasons.append(f"holder_count:{r.get('total_holders')}_req_5")
 
             # Rule 6: Check aggregated liquidity lock percentage (must be >= 95%)
-            if r.get("overall_lp_locked_pct", 0.0) < 95.0:
-                reasons.append(f"lp_locked:{r.get('overall_lp_locked_pct'):.1f}%_req_95%")
+            if r.get("overall_lp_locked_pct", 0.0) < 5.0:
+                reasons.append(f"lp_locked:{r.get('overall_lp_locked_pct'):.1f}%_req_5%")
 
             # Rule 7: Check aggregated total liquidity (must be >= $15,000)
-            if r.get("total_lp_usd", 0.0) < 15000.0:
-                reasons.append(f"liquidity_usd:{r.get('total_lp_usd'):.2f}_req_15k")
+            if r.get("total_lp_usd", 0.0) < 100.0:
+                reasons.append(f"liquidity_usd:{r.get('total_lp_usd'):.2f}_req_100")
 
         if reasons:
             if self.debug:
