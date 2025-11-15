@@ -24,6 +24,5 @@
   "critical_signal_quality",
   "signal_source",
   "grade",
-  "hour_category",
-  "rugcheck_risk_level"
+  "hour_category"
 ]

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-ml_predictor.py (V3 - Feature Compatible)
+ml_predictor.py (V4 - Compatible with train_model.py)
 
 Loads trained XGBoost model and predicts win probability.
-NOW INCLUDES NEW FEATURES: is_asia_prime, is_us_prime, etc.
+Uses feature selector and matches train_model.py feature engineering.
 """
 
 import joblib
@@ -23,106 +23,42 @@ import logging
 MODEL_DIR = './models'
 MODEL_PATH = os.path.join(MODEL_DIR, 'xgboost_signal_classifier.pkl')
 ENCODERS_PATH = os.path.join(MODEL_DIR, 'label_encoders.pkl')
-FEATURES_PATH = os.path.join(MODEL_DIR, 'feature_names.json')
+METADATA_PATH = os.path.join(MODEL_DIR, 'model_metadata.json')
+SELECTOR_PATH = os.path.join(MODEL_DIR, 'feature_selector.pkl')
 
 # --- Logging ---
 log = logging.getLogger(__name__)
 if not log.handlers:
     logging.basicConfig(level=logging.INFO)
 
-# --- Holiday API Logic (from collector.py) ---
-
-HOLIDAY_COUNTRY_CODES = "US,GB,DE,JP,SG,KR,CN,CA,AU".split(',')
-
-def async_ttl_cache(ttl_seconds: int):
-    """Decorator for async in-memory TTL caching."""
-    cache: Dict[Any, Tuple[Any, float]] = {}
-    lock = asyncio.Lock()
-
-    def decorator(func: Callable):
-        @wraps(func)
-        async def wrapper(*args, **kwargs):
-            key = (args, tuple(sorted(kwargs.items())))
-            now = time.monotonic()
-
-            async with lock:
-                if key in cache:
-                    result, expiry = cache[key]
-                    if now < expiry:
-                        return result
-                    del cache[key]
-
-            new_result = await func(*args, **kwargs)
-            async with lock:
-                cache[key] = (new_result, now + ttl_seconds)
-            return new_result
-        return wrapper
-    return decorator
-
-class BaseAPIClient:
-    def __init__(self, session: aiohttp.ClientSession, max_retries: int, name: str):
-        self.session = session
-        self.max_retries = max_retries
-        self.name = name
-
-    async def async_get(self, url: str, timeout: int) -> Optional[Dict]:
-        for attempt in range(self.max_retries):
-            try:
-                if not self.session or self.session.closed:
-                    log.error(f"[{self.name}] HTTP session is closed.")
-                    return None
-                    
-                async with self.session.get(url, timeout=timeout) as resp:
-                    if resp.status == 200:
-                        return await resp.json()
-                    if resp.status >= 500 or resp.status == 429:
-                        await asyncio.sleep(2 ** attempt)
-                    else:
-                        return None
-            except (asyncio.TimeoutError, aiohttp.ClientError) as e:
-                log.warning(f"[{self.name}] Request failed: {e}")
-            
-            if attempt < self.max_retries - 1:
-                await asyncio.sleep(2 ** attempt)
-        return None
-
-class HolidayClient(BaseAPIClient):
-    BASE_URL = "https://date.nager.at/api/v3"
-
-    def __init__(self, session: aiohttp.ClientSession, max_retries: int = 3):
-        super().__init__(session, max_retries, "HolidayAPI")
-        self.timeout = 5
-
-    @async_ttl_cache(ttl_seconds=3600 * 24)
-    async def _fetch_holidays_for_year(self, year: int, country_code: str) -> Set[str]:
-        url = f"{self.BASE_URL}/PublicHolidays/{year}/{country_code}"
-        data = await self.async_get(url, self.timeout)
-        if data and isinstance(data, list):
-            return {item['date'] for item in data if 'date' in item}
-        return set()
-
-    async def is_holiday(self, dt: datetime, country_codes: List[str]) -> bool:
-        date_str = dt.strftime('%Y-%m-%d')
-        year = dt.year
-        tasks = [self._fetch_holidays_for_year(year, code) for code in country_codes]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for res in results:
-            if isinstance(res, set) and date_str in res:
-                return True
-        return False
-
 # --- Load Model Artifacts ---
 try:
     model = joblib.load(MODEL_PATH)
     label_encoders = joblib.load(ENCODERS_PATH)
-    feature_list = json.load(open(FEATURES_PATH, 'r'))
-    log.info(f"✅ [ML_Predictor] Loaded model with {len(feature_list)} features")
+    feature_selector = joblib.load(SELECTOR_PATH)
+    metadata = json.load(open(METADATA_PATH, 'r'))
+    
+    all_features = metadata['all_features']
+    selected_features = metadata['selected_features']
+    numeric_features = metadata['numeric_features']
+    categorical_features = metadata['categorical_features']
+    
+    log.info(f"✅ [ML_Predictor] Loaded model: {metadata['model_type']}")
+    log.info(f"   All features: {len(all_features)}")
+    log.info(f"   Selected features: {len(selected_features)}")
     log.info(f"   Categorical encoders: {list(label_encoders.keys())}")
+    log.info(f"   Test AUC: {metadata['performance']['test_auc']:.4f}")
+    
 except Exception as e:
     log.error(f"❌ [ML_Predictor] CRITICAL: Could not load model: {e}")
     model = None
     label_encoders = {}
-    feature_list = []
+    feature_selector = None
+    metadata = {}
+    all_features = []
+    selected_features = []
+    numeric_features = []
+    categorical_features = []
 
 def _safe_divide(a, b, default=0.0):
     """Safe division with None handling."""
@@ -147,93 +83,33 @@ def _safe_float(val, default=0.0):
 async def _prepare_features(
     data_dict: dict, 
     signal_source: str,
-    session: aiohttp.ClientSession
 ) -> pd.DataFrame | None:
     """
     Converts raw token data into model features.
-    MUST match training script's feature engineering exactly!
+    MUST match train_model.py's feature engineering exactly!
     """
-    if not model or not feature_list:
+    if not model or not all_features:
         log.error("❌ Model not loaded")
         return None
 
     try:
         features = {}
         
-        # === 1. TIMESTAMP ===
-        ts_str = data_dict.get('checked_at', data_dict.get('ts', datetime.now(timezone.utc).isoformat()))
-        dt = pd.to_datetime(ts_str).tz_convert(timezone.utc)
-        checked_at_timestamp = int(dt.timestamp())
-        
-        # === 2. TIME FEATURES ===
-        hour = dt.hour
-        features['time_of_day_utc'] = hour
-        features['day_of_week_utc'] = dt.dayofweek
-        features['is_weekend_utc'] = int(dt.dayofweek >= 5)
-        
-        # NEW: Regional prime time indicators
-        features['is_asia_prime'] = int(6 <= hour < 14)
-        features['is_us_prime'] = int(13 <= hour < 21)
-        features['is_eu_prime'] = int(8 <= hour < 16)
-        features['is_dead_hours'] = int(0 <= hour < 6)
-        
-        # Hour category
-        if 0 <= hour < 7:
-            features['hour_category'] = 'dead_hours'
-        elif 7 <= hour < 15:
-            features['hour_category'] = 'asia_hours'
-        elif 15 <= hour < 19:
-            features['hour_category'] = 'eu_hours'
-        else:
-            features['hour_category'] = 'us_hours'
-        
-        features['is_last_day_of_week'] = int(dt.dayofweek == 4)
-        
-        # === 3. HOLIDAY FEATURE ===
-        try:
-            holiday_client = HolidayClient(session)
-            features['is_public_holiday_any'] = await holiday_client.is_holiday(dt, HOLIDAY_COUNTRY_CODES)
-        except Exception as e:
-            log.warning(f"Holiday check failed: {e}")
-            features['is_public_holiday_any'] = False
-        
-        # === 4. SIGNAL FEATURES ===
-        features['signal_source'] = signal_source
-        features['grade'] = data_dict.get('grade', 'NONE')
-        
-        # === 5. MARKET FEATURES ===
+        # === 1. RAW DATA EXTRACTION ===
         raw_dex = data_dict.get('raw_dexscreener', data_dict.get('raw', {}))
         if not isinstance(raw_dex, dict):
             raw_dex = {}
         
-        features['fdv_usd'] = _safe_float(data_dict.get('fdv_usd', raw_dex.get('fdv')))
-        features['liquidity_usd'] = _safe_float(data_dict.get('liquidity_usd', data_dict.get('total_lp_usd')))
-        features['volume_h24_usd'] = _safe_float(
-            data_dict.get('volume_h24_usd', raw_dex.get('volume', {}).get('h24'))
-        )
-        features['price_change_h24_pct'] = _safe_float(
-            data_dict.get('price_change_h24_pct', raw_dex.get('priceChange', {}).get('h24'))
-        )
-        
-        # === 6. SECURITY FEATURES ===
         raw_rug = data_dict.get('raw_rugcheck', data_dict.get('raw', {}))
         if not isinstance(raw_rug, dict):
             raw_rug = {}
         
-        features['has_mint_authority'] = int(data_dict.get('has_mint_authority', data_dict.get('mint_authority') is not None))
-        features['has_freeze_authority'] = int(data_dict.get('has_freeze_authority', data_dict.get('freeze_authority') is not None))
-        features['creator_balance_pct'] = _safe_float(data_dict.get('creator_balance_pct'))
-        features['top_10_holders_pct'] = _safe_float(data_dict.get('top_10_holders_pct'))
+        # === 2. TIMESTAMP & TOKEN AGE ===
+        ts_str = data_dict.get('checked_at', data_dict.get('ts', datetime.now(timezone.utc).isoformat()))
+        dt = pd.to_datetime(ts_str).tz_convert(timezone.utc)
+        checked_at_timestamp = int(dt.timestamp())
         
-        lp_locked_pct = _safe_float(data_dict.get('lp_locked_pct', data_dict.get('overall_lp_locked_pct')))
-        features['is_lp_locked_95_plus'] = int(lp_locked_pct >= 95.0)
-        
-        markets = (raw_rug.get('data') or raw_rug.get('raw') or {}).get('markets', [])
-        features['total_lp_locked_usd'] = sum(m.get('lp', {}).get('lpLockedUSD', 0) for m in markets)
-        
-        features['rugcheck_risk_level'] = (data_dict.get('probation_meta') or {}).get('level', 'unknown')
-        
-        # === 7. TOKEN AGE ===
+        # Token age calculation
         token_age_seconds = None
         block_time = data_dict.get('block_time')
         pair_created_at = raw_dex.get('pairCreatedAt')
@@ -243,10 +119,30 @@ async def _prepare_features(
         elif pair_created_at:
             token_age_seconds = max(0, checked_at_timestamp - int(pair_created_at / 1000))
         
-        features['token_age_at_signal_seconds'] = token_age_seconds if token_age_seconds is not None else 100000
-        features['is_new_token'] = int((token_age_seconds or 100000) < 43200)
+        if token_age_seconds is None:
+            token_age_seconds = 100000  # Default for unknown
         
-        # === 8. SMART MONEY FEATURES ===
+        features['token_age_at_signal_seconds'] = token_age_seconds
+        
+        # === 3. MARKET FUNDAMENTALS ===
+        features['fdv_usd'] = _safe_float(data_dict.get('fdv_usd', raw_dex.get('fdv')))
+        features['liquidity_usd'] = _safe_float(data_dict.get('liquidity_usd', data_dict.get('total_lp_usd')))
+        features['volume_h24_usd'] = _safe_float(
+            data_dict.get('volume_h24_usd', raw_dex.get('volume', {}).get('h24'))
+        )
+        features['price_change_h24_pct'] = _safe_float(
+            data_dict.get('price_change_h24_pct', raw_dex.get('priceChange', {}).get('h24'))
+        )
+        
+        # === 4. SECURITY/RISK FEATURES ===
+        features['creator_balance_pct'] = _safe_float(data_dict.get('creator_balance_pct'))
+        features['top_10_holders_pct'] = _safe_float(data_dict.get('top_10_holders_pct'))
+        
+        # LP locked USD
+        markets = (raw_rug.get('data') or raw_rug.get('raw') or {}).get('markets', [])
+        features['total_lp_locked_usd'] = sum(m.get('lp', {}).get('lpLockedUSD', 0) for m in markets)
+        
+        # === 5. SMART MONEY FEATURES ===
         overlap_count = _safe_float(data_dict.get('overlap_count'))
         weighted_concentration = _safe_float(data_dict.get('weighted_concentration'))
         total_winner_wallets = _safe_float(data_dict.get('total_winner_wallets'), 1.0)
@@ -257,36 +153,34 @@ async def _prepare_features(
         )
         features['winner_wallet_density'] = _safe_divide(overlap_count, holder_count)
         
-        # === 9. DERIVED MARKET FEATURES ===
-        features['volume_to_liquidity_ratio'] = _safe_divide(
-            features['volume_h24_usd'], features['liquidity_usd']
-        )
-        features['fdv_to_liquidity_ratio'] = _safe_divide(
-            features['fdv_usd'], features['liquidity_usd']
-        )
-        
-        # === 10. RISK FEATURES ===
+        # === 6. WHALE CONCENTRATION SCORE ===
         top1_pct = _safe_float(data_dict.get('top1_holder_pct'))
         top10_pct = features['top_10_holders_pct']
         features['whale_concentration_score'] = (
             (top1_pct * 3) + (top10_pct - top1_pct) if top10_pct >= top1_pct else top1_pct * 3
         )
         
+        # === 7. AUTHORITY RISK SCORE ===
+        has_mint = int(data_dict.get('has_mint_authority', data_dict.get('mint_authority') is not None))
+        has_freeze = int(data_dict.get('has_freeze_authority', data_dict.get('freeze_authority') is not None))
         transfer_fee = _safe_float(data_dict.get('transfer_fee_pct'))
+        
         features['authority_risk_score'] = (
-            (50 if features['has_mint_authority'] else 0) +
-            (50 if features['has_freeze_authority'] else 0) +
+            (50 if has_mint else 0) +
+            (50 if has_freeze else 0) +
             (transfer_fee * 100 if transfer_fee else 0)
         )
         
-        features['creator_dumped'] = int(
-            (features['creator_balance_pct'] == 0) and 
-            (features['token_age_at_signal_seconds'] < 86400)
-        )
+        # === 8. PUMP DUMP RISK SCORE ===
+        lp_locked_pct = _safe_float(data_dict.get('lp_locked_pct', data_dict.get('overall_lp_locked_pct')))
         
-        # Pump dump risk score
         insider_networks = (raw_rug.get('data') or raw_rug.get('raw') or {}).get('insiderNetworks', [])
         largest_insider_network_size = max((n.get('size', 0) for n in insider_networks), default=0)
+        
+        creator_dumped = int(
+            (features['creator_balance_pct'] == 0) and 
+            (token_age_seconds < 86400)
+        )
         
         pump_dump_score = 0
         if largest_insider_network_size > 100: pump_dump_score += 30
@@ -303,46 +197,79 @@ async def _prepare_features(
         
         pump_dump_score += min(features['authority_risk_score'] / 100 * 15, 15)
         
-        if features['creator_dumped']: pump_dump_score += 10
+        if creator_dumped: pump_dump_score += 10
         elif features['creator_balance_pct'] > 10: pump_dump_score += 7
         elif features['creator_balance_pct'] > 5: pump_dump_score += 4
         
         features['pump_dump_risk_score'] = pump_dump_score
         
-        # === 11. INTERACTION FEATURES (NEW) ===
-        features['high_risk_combo'] = int(
+        # === 9. DERIVED FEATURES (from train_model.py) ===
+        
+        # Token age features
+        features['token_age_hours'] = token_age_seconds / 3600
+        features['token_age_hours_capped'] = min(features['token_age_hours'], 24)
+        features['is_ultra_fresh'] = int(token_age_seconds < 3600)
+        
+        # Market ratios
+        features['volume_to_liquidity_ratio'] = _safe_divide(
+            features['volume_h24_usd'], features['liquidity_usd']
+        )
+        features['fdv_to_liquidity_ratio'] = _safe_divide(
+            features['fdv_usd'], features['liquidity_usd']
+        )
+        
+        # Risk interactions
+        features['high_risk_signal'] = int(
             (pump_dump_score > 30) and (features['authority_risk_score'] > 15)
         )
-        features['critical_signal_quality'] = int(
-            (features['grade'] == 'CRITICAL') and (signal_source == 'alpha')
+        
+        features['premium_signal'] = int(
+            (data_dict.get('grade') == 'CRITICAL') and (signal_source == 'alpha')
         )
         
-        # === 12. ENCODE CATEGORICAL FEATURES ===
-        for col in label_encoders:
-            if col in features:
-                le = label_encoders[col]
-                val = str(features[col])
-                if val not in le.classes_:
-                    val = le.classes_[0]
-                features[col] = le.transform([val])[0]
+        features['extreme_concentration'] = int(features['top_10_holders_pct'] > 60)
         
-        # === 13. CREATE DATAFRAME ===
+        # Log transforms (for stability)
+        features['log_liquidity'] = np.log1p(features['liquidity_usd'])
+        features['log_volume'] = np.log1p(features['volume_h24_usd'])
+        features['log_fdv'] = np.log1p(features['fdv_usd'])
+        
+        # === 10. CATEGORICAL FEATURES ===
+        features['signal_source'] = signal_source
+        features['grade'] = data_dict.get('grade', 'NONE')
+        
+        # === 11. CREATE DATAFRAME WITH ALL FEATURES ===
         df = pd.DataFrame([features])
         
-        # Add missing features with defaults
-        for col in feature_list:
+        # Add any missing numeric features
+        for col in numeric_features:
             if col not in df.columns:
-                if col in label_encoders:
-                    df[col] = label_encoders[col].transform([label_encoders[col].classes_[0]])[0]
-                elif any(k in col for k in ['pct', 'usd', 'score', 'ratio']):
-                    df[col] = 0.0
-                elif any(k in col for k in ['is_', 'has_']):
-                    df[col] = 0
-                else:
-                    df[col] = 0
+                df[col] = 0.0
         
-        # Return in exact feature order
-        return df[feature_list]
+        # Add any missing categorical features
+        for col in categorical_features:
+            if col not in df.columns:
+                df[col] = 'UNKNOWN'
+        
+        # === 12. ENCODE CATEGORICAL FEATURES ===
+        df_encoded = df.copy()
+        for col in categorical_features:
+            if col in label_encoders:
+                le = label_encoders[col]
+                val = str(df[col].iloc[0])
+                if val not in le.classes_:
+                    val = le.classes_[0]
+                df_encoded[col] = le.transform([val])[0]
+        
+        # === 13. ENSURE CORRECT FEATURE ORDER ===
+        df_ordered = df_encoded[all_features]
+        
+        # === 14. APPLY FEATURE SELECTOR ===
+        df_selected = feature_selector.transform(df_ordered)
+        
+        log.debug(f"[ML_Predictor] Features prepared: {df_ordered.shape} -> {df_selected.shape}")
+        
+        return df_selected
         
     except Exception as e:
         log.error(f"❌ Failed to prepare features: {e}", exc_info=True)
@@ -351,7 +278,6 @@ async def _prepare_features(
 async def predict_token_win_probability(
     data_dict: dict,
     signal_source: str,
-    session: aiohttp.ClientSession
 ) -> float | None:
     """
     Main prediction function.
@@ -359,21 +285,21 @@ async def predict_token_win_probability(
     Args:
         data_dict: Token data from monitor
         signal_source: 'discovery' or 'alpha'
-        session: aiohttp session
         
     Returns:
         Win probability [0.0-1.0] or None on failure
     """
-    if not model:
+    if not model or not feature_selector:
+        log.error("❌ Model or feature selector not loaded")
         return None
     
-    features_df = await _prepare_features(data_dict, signal_source, session)
+    features_array = await _prepare_features(data_dict, signal_source)
     
-    if features_df is None:
+    if features_array is None:
         return None
     
     try:
-        probabilities = model.predict_proba(features_df)
+        probabilities = model.predict_proba(features_array)
         win_probability = float(probabilities[0][1])
         
         log.debug(f"[ML_Predictor] P(win)={win_probability:.3f} for {signal_source} signal")
@@ -382,3 +308,77 @@ async def predict_token_win_probability(
     except Exception as e:
         log.error(f"❌ Prediction failed: {e}", exc_info=True)
         return None
+
+# === OPTIONAL: Batch Prediction ===
+async def predict_batch(
+    data_list: List[dict],
+    signal_sources: List[str],
+) -> List[Optional[float]]:
+    """
+    Predict win probabilities for multiple tokens.
+    
+    Args:
+        data_list: List of token data dicts
+        signal_sources: List of signal sources (same length as data_list)
+        
+    Returns:
+        List of win probabilities (or None for failures)
+    """
+    if len(data_list) != len(signal_sources):
+        log.error("❌ data_list and signal_sources must have same length")
+        return [None] * len(data_list)
+    
+    results = []
+    for data_dict, signal_source in zip(data_list, signal_sources):
+        prob = await predict_token_win_probability(data_dict, signal_source)
+        results.append(prob)
+    
+    return results
+
+# === UTILITY: Get Model Info ===
+def get_model_info() -> dict:
+    """Returns model metadata."""
+    if not metadata:
+        return {}
+    return {
+        'model_type': metadata.get('model_type'),
+        'trained_at': metadata.get('trained_at'),
+        'num_features': len(all_features),
+        'selected_features': len(selected_features),
+        'test_auc': metadata.get('performance', {}).get('test_auc'),
+        'test_accuracy': metadata.get('performance', {}).get('test_accuracy'),
+        'max_token_age_hours': metadata.get('max_token_age_hours'),
+    }
+
+# === TEST FUNCTION ===
+async def test_predictor():
+    """Test predictor with dummy data."""
+    test_data = {
+        'grade': 'CRITICAL',
+        'fdv_usd': 1000000,
+        'liquidity_usd': 50000,
+        'volume_h24_usd': 200000,
+        'price_change_h24_pct': 150,
+        'creator_balance_pct': 2.5,
+        'top_10_holders_pct': 35,
+        'top1_holder_pct': 12,
+        'block_time': int(datetime.now(timezone.utc).timestamp()) - 1800,  # 30 min old
+        'overlap_count': 5,
+        'weighted_concentration': 0.3,
+        'total_winner_wallets': 100,
+        'holder_count': 200,
+    }
+    
+    prob = await predict_token_win_probability(test_data, 'alpha')
+    
+    if prob is not None:
+        log.info(f"✅ Test prediction: {prob:.3f}")
+        log.info(f"   Model info: {get_model_info()}")
+        return True
+    else:
+        log.error("❌ Test prediction failed")
+        return False
+
+if __name__ == "__main__":
+    # Test the predictor
+    asyncio.run(test_predictor())

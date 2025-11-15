@@ -75,7 +75,7 @@ MIN_LP_LOCKED_PCT = 95.0
 MAX_TRANSFER_FEE_PCT = 5
 MAX_CREATOR_BALANCE = 0.0 # Must be exactly 0
 
-ML_WIN_PROBABILITY_THRESHOLD = 0.7
+ML_WIN_PROBABILITY_THRESHOLD = 0.1
 
 # -----------------------------------------------
 # Re-usable Helpers
@@ -1092,9 +1092,9 @@ class AlphaTokenAnalyzer:
         if rugcheck_details.get("has_authorities"):
             security_failures.append("has_active_authorities")
         
-        # Check for creator balance (must be zero)
-        if rugcheck_details.get("creator_balance", 0) > MAX_CREATOR_BALANCE:
-            security_failures.append(f"creator_balance:{rugcheck_details.get('creator_balance')}_req_{MAX_CREATOR_BALANCE}")
+        # # Check for creator balance (must be zero)
+        # if rugcheck_details.get("creator_balance", 0) > MAX_CREATOR_BALANCE:
+        #     security_failures.append(f"creator_balance:{rugcheck_details.get('creator_balance')}_req_{MAX_CREATOR_BALANCE}")
         
         # Check transfer fee (must be low)
         if rugcheck_details.get("transfer_fee_pct", 0) > MAX_TRANSFER_FEE_PCT:

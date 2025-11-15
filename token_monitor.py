@@ -44,8 +44,7 @@ load_dotenv()
 PROBATION_TOP_N = int(os.getenv("PROBATION_TOP_N", "10"))
 PROBATION_THRESHOLD_PCT = float(os.getenv("PROBATION_THRESHOLD_PCT", "40"))
 
-# (*** NEW ***) ML Model Threshold (from winner_monitor.py)
-ML_WIN_PROBABILITY_THRESHOLD = 0.7
+ML_WIN_PROBABILITY_THRESHOLD = 0.1
 
 COINGECKO_PRO_API_KEY = os.environ.get("GECKO_API")
 DUNE_API_KEY = os.environ.get("DUNE_API_KEY")
@@ -2064,8 +2063,8 @@ class Monitor:
                 reasons.append(f"authorities:{','.join(authorities)}")
 
             # Rule 3: Check creator token balance
-            if r.get("creator_balance", 0) > 0:
-                reasons.append(f"creator_balance:{r.get('creator_balance')}")
+            # if r.get("creator_balance", 0) > 0:
+            #     reasons.append(f"creator_balance:{r.get('creator_balance')}")
 
             # Rule 4: Check transfer fee (must be <= 5%)
             if r.get("transfer_fee_pct", 0) > 5:
