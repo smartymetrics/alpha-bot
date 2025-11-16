@@ -1,4 +1,3 @@
-
 """
 Production Inference Script for Solana Memecoin Classifier
 Uses ensemble of XGBoost, LightGBM, and CatBoost models
@@ -10,8 +9,9 @@ import joblib
 import json
 
 class SolanaMemeTokenClassifier:
-    def __init__(self, model_dir='models'):
+    def __init__(self, model_dir='models', debug=False):
         """Load all models and preprocessing artifacts"""
+        self.debug = debug
         self.selector = joblib.load(f'{model_dir}/feature_selector.pkl')
         self.xgb_model = joblib.load(f'{model_dir}/xgboost_model.pkl')
         self.lgb_model = joblib.load(f'{model_dir}/lightgbm_model.pkl')
@@ -133,13 +133,35 @@ class SolanaMemeTokenClassifier:
         # Select features
         X = df[self.all_features].copy()
         
-        # Encode categorical features
+        # Encode categorical features with handling for unseen labels
         for col in self.metadata['categorical_features']:
             if col in X.columns:
-                X[col] = self.label_encoders[col].transform(X[col].astype(str))
+                try:
+                    # Check if values are in the encoder's classes
+                    values = X[col].astype(str)
+                    unseen_mask = ~values.isin(self.label_encoders[col].classes_)
+                    
+                    if unseen_mask.any():
+                        # Replace unseen labels with the most common class from training
+                        most_common = self.label_encoders[col].classes_[0]
+                        X.loc[unseen_mask, col] = most_common
+                        if self.debug:
+                            print(f"Warning: Unseen values in '{col}' replaced with '{most_common}'")
+                    
+                    X[col] = self.label_encoders[col].transform(values)
+                except Exception as e:
+                    if self.debug:
+                        print(f"Error encoding '{col}': {e}. Using default value.")
+                    X[col] = 0
         
-        # Apply feature selection
-        X_selected = self.selector.transform(X)
+        # Apply feature selection - this returns a numpy array
+        X_selected_array = self.selector.transform(X)
+        
+        # Convert back to DataFrame with proper column names for the models
+        # Get the selected feature names from the selector
+        selected_feature_mask = self.selector.get_support()
+        selected_feature_names = [name for name, selected in zip(self.all_features, selected_feature_mask) if selected]
+        X_selected = pd.DataFrame(X_selected_array, columns=selected_feature_names, index=X.index)
         
         # Get predictions from all models
         xgb_proba = self.xgb_model.predict_proba(X_selected)[:, 1]
