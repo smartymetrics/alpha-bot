@@ -1373,9 +1373,19 @@ class AlphaTokenAnalyzer:
         
         # --- ML PREDICTION (NEW) ---
         # Run ML prediction only if the token is NOT being sent to monitoring
-        # (i.e., it passed all security AND has overlap)
+        # (i.e., it passed all security AND has overlap AND has a valid grade)
         ml_prediction_result = None
-        if not final_needs_monitoring:
+
+        # *** MODIFICATION START ***
+        # Only run ML if it passed security, has overlap, AND has a grade.
+        # This matches the final "cleared for upload" logic from the security gate.
+        is_cleared_for_upload = (
+            not final_needs_monitoring and 
+            grade not in ("NONE", "UNKNOWN")
+        )
+        
+        if is_cleared_for_upload:
+        # *** MODIFICATION END ***
             try:
                 # Build the feature dictionary for the ML model
                 ml_input_data = self._build_ml_input(
@@ -1411,8 +1421,16 @@ class AlphaTokenAnalyzer:
         # --- END ML PREDICTION ---
         
         if self.debug and not final_needs_monitoring:
-            ml_prob = result.get("ml_prediction", {}).get("probability", 0.0)
-            print(f"[TokenAnalyzer] ✅ {mint} -> Grade: {grade}, Overlap: {overlap_count}, ML Prob: {ml_prob:.1%}, CLEARED for upload")
+            # *** MODIFICATION START ***
+            ml_prob_str = "N/A (Skipped)" # Default if ML wasn't run
+            if "ml_prediction" in result:
+                ml_prob_str = f"{result.get('ml_prediction', {}).get('probability', 0.0):.1%}"
+            
+            # Use the same flag from the ML block
+            cleared_status = "CLEARED for upload" if is_cleared_for_upload else "NOT CLEARED (No Grade)"
+
+            print(f"[TokenAnalyzer] ✅ {mint} -> Grade: {grade}, Overlap: {overlap_count}, ML Prob: {ml_prob_str}, Status: {cleared_status}")
+            # *** MODIFICATION END ***
             
         return result
 
