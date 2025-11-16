@@ -1316,7 +1316,7 @@ class AlphaTokenAnalyzer:
             if total_winner_weights else 0.0
         )
 
-        # 8. GRADE CALCULATION
+# 8. GRADE CALCULATION
         grade = calculate_overlap_grade(
             overlap_count=overlap_count,
             overlap_percentage=overlap_pct, 
@@ -1326,7 +1326,7 @@ class AlphaTokenAnalyzer:
             total_winner_wallets=total_winner_wallets
         )
         
-        # 9. FINAL CHECK: ONLY UPLOAD IF OVERLAP IS FOUND (User requirement: only clean/quality tokens)
+        # 9. FINAL CHECK: ONLY UPLOAD IF OVERLAP IS FOUND
         final_needs_monitoring = False
         final_skip_reason = None
         
@@ -1336,12 +1336,16 @@ class AlphaTokenAnalyzer:
             final_skip_reason = "zero_overlap_after_security_pass"
             if self.debug:
                  print(f"[TokenAnalyzer] ⚠️ {mint} passed security but ZERO overlap - setting to monitoring.")
-            
+        elif grade in ("NONE", "UNKNOWN"):
+            # If overlap exists but doesn't meet grade thresholds, also monitor
+            final_needs_monitoring = True
+            final_skip_reason = "overlap_below_grade_threshold"
+            if self.debug:
+                print(f"[TokenAnalyzer] ⚠️ {mint} has overlap ({overlap_count}) but grade is {grade} - setting to monitoring.")
         
-        # --- DEXSCREENER FETCH (NEW) ---
-        # If the token passed all checks (i.e., not monitoring), fetch Dexscreener data
+        # Only fetch DexScreener data for tokens with valid grades (LOW+)
         dex_data = None # Default
-        if not final_needs_monitoring:
+        if not final_needs_monitoring and grade not in ("NONE", "UNKNOWN"):
             if self.debug:
                 print(f"[TokenAnalyzer] 💎 {mint} PASSED (Grade: {grade}), fetching DexScreener data...")
             try:
@@ -1353,6 +1357,9 @@ class AlphaTokenAnalyzer:
                 if self.debug:
                     print(f"[TokenAnalyzer] ⚠️ {mint} Dexscreener fetch failed after retries: {e}")
                 dex_data = {"ok": False, "error": str(e)}
+        elif self.debug and not final_needs_monitoring:
+            # Token not monitoring but has invalid grade - should not happen with new logic
+            print(f"[TokenAnalyzer] ⚠️ {mint} skipping DexScreener (Grade: {grade})")
         # --- END DEXSCREENER FETCH ---
         
         result = {
