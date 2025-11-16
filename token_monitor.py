@@ -10,6 +10,11 @@ Now using CoinGecko Pro API for new token discovery.
 - The core logic is consolidated into `run_token_analysis_step`.
 - Removed functions: _security_gate_and_route, _schedule_first_check_only, _schedule_repeat_check_only.
 - Renamed `check_holders_overlap` to `_fetch_and_calculate_overlap` for clarity.
+
+*** MODIFIED (ML V2 Integration) ***
+- Runs ml_predictor_v2.py ONLY on tokens that pass ALL security/overlap checks.
+- Adds 'ml_prediction' (probability, confidence, risk_tier) to the final
+  results file for data confirmation, NOT as a filter.
 """
 import asyncio
 import aiohttp
@@ -35,6 +40,9 @@ from typing import List, Set
 
 import sqlite3
 import threading
+
+# --- NEW ML IMPORT ---
+from ml_predictor_v2 import SolanaMemeTokenClassifier
 
 load_dotenv()
 
@@ -1818,6 +1826,8 @@ class Monitor:
         scheduling_store: SchedulingStore,
         # ------------------ 🚀 CHANGE 1: Accept http_session ------------------
         http_session: aiohttp.ClientSession,
+        # --- NEW: Accept ML Classifier ---
+        ml_classifier: SolanaMemeTokenClassifier,
         *,
         coingecko_poll_interval_seconds: int = 30,
         initial_check_delay_seconds: int = 600, # 10 minutes
@@ -1844,6 +1854,8 @@ class Monitor:
         self._probation_tasks: Dict[str, asyncio.Task] = {}  # mint -> asyncio.Task
         # ------------------ 🚀 CHANGE 2: Use the provided session ------------------
         self.http_session = http_session
+        # --- NEW: Store ML Classifier ---
+        self.ml_classifier = ml_classifier
         # concurrency guard for external API calls
         self._api_sema = asyncio.Semaphore(8)
 
@@ -1941,7 +1953,10 @@ class Monitor:
         
         # Holder metrics
         total_holders = data.get("totalHolders", 0)
+        # --- MODIFIED: Get Top 1 and Top 10 pct ---
         top1_holder_pct = top_holders[0].get("pct", 0) if top_holders else 0.0
+        top_10_holders_pct = sum(h.get("pct", 0) for h in top_holders[:10])
+        # --- End Modification ---
 
         # --- Liquidity Aggregation ---
         markets = data.get("markets", [])
@@ -1978,6 +1993,7 @@ class Monitor:
             "rugged": rugged,
             "total_holders": total_holders,
             "top1_holder_pct": top1_holder_pct,
+            "top_10_holders_pct": top_10_holders_pct, # NEW: Add this
             "creator_balance": creator_balance,
             "freeze_authority": freeze_authority,
             "mint_authority": mint_authority,
@@ -1985,6 +2001,7 @@ class Monitor:
             "transfer_fee_pct": transfer_fee_pct,
             # Aggregated liquidity metrics
             "total_lp_usd": total_lp_usd,
+            "total_lp_locked_usd": total_lp_locked_usd, # NEW: Add this for ML
             "overall_lp_locked_pct": overall_lp_locked_pct,
             "lp_lock_sufficient": lp_lock_sufficient,
             "probation": probation_result["probation"],
@@ -2003,6 +2020,7 @@ class Monitor:
             return {"error": r.get("error", "unknown"), "error_text": r.get("error_text")}
         return {
             "top1_holder_pct": r.get("top1_holder_pct", 0.0),
+            "top_10_holders_pct": r.get("top_10_holders_pct", 0.0), # NEW
             "holder_count": r.get("total_holders", 0),
             "has_authorities": r.get("has_authorities", False),
             "creator_balance": r.get("creator_balance", 0),
@@ -2011,6 +2029,73 @@ class Monitor:
             "total_liquidity_usd": r.get("total_lp_usd", 0.0),
             "lp_lock_details": r.get("lp_lock_details", [])
         }
+
+    def _build_ml_input(
+        self, 
+        start: TradingStart,
+        overlap_result: Dict[str, Any], 
+        security_report: Dict[str, Any],
+        dex_data: Optional[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """Helper to construct the feature dictionary for ml_predictor_v2."""
+        
+        dex_raw = (dex_data or {}).get("raw", {}) or {} # Ensure dex_raw is a dict
+        
+        # --- Calculate Token Age ---
+        token_age_seconds = 0
+        block_time = start.block_time
+        if block_time:
+            try:
+                now_ts = int(datetime.now(timezone.utc).timestamp())
+                token_age_seconds = now_ts - int(block_time)
+            except Exception:
+                token_age_seconds = 0 # Default on error
+        
+        # --- Get DexScreener values ---
+        volume_h24 = 0.0
+        try:
+            volume_h24 = float((dex_raw.get("volume", {}).get("h24") or 0.0))
+        except (ValueError, TypeError):
+            pass
+            
+        fdv = 0.0
+        try:
+            fdv = float((dex_raw.get("fdv") or 0.0))
+        except (ValueError, TypeError):
+            pass
+            
+        price_change_h24 = 0.0
+        try:
+            price_change_h24 = float((dex_raw.get("priceChange", {}).get("h24") or 0.0))
+        except (ValueError, TypeError):
+            pass
+
+        # --- Build the feature dict ---
+        # This must match the features expected by ml_predictor_v2
+        feature_dict = {
+            # --- Available data ---
+            'signal_source': start.detected_via or 'unknown', # e.g., 'coingecko', 'dune'
+            'grade': overlap_result.get("grade", "NONE"),
+            'liquidity_usd': security_report.get("total_lp_usd", 0.0),
+            'volume_h24_usd': volume_h24,
+            'fdv_usd': fdv,
+            'price_change_h24_pct': price_change_h24,
+            'creator_balance_pct': security_report.get("creator_balance", 0.0),
+            'top_10_holders_pct': security_report.get("top_10_holders_pct", 0.0),
+            'total_lp_locked_usd': security_report.get("total_lp_locked_usd", 0.0),
+            'token_age_at_signal_seconds': max(0, token_age_seconds),
+            
+            # --- MOCKED/UNAVAILABLE data ---
+            # These are required by the ML script's engineer_features
+            # but not provided by token_monitor. We default them to 0.
+            'whale_concentration_score': 0.0,
+            'pump_dump_risk_score': 0.0,
+            'authority_risk_score': 0.0,
+            'overlap_quality_score': 0.0,
+            'winner_wallet_density': 0.0
+        }
+        
+        return feature_dict
 
     async def run_token_analysis_step(self, start: TradingStart, check_count: int):
         """
@@ -2021,7 +2106,7 @@ class Monitor:
         3. If fail, send to probation and RETURN.
         4. If pass, run Helius call (_fetch_and_calculate_overlap).
         5. If overlap=NONE, save and RETURN.
-        6. If overlap=PASS, run DexScreener, save, and mark as completed.
+        6. If overlap=PASS, run DexScreener, RUN ML PREDICTION, save, and mark as completed.
         """
         mint = start.mint
         now_ts = int(datetime.now(timezone.utc).timestamp())
@@ -2146,7 +2231,33 @@ class Monitor:
         except Exception as e:
             if self.debug:
                 print(f"[Analysis] Dexscreener check for {mint} failed after all retries: {e}")
-            dex_data = {"ok": False, "price_usd": None, "market_cap_usd": None}
+            dex_data = {"ok": False, "price_usd": None, "market_cap_usd": None, "raw": {}}
+
+        # --- ML PREDICTION (NEW) ---
+        # Only run if all checks passed (security + overlap)
+        ml_prediction_result = None
+        try:
+            # Build the feature dictionary for the ML model
+            ml_input_data = self._build_ml_input(
+                start=start,
+                overlap_result=overlap_result,
+                security_report=r, # 'r' is the rugcheck result from earlier
+                dex_data=dex_data
+            )
+            
+            # Run prediction
+            ml_prediction_result = self.ml_classifier.predict(ml_input_data)
+            
+        except Exception as e:
+            if self.debug:
+                print(f"[Analysis] ML prediction failed for {mint}: {e}")
+            ml_prediction_result = {
+                'action': 'ERROR',
+                'win_probability': 0.0,
+                'confidence': 'NONE',
+                'risk_tier': 'UNKNOWN',
+            }
+        # --- END ML PREDICTION ---
 
         # Save to overlap store
         obj = safe_load_overlap(self.overlap_store)
@@ -2159,6 +2270,13 @@ class Monitor:
             "dexscreener": {
                 "current_price_usd": dex_data.get("price_usd"),
                 "market_cap_usd": dex_data.get("market_cap_usd"),
+            },
+            # --- NEW: Embed ML Result ---
+            "ml_prediction": {
+                "probability": ml_prediction_result.get("win_probability"),
+                "confidence": ml_prediction_result.get("confidence"),
+                "risk_tier": ml_prediction_result.get("risk_tier"),
+                "action": ml_prediction_result.get("action")
             }
         })
         self.overlap_store.save(obj)
@@ -2772,12 +2890,21 @@ class Monitor:
 # Main loop wiring
 # -----------------------
 async def main_loop():
+    """
+    Initializes all components and starts the monitor's main polling loop.
+    Manages the AIOHTTP session lifecycle.
+    """
     # ------------------ 🚀 CHANGE 6: Manage session lifecycle here ------------------
+    # The session is created here and passed into the Monitor,
+    # which then uses it for all API calls (RugCheck, DexScreener).
     async with aiohttp.ClientSession() as http_session:
         try:
             sol_client = SolanaAlphaClient()
             ok = await sol_client.test_connection()
             print("🚀 Solana RPC ok:", ok)
+            if not ok:
+                print("⚠️ Solana RPC connection failed. Check Helius keys/status.")
+                # We can continue, but holder_agg will likely fail.
 
             td = TokenDiscovery(
                 client=sol_client,
@@ -2789,14 +2916,25 @@ async def main_loop():
                 debug=True
             )
             holder_agg = HolderAggregator(sol_client, debug=True)
+            
             # --- UPDATER INSTANCE: This now uses the new SQLite class ---
             updater = JobLibTokenUpdater(data_dir="./data/token_data", expiry_hours=6, debug=True)
             # ---
-            dune_cache = DuneWinnersCache(cache_dir="./data/dune_cache", debug=True)
+            
+            dune_cache = DuneWinnersCache(cache_dir="./data/dune_cache", debug=True, supabase_bucket=BUCKET_NAME)
             dune_builder = DuneWinnersBuilder(cache=dune_cache, debug=True, max_concurrency=8)
             overlap_store = OverlapStore(filepath="./data/overlap_results.pkl", debug=True)
             scheduling_store = SchedulingStore(filepath="./data/scheduling_state.pkl", debug=True)
-            
+
+            try:
+                # Assuming models are in the 'models' directory relative to execution
+                ml_classifier = SolanaMemeTokenClassifier(model_dir='models') 
+            except Exception as e:
+                print(f"❌ CRITICAL: Failed to load ML models: {e}")
+                print("--- 💀 Token Monitor Halted ---")
+                return
+
+            # Initialize the main Monitor orchestrator
             monitor = Monitor(
                 sol_client=sol_client,
                 token_discovery=td,
@@ -2806,31 +2944,39 @@ async def main_loop():
                 dune_builder=dune_builder,
                 overlap_store=overlap_store,
                 scheduling_store=scheduling_store,
-                http_session=http_session, # Pass the session here
+                http_session=http_session, # Pass the managed session
+                ml_classifier=ml_classifier, # Pass the ML classifier
                 coingecko_poll_interval_seconds=30,
-                initial_check_delay_seconds=30 * 60, # 30 minutes
-                repeat_interval_seconds=1 * 3600, # 1 hour
-                debug=True,
+                initial_check_delay_seconds=600, # 10 minutes
+                repeat_interval_seconds=1800, # 30 minutes
+                debug=True
             )
 
-            # Start both tasks concurrently
-            dune_task = asyncio.create_task(monitor.ensure_dune_holders())
-            coingecko_task = asyncio.create_task(monitor.poll_coingecko_loop())
-            
-            print("🚀 Starting CoinGecko polling and Dune cache building concurrently...")
-            
-            # Wait for both tasks (poll_coingecko_loop runs forever)
-            await asyncio.gather(dune_task, coingecko_task)
+            # Pre-load/build the Dune winners cache on startup
+            print("🚀 Ensuring Dune winners cache is populated...")
+            await monitor.ensure_dune_holders()
+            print("✅ Dune winners cache is ready.")
 
-        except asyncio.CancelledError:
-            print("🚀 Main loop was cancelled. Shutting down gracefully.")
-        finally:
-            # The 'async with' block ensures the http_session is closed automatically.
-            print("🚀 Main loop has finished.")
+            # Start the main polling loop (which also handles recovery)
+            print("🚀 Starting main CoinGecko polling loop...")
+            await monitor.poll_coingecko_loop()
 
+        except RuntimeError as e:
+            print(f"\n❌ CRITICAL RUNTIME ERROR: {e}")
+            print("--- 💀 Token Monitor Halted ---")
+        except Exception as e:
+            print(f"\n❌ UNHANDLED EXCEPTION in main_loop: {e}")
+            traceback.print_exc()
+            print("--- 💀 Token Monitor Halted ---")
 
 if __name__ == "__main__":
+    print("--- 🚀 Starting Token Monitor ---")
     try:
         asyncio.run(main_loop())
     except KeyboardInterrupt:
-        print("🚀 Interrupted, exiting")
+        print("\n🛑 Token Monitor interrupted, exiting gracefully")
+    except Exception as e:
+        # This catches errors during asyncio.run() itself, if any
+        print(f"\n❌ UNHANDLED TOP-LEVEL EXCEPTION: {e}")
+        traceback.print_exc()
+        print("--- 💀 Token Monitor Halted ---")

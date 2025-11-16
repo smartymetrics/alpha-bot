@@ -15,6 +15,10 @@ Tracks high-frequency winner wallets and monitors their latest token purchases.
 - Now fetches and embeds Dexscreener data for all tokens that pass security and overlap checks.
 - This provides the market data (price, etc.) for collector.py, removing the need
   for the collector to make a separate, failing live API call.
+- *** INTEGRATED ML PREDICTOR V2 ***
+- Runs ml_predictor_v2.py on all tokens that pass security/overlap checks.
+- Adds 'ml_prediction' (probability, confidence, risk_tier) to the final
+  results file for data confirmation, NOT as a filter.
 """
 
 import asyncio
@@ -47,6 +51,8 @@ from token_monitor import (
     calculate_overlap_grade,
     evaluate_probation_from_rugcheck
 )
+# --- NEW ML IMPORT ---
+from ml_predictor_v2 import SolanaMemeTokenClassifier
 
 load_dotenv()
 
@@ -812,6 +818,7 @@ class AlphaTokenAnalyzer:
         helius_limiter: AsyncRateLimiter,
         rugcheck_client: RugCheckClient,
         dex_limiter: AsyncRateLimiter, # Add new limiter
+        ml_classifier: SolanaMemeTokenClassifier, # NEW: ML Classifier
         debug: bool = False
     ):
         self.http_session = http_session
@@ -819,8 +826,9 @@ class AlphaTokenAnalyzer:
         self.dune_cache = dune_cache
         self.helius_limiter = helius_limiter
         self.rugcheck_client = rugcheck_client
-        self.debug = debug
         self.dex_limiter = dex_limiter # Store new limiter
+        self.ml_classifier = ml_classifier # NEW: Store classifier
+        self.debug = debug
         
         if self.debug:
             print("[TokenAnalyzer] Initialized.")
@@ -868,7 +876,10 @@ class AlphaTokenAnalyzer:
 
         total_holders = data.get("totalHolders", 0)
         
+        # --- MODIFIED: Get Top 1 and Top 10 pct ---
         top1_holder_pct = top_holders[0].get("pct", 0) if top_holders else 0.0
+        top_10_holders_pct = sum(h.get("pct", 0) for h in top_holders[:10])
+        # --- End Modification ---
 
         markets = data.get("markets", [])
         total_lp_locked_usd = 0.0
@@ -896,6 +907,7 @@ class AlphaTokenAnalyzer:
             "rugged": rugged,
             "total_holders": total_holders,
             "top1_holder_pct": top1_holder_pct,
+            "top_10_holders_pct": top_10_holders_pct, # NEW: Add this
             "creator_balance": creator_balance,
             "freeze_authority": freeze_authority,
             "mint_authority": mint_authority,
@@ -963,6 +975,79 @@ class AlphaTokenAnalyzer:
             "raw": p0
         }
 
+    def _build_ml_input(
+        self, 
+        overlap_result: Dict[str, Any], 
+        security_report: Dict[str, Any],
+        dex_data: Optional[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """Helper to construct the feature dictionary for ml_predictor_v2."""
+        
+        rugcheck = security_report.get("rugcheck", {})
+        dex_raw = (dex_data or {}).get("raw", {}) or {} # Ensure dex_raw is a dict
+        
+        # --- Calculate Token Age ---
+        token_age_seconds = 0
+        pair_created_at_ms = dex_raw.get("pairCreatedAt")
+        if pair_created_at_ms:
+            try:
+                # Get timestamp in whole seconds
+                created_at_ts = int(pair_created_at_ms) // 1000
+                now_ts = int(datetime.now(timezone.utc).timestamp())
+                token_age_seconds = now_ts - created_at_ts
+            except Exception:
+                token_age_seconds = 0 # Default on error
+        
+        # --- Get DexScreener values ---
+        volume_h24 = 0.0
+        try:
+            volume_h24 = float((dex_raw.get("volume", {}).get("h24") or 0.0))
+        except (ValueError, TypeError):
+            pass
+            
+        fdv = 0.0
+        try:
+            fdv = float((dex_raw.get("fdv") or 0.0))
+        except (ValueError, TypeError):
+            pass
+            
+        price_change_h24 = 0.0
+        try:
+            price_change_h24 = float((dex_raw.get("priceChange", {}).get("h24") or 0.0))
+        except (ValueError, TypeError):
+            pass
+
+        # --- Get LP Lock value ---
+        # ml_predictor_v2 example uses total_lp_locked_usd
+        lp_locked_usd = rugcheck.get("total_liquidity_usd", 0.0) * (rugcheck.get("lp_locked_pct", 0.0) / 100.0)
+
+        # --- Build the feature dict ---
+        # This must match the features expected by ml_predictor_v2
+        feature_dict = {
+            # --- Available data ---
+            'signal_source': 'alpha', # This is always 'alpha' in this script
+            'grade': overlap_result.get("grade", "NONE"),
+            'liquidity_usd': rugcheck.get("total_liquidity_usd", 0.0),
+            'volume_h24_usd': volume_h24,
+            'fdv_usd': fdv,
+            'price_change_h24_pct': price_change_h24,
+            'creator_balance_pct': rugcheck.get("creator_balance", 0.0),
+            'top_10_holders_pct': rugcheck.get("top_10_holders_pct", 0.0),
+            'total_lp_locked_usd': lp_locked_usd,
+            'token_age_at_signal_seconds': max(0, token_age_seconds),
+            
+            # --- MOCKED/UNAVAILABLE data ---
+            # These are required by the ML script's engineer_features
+            # but not provided by winner_monitor. We default them to 0.
+            'whale_concentration_score': 0.0,
+            'pump_dump_risk_score': 0.0,
+            'authority_risk_score': 0.0, # Note: has_authorities is boolean, not a score
+            'overlap_quality_score': 0.0,
+            'winner_wallet_density': 0.0
+        }
+        
+        return feature_dict
+
     async def analyze_token(self, mint: str) -> Dict[str, Any]:
         """
         Comprehensive token analysis.
@@ -995,6 +1080,7 @@ class AlphaTokenAnalyzer:
                 security_report["rugcheck"] = {
                     "rugged": rugcheck.get("rugged"),
                     "top1_holder_pct": rugcheck.get("top1_holder_pct"),
+                    "top_10_holders_pct": rugcheck.get("top_10_holders_pct"), # NEW
                     "holder_count": rugcheck.get("total_holders"),
                     "has_authorities": rugcheck.get("has_authorities"),
                     "creator_balance": rugcheck.get("creator_balance"),
@@ -1285,8 +1371,48 @@ class AlphaTokenAnalyzer:
             "dexscreener": dex_data # Embed Dexscreener data
         }
         
+        # --- ML PREDICTION (NEW) ---
+        # Run ML prediction only if the token is NOT being sent to monitoring
+        # (i.e., it passed all security AND has overlap)
+        ml_prediction_result = None
+        if not final_needs_monitoring:
+            try:
+                # Build the feature dictionary for the ML model
+                ml_input_data = self._build_ml_input(
+                    overlap_result=result, # Pass the partially built result
+                    security_report=security_report,
+                    dex_data=dex_data
+                )
+                
+                # Run prediction
+                # The threshold doesn't filter, it's just a default for the function
+                ml_prediction_result = self.ml_classifier.predict(
+                    ml_input_data, 
+                    threshold=0.70
+                )
+                
+            except Exception as e:
+                if self.debug:
+                    print(f"[TokenAnalyzer] ⚠️ ML prediction failed for {mint}: {e}")
+                ml_prediction_result = {
+                    'action': 'ERROR',
+                    'win_probability': 0.0,
+                    'confidence': 'NONE',
+                    'risk_tier': 'UNKNOWN',
+                }
+            
+            # Embed ML results into the final result
+            result["ml_prediction"] = {
+                "probability": ml_prediction_result.get("win_probability"),
+                "confidence": ml_prediction_result.get("confidence"),
+                "risk_tier": ml_prediction_result.get("risk_tier"),
+                "action": ml_prediction_result.get("action")
+            }
+        # --- END ML PREDICTION ---
+        
         if self.debug and not final_needs_monitoring:
-            print(f"[TokenAnalyzer] ✅ {mint} -> Grade: {grade}, Overlap: {overlap_count}, CLEARED for upload")
+            ml_prob = result.get("ml_prediction", {}).get("probability", 0.0)
+            print(f"[TokenAnalyzer] ✅ {mint} -> Grade: {grade}, Overlap: {overlap_count}, ML Prob: {ml_prob:.1%}, CLEARED for upload")
             
         return result
 
@@ -1411,7 +1537,7 @@ class WinnerMonitor:
             # Build entry for storage
             entry = {
                 "ts": datetime.now(timezone.utc).isoformat(),
-                "result": overlap_result,
+                "result": overlap_result, # This now contains 'ml_prediction'
                 "check_type": check_type,
                 "security": "passed"  # This is the "passed" status checked by Requirement 2
             }
@@ -1863,13 +1989,23 @@ async def main():
             debug=debug_mode
         )
 
+        # --- NEW: Initialize ML Classifier ---
+        try:
+            ml_classifier = SolanaMemeTokenClassifier(model_dir='models')
+        except Exception as e:
+            print(f"❌ CRITICAL: Failed to load ML models: {e}")
+            print("--- 💀 Winner Monitor Halted ---")
+            return
+        # --- END NEW ---
+
         token_analyzer = AlphaTokenAnalyzer(
             http_session=http_session,
             holder_agg=holder_agg,
             dune_cache=dune_cache,
             helius_limiter=helius_limiter,
             rugcheck_client=rugcheck_client,
-            dex_limiter=dex_limiter, # Pass new limiter
+            dex_limiter=dex_limiter,
+            ml_classifier=ml_classifier, # NEW: Inject classifier
             debug=debug_mode
         )
         
