@@ -2158,12 +2158,12 @@ class Monitor:
                 reasons.append(f"holder_count:{r.get('total_holders')}_req_5")
 
             # Rule 6: Check aggregated liquidity lock percentage (must be >= 95%)
-            if r.get("overall_lp_locked_pct", 0.0) < 5.0:
-                reasons.append(f"lp_locked:{r.get('overall_lp_locked_pct'):.1f}%_req_5%")
+            if r.get("overall_lp_locked_pct", 0.0) < 55.0:
+                reasons.append(f"lp_locked:{r.get('overall_lp_locked_pct'):.1f}%_req_55%")
 
             # Rule 7: Check aggregated total liquidity (must be >= $15,000)
-            if r.get("total_lp_usd", 0.0) < 100.0:
-                reasons.append(f"liquidity_usd:{r.get('total_lp_usd'):.2f}_req_100")
+            if r.get("total_lp_usd", 0.0) < 10000.0:
+                reasons.append(f"liquidity_usd:{r.get('total_lp_usd'):.2f}_req_10000")
 
         if reasons:
             if self.debug:
