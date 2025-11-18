@@ -47,7 +47,8 @@ from ml_predictor_v2 import SolanaMemeTokenClassifier
 load_dotenv()
 
 PROBATION_TOP_N = int(os.getenv("PROBATION_TOP_N", "3"))
-PROBATION_THRESHOLD_PCT = float(os.getenv("PROBATION_THRESHOLD_PCT", "90"))
+PROBATION_THRESHOLD_PCT = float(os.getenv("PROBATION_THRESHOLD_PCT", "40"))
+MAX_CREATOR_PCT = 20
 
 COINGECKO_PRO_API_KEY = os.environ.get("GECKO_API")
 DUNE_API_KEY = os.environ.get("DUNE_API_KEY")
@@ -2145,9 +2146,13 @@ class Monitor:
                 if r.get("mint_authority"): authorities.append("mint")
                 reasons.append(f"authorities:{','.join(authorities)}")
 
+            supply = r.get("token", {}).get("supply", 0)
+            decimals = r.get("token", {}).get("decimals", 0)
+            total_supply = supply / (10 ** decimals) if decimals > 0 else supply
+
             # Rule 3: Check creator token balance
-            if r.get("creator_balance", 0) > 0:
-                reasons.append(f"creator_balance:{r.get('creator_balance')}")
+            if r.get("creator_balance", 0)/total_supply *100 >  MAX_CREATOR_PCT:
+                reasons.append(f"creator_balance_pct:{r.get('creator_balance')/total_supply *100} ")
 
             # Rule 4: Check transfer fee (must be <= 5%)
             if r.get("transfer_fee_pct", 0) > 5:
@@ -2165,7 +2170,7 @@ class Monitor:
             if r.get("total_lp_usd", 0.0) < 10000.0:
                 reasons.append(f"liquidity_usd:{r.get('total_lp_usd'):.2f}_req_10000")
 
-        if reasons:
+        if reasons: 
             if self.debug:
                 print(f"[Security] {mint} FAILED pre-Helius check: {reasons}")
             overlap_result_stub = {"mint": mint, "grade": "NONE", "probation_meta": r.get("probation_meta")}
