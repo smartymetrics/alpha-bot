@@ -2158,13 +2158,13 @@ class Monitor:
             if r.get("transfer_fee_pct", 0) > 5:
                 reasons.append(f"transfer_fee:{r.get('transfer_fee_pct')}%")
 
-            # Rule 5: Check holder count (must be >= 5)
-            if r.get("total_holders", 0) < 5:
+            # Rule 5: Check holder count (must be >= 50)
+            if r.get("total_holders", 0) < 50:
                 reasons.append(f"holder_count:{r.get('total_holders')}_req_5")
 
-            # Rule 6: Check aggregated liquidity lock percentage (must be >= 95%)
-            if r.get("overall_lp_locked_pct", 0.0) < 55.0:
-                reasons.append(f"lp_locked:{r.get('overall_lp_locked_pct'):.1f}%_req_55%")
+            # Rule 6: Check aggregated liquidity lock percentage (must be >= 80%)
+            if r.get("overall_lp_locked_pct", 0.0) < 80.0:
+                reasons.append(f"lp_locked:{r.get('overall_lp_locked_pct'):.1f}%_req_80%")
 
             # Rule 7: Check aggregated total liquidity (must be >= $15,000)
             if r.get("total_lp_usd", 0.0) < 10000.0:

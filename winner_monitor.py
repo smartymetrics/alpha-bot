@@ -77,7 +77,7 @@ MIN_HOLDER_COUNT = 50
 MIN_LIQUIDITY_USD = 10000.0
 MIN_LP_LOCKED_PCT = 80.0 
 MAX_TRANSFER_FEE_PCT = 5
-MAX_CREATOR_BALANCE_PCT = 10.0 
+MAX_CREATOR_BALANCE_PCT = 20.0 
 
 # -----------------------------------------------
 # Re-usable Helpers
