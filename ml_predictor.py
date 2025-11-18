@@ -1,384 +1,533 @@
-#!/usr/bin/env python3
 """
-ml_predictor.py (V3 - Feature Compatible)
-
-Loads trained XGBoost model and predicts win probability.
-NOW INCLUDES NEW FEATURES: is_asia_prime, is_us_prime, etc.
+Production Inference Script for Solana Memecoin Classifier
+Fetches data from DexScreener and Rugcheck APIs in real-time
 """
 
-import joblib
-import json
-import os
 import pandas as pd
 import numpy as np
-from datetime import datetime, timezone
-import aiohttp
-import asyncio
+import joblib
+import json
+import requests
+from datetime import datetime
 import time
-from typing import Any, Dict, List, Optional, Set, Tuple, Callable
-from functools import wraps
+from typing import Dict, Optional
 import logging
 
-# --- Configuration ---
-MODEL_DIR = './models'
-MODEL_PATH = os.path.join(MODEL_DIR, 'xgboost_signal_classifier.pkl')
-ENCODERS_PATH = os.path.join(MODEL_DIR, 'label_encoders.pkl')
-FEATURES_PATH = os.path.join(MODEL_DIR, 'feature_names.json')
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# --- Logging ---
-log = logging.getLogger(__name__)
-if not log.handlers:
-    logging.basicConfig(level=logging.INFO)
 
-# --- Holiday API Logic (from collector.py) ---
-
-HOLIDAY_COUNTRY_CODES = "US,GB,DE,JP,SG,KR,CN,CA,AU".split(',')
-
-def async_ttl_cache(ttl_seconds: int):
-    """Decorator for async in-memory TTL caching."""
-    cache: Dict[Any, Tuple[Any, float]] = {}
-    lock = asyncio.Lock()
-
-    def decorator(func: Callable):
-        @wraps(func)
-        async def wrapper(*args, **kwargs):
-            key = (args, tuple(sorted(kwargs.items())))
-            now = time.monotonic()
-
-            async with lock:
-                if key in cache:
-                    result, expiry = cache[key]
-                    if now < expiry:
-                        return result
-                    del cache[key]
-
-            new_result = await func(*args, **kwargs)
-            async with lock:
-                cache[key] = (new_result, now + ttl_seconds)
-            return new_result
-        return wrapper
-    return decorator
-
-class BaseAPIClient:
-    def __init__(self, session: aiohttp.ClientSession, max_retries: int, name: str):
-        self.session = session
-        self.max_retries = max_retries
-        self.name = name
-
-    async def async_get(self, url: str, timeout: int) -> Optional[Dict]:
-        for attempt in range(self.max_retries):
-            try:
-                if not self.session or self.session.closed:
-                    log.error(f"[{self.name}] HTTP session is closed.")
-                    return None
-                    
-                async with self.session.get(url, timeout=timeout) as resp:
-                    if resp.status == 200:
-                        return await resp.json()
-                    if resp.status >= 500 or resp.status == 429:
-                        await asyncio.sleep(2 ** attempt)
-                    else:
-                        return None
-            except (asyncio.TimeoutError, aiohttp.ClientError) as e:
-                log.warning(f"[{self.name}] Request failed: {e}")
-            
-            if attempt < self.max_retries - 1:
-                await asyncio.sleep(2 ** attempt)
-        return None
-
-class HolidayClient(BaseAPIClient):
-    BASE_URL = "https://date.nager.at/api/v3"
-
-    def __init__(self, session: aiohttp.ClientSession, max_retries: int = 3):
-        super().__init__(session, max_retries, "HolidayAPI")
-        self.timeout = 5
-
-    @async_ttl_cache(ttl_seconds=3600 * 24)
-    async def _fetch_holidays_for_year(self, year: int, country_code: str) -> Set[str]:
-        url = f"{self.BASE_URL}/PublicHolidays/{year}/{country_code}"
-        data = await self.async_get(url, self.timeout)
-        if data and isinstance(data, list):
-            return {item['date'] for item in data if 'date' in item}
-        return set()
-
-    async def is_holiday(self, dt: datetime, country_codes: List[str]) -> bool:
-        date_str = dt.strftime('%Y-%m-%d')
-        year = dt.year
-        tasks = [self._fetch_holidays_for_year(year, code) for code in country_codes]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for res in results:
-            if isinstance(res, set) and date_str in res:
-                return True
-        return False
-
-# --- Load Model Artifacts ---
-try:
-    model = joblib.load(MODEL_PATH)
-    label_encoders = joblib.load(ENCODERS_PATH)
-    feature_list = json.load(open(FEATURES_PATH, 'r'))
-    log.info(f"✅ [ML_Predictor] Loaded model with {len(feature_list)} features")
-    log.info(f"   Categorical encoders: {list(label_encoders.keys())}")
-except Exception as e:
-    log.error(f"❌ [ML_Predictor] CRITICAL: Could not load model: {e}")
-    model = None
-    label_encoders = {}
-    feature_list = []
-
-def _safe_divide(a, b, default=0.0):
-    """Safe division with None handling."""
-    if a is None or b is None:
-        return default
-    try:
-        a_f = float(a)
-        b_f = float(b)
-        return a_f / b_f if b_f != 0 else default
-    except (ValueError, TypeError):
-        return default
-
-def _safe_float(val, default=0.0):
-    """Safely convert to float with None handling."""
-    if val is None:
-        return default
-    try:
-        return float(val)
-    except (ValueError, TypeError):
-        return default
-
-async def _prepare_features(
-    data_dict: dict, 
-    signal_source: str,
-    session: aiohttp.ClientSession
-) -> pd.DataFrame | None:
-    """
-    Converts raw token data into model features.
-    MUST match training script's feature engineering exactly!
-    """
-    if not model or not feature_list:
-        log.error("❌ Model not loaded")
-        return None
-
-    try:
-        features = {}
+class SolanaTokenPredictor:
+    def __init__(self, model_dir='models'):
+        """Load all models and preprocessing artifacts"""
+        logger.info("Loading models...")
+        self.selector = joblib.load(f'{model_dir}/feature_selector.pkl')
+        self.xgb_model = joblib.load(f'{model_dir}/xgboost_model.pkl')
+        self.lgb_model = joblib.load(f'{model_dir}/lightgbm_model.pkl')
+        self.cat_model = joblib.load(f'{model_dir}/catboost_model.pkl')
         
-        # === 1. TIMESTAMP ===
-        ts_str = data_dict.get('checked_at', data_dict.get('ts', datetime.now(timezone.utc).isoformat()))
-        dt = pd.to_datetime(ts_str).tz_convert(timezone.utc)
-        checked_at_timestamp = int(dt.timestamp())
+        with open(f'{model_dir}/model_metadata.json', 'r') as f:
+            self.metadata = json.load(f)
         
-        # === 2. TIME FEATURES ===
-        hour = dt.hour
-        features['time_of_day_utc'] = hour
-        features['day_of_week_utc'] = dt.dayofweek
-        features['is_weekend_utc'] = int(dt.dayofweek >= 5)
+        self.ensemble_weights = self.metadata['ensemble_weights']
+        self.selected_features = self.metadata['selected_features']
+        self.all_features = self.metadata['all_features']
         
-        # NEW: Regional prime time indicators
-        features['is_asia_prime'] = int(6 <= hour < 14)
-        features['is_us_prime'] = int(13 <= hour < 21)
-        features['is_eu_prime'] = int(8 <= hour < 16)
-        features['is_dead_hours'] = int(0 <= hour < 6)
+        logger.info(f"✅ Loaded {self.metadata['model_type']} model")
+        logger.info(f"   Test AUC: {self.metadata['performance']['test_auc']:.4f}")
+        logger.info(f"   Selected features: {len(self.selected_features)}")
+    
+    def fetch_dexscreener_data(self, mint: str) -> Optional[Dict]:
+        """Fetch token data from DexScreener API"""
+        url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
         
-        # Hour category
-        if 0 <= hour < 7:
-            features['hour_category'] = 'dead_hours'
-        elif 7 <= hour < 15:
-            features['hour_category'] = 'asia_hours'
-        elif 15 <= hour < 19:
-            features['hour_category'] = 'eu_hours'
-        else:
-            features['hour_category'] = 'us_hours'
-        
-        features['is_last_day_of_week'] = int(dt.dayofweek == 4)
-        
-        # === 3. HOLIDAY FEATURE ===
         try:
-            holiday_client = HolidayClient(session)
-            features['is_public_holiday_any'] = await holiday_client.is_holiday(dt, HOLIDAY_COUNTRY_CODES)
+            response = requests.get(url, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            
+            if not data.get('pairs') or len(data['pairs']) == 0:
+                logger.warning(f"No pairs found for {mint}")
+                return None
+            
+            # Get the first/main pair (usually highest liquidity)
+            pair = data['pairs'][0]
+            
+            return {
+                'price_usd': float(pair.get('priceUsd', 0)),
+                'liquidity_usd': float(pair.get('liquidity', {}).get('usd', 0)),
+                'volume_h24_usd': float(pair.get('volume', {}).get('h24', 0)),
+                'fdv_usd': float(pair.get('fdv', 0) or pair.get('marketCap', 0)),
+                'price_change_h24_pct': float(pair.get('priceChange', {}).get('h24', 0)),
+                'pair_created_at': pair.get('pairCreatedAt', 0),
+            }
         except Exception as e:
-            log.warning(f"Holiday check failed: {e}")
-            features['is_public_holiday_any'] = False
+            logger.error(f"Error fetching DexScreener data: {e}")
+            return None
+    
+    def fetch_rugcheck_data(self, mint: str) -> Optional[Dict]:
+        """Fetch security data from Rugcheck API"""
+        url = f"https://api.rugcheck.xyz/v1/tokens/{mint}/report"
         
-        # === 4. SIGNAL FEATURES ===
-        features['signal_source'] = signal_source
-        features['grade'] = data_dict.get('grade', 'NONE')
+        try:
+            response = requests.get(url, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            
+            # Extract key security metrics from the nested structure
+            token = data.get('token', {})
+            token_meta = token if isinstance(token, dict) else {}
+            
+            top_holders = data.get('topHolders', [])
+            markets = data.get('markets', [])
+            risks = data.get('risks', [])
+            
+            # Calculate top 10 holders percentage
+            top_10_pct = sum(h.get('pct', 0) for h in top_holders[:10])
+            
+            # Calculate total LP locked and liquidity from markets
+            total_lp_locked = 0
+            total_liquidity = 0
+            
+            for market in markets:
+                lp_data = market.get('lp', {})
+                total_lp_locked += lp_data.get('lpLockedUSD', 0)
+                
+                # Calculate liquidity from reserves
+                base_usd = lp_data.get('baseUSD', 0)
+                quote_usd = lp_data.get('quoteUSD', 0)
+                total_liquidity += (base_usd + quote_usd)
+            
+            # LP lock percentage
+            lp_locked_pct = (total_lp_locked / total_liquidity * 100) if total_liquidity > 0 else 0
+            
+            # Insider networks
+            insider_networks = data.get('insiderNetworks', []) or []
+            
+            # Calculate insider metrics safely
+            if insider_networks:
+                largest_network = max(n.get('size', 0) for n in insider_networks)
+                total_insider_tokens = sum(n.get('tokenAmount', 0) for n in insider_networks)
+            else:
+                largest_network = 0
+                total_insider_tokens = 0
+            
+            # Get token supply
+            token_supply = token_meta.get('supply', 0)
+            
+            # Creator balance
+            creator_balance = data.get('creatorBalance', 0)
+            creator_balance_pct = (float(creator_balance) / float(token_supply) * 100) if token_supply > 0 else 0
+            
+            return {
+                'creator_address': data.get('creator', 'UNKNOWN'),
+                'creator_balance_pct': creator_balance_pct,
+                'top_10_holders_pct': float(top_10_pct),
+                'total_lp_locked_usd': float(total_lp_locked),
+                'is_lp_locked_95_plus': int(lp_locked_pct >= 95),
+                'has_mint_authority': int(token_meta.get('mintAuthority') is not None),
+                'has_freeze_authority': int(token_meta.get('freezeAuthority') is not None),
+                'token_supply': float(token_supply),
+                'total_insider_networks': len(insider_networks),
+                'largest_insider_network_size': largest_network,
+                'total_insider_token_amount': total_insider_tokens,
+                'rugcheck_risks': risks,
+                'lp_locked_pct': lp_locked_pct,  # For debugging
+            }
+        except Exception as e:
+            logger.error(f"Error fetching Rugcheck data: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return None
+    
+    def calculate_pump_dump_risk(self, token_data: Dict) -> float:
+        """Calculate pump & dump risk score"""
+        risk_components = []
         
-        # === 5. MARKET FEATURES ===
-        raw_dex = data_dict.get('raw_dexscreener', data_dict.get('raw', {}))
-        if not isinstance(raw_dex, dict):
-            raw_dex = {}
+        # Insider risk
+        insider_size = token_data.get('largest_insider_network_size', 0)
+        if insider_size > 100:
+            risk_components.append(30)
+        elif insider_size > 50:
+            risk_components.append(20)
+        elif insider_size > 20:
+            risk_components.append(10)
         
-        features['fdv_usd'] = _safe_float(data_dict.get('fdv_usd', raw_dex.get('fdv')))
-        features['liquidity_usd'] = _safe_float(data_dict.get('liquidity_usd', data_dict.get('total_lp_usd')))
-        features['volume_h24_usd'] = _safe_float(
-            data_dict.get('volume_h24_usd', raw_dex.get('volume', {}).get('h24'))
+        # Top holder concentration risk
+        top_10 = token_data.get('top_10_holders_pct', 0)
+        top_1_pct = top_10 / 10  # Approximate top 1 holder
+        if top_1_pct > 30:
+            risk_components.append(25)
+        elif top_1_pct > 20:
+            risk_components.append(15)
+        elif top_1_pct > 10:
+            risk_components.append(8)
+        
+        # LP lock risk
+        is_locked = token_data.get('is_lp_locked_95_plus', 0)
+        if not is_locked:
+            lp_usd = token_data.get('total_lp_locked_usd', 0)
+            total_liq = token_data.get('liquidity_usd', 1)
+            lp_pct = (lp_usd / total_liq * 100) if total_liq > 0 else 0
+            
+            if lp_pct < 50:
+                risk_components.append(20)
+            elif lp_pct < 80:
+                risk_components.append(12)
+            elif lp_pct < 95:
+                risk_components.append(5)
+        
+        # Authority risk
+        has_mint = token_data.get('has_mint_authority', 0)
+        has_freeze = token_data.get('has_freeze_authority', 0)
+        auth_score = (50 if has_mint else 0) + (50 if has_freeze else 0)
+        risk_components.append(min(auth_score / 100 * 15, 15))
+        
+        # Creator risk
+        creator_pct = token_data.get('creator_balance_pct', 0)
+        token_age_hours = token_data.get('token_age_hours', 0)
+        creator_dumped = (creator_pct == 0) and (token_age_hours < 24)
+        
+        if creator_dumped:
+            risk_components.append(10)
+        elif creator_pct > 10:
+            risk_components.append(7)
+        elif creator_pct > 5:
+            risk_components.append(4)
+        
+        return sum(risk_components)
+    
+    def engineer_features(self, raw_data: Dict) -> Dict:
+        """Engineer all features from raw API data"""
+        now = datetime.utcnow()
+        
+        # === TIME FEATURES ===
+        pair_created_ms = raw_data.get('pair_created_at', 0)
+        if pair_created_ms:
+            pair_created_ts = pair_created_ms / 1000
+            token_age_seconds = time.time() - pair_created_ts
+        else:
+            token_age_seconds = 0
+        
+        token_age_hours = token_age_seconds / 3600
+        
+        features = {
+            # Core time features
+            'token_age_at_signal_seconds': token_age_seconds,
+            'token_age_hours': token_age_hours,
+            'time_of_day_utc': now.hour,
+            'day_of_week_utc': now.weekday(),
+            'is_weekend_utc': int(now.weekday() >= 5),
+            'is_public_holiday_any': 0,  # Would need holiday API
+            
+            # Time-based derived features
+            'is_ultra_fresh': int(token_age_hours < 1),
+            'is_very_fresh': int(token_age_hours < 4),
+            'is_fresh': int(token_age_hours < 12),
+            'freshness_score': np.exp(-token_age_hours / 6),
+            'age_penalty': 1 / (1 + token_age_hours),
+            
+            # Trading session indicators
+            'asian_hours': int(0 <= now.hour < 8),
+            'european_hours': int(8 <= now.hour < 16),
+            'us_hours': int(16 <= now.hour < 24),
+            'peak_hours': int(14 <= now.hour <= 20),
+            'off_peak_day': int(now.weekday() >= 5),
+        }
+        
+        # === MARKET DATA ===
+        price = raw_data.get('price_usd', 0)
+        liquidity = raw_data.get('liquidity_usd', 0)
+        volume = raw_data.get('volume_h24_usd', 0)
+        fdv = raw_data.get('fdv_usd', 0)
+        price_change = raw_data.get('price_change_h24_pct', 0)
+        
+        features.update({
+            'price_usd': price,
+            'liquidity_usd': liquidity,
+            'volume_h24_usd': volume,
+            'fdv_usd': fdv,
+            'price_change_h24_pct': price_change,
+            
+            # Log transforms
+            'log_liquidity': np.log1p(liquidity),
+            'log_volume': np.log1p(volume),
+            'log_fdv': np.log1p(fdv),
+        })
+        
+        # === RATIOS ===
+        features['volume_to_liquidity_ratio'] = volume / liquidity if liquidity > 0 else 0
+        features['fdv_to_liquidity_ratio'] = fdv / liquidity if liquidity > 0 else 0
+        features['liquidity_to_volume_ratio'] = liquidity / volume if volume > 0 else 0
+        features['liquidity_depth_pct'] = (liquidity / fdv * 100) if fdv > 0 else 0
+        features['volume_efficiency'] = volume / fdv if fdv > 0 else 0
+        features['market_efficiency'] = (features['volume_to_liquidity_ratio'] / features['liquidity_to_volume_ratio']) if features['liquidity_to_volume_ratio'] > 0 else features['volume_to_liquidity_ratio']
+        features['liquidity_coverage'] = liquidity / volume if volume > 0 else 0
+        
+        # === SECURITY DATA ===
+        creator_pct = raw_data.get('creator_balance_pct', 0)
+        top_10_pct = raw_data.get('top_10_holders_pct', 0)
+        lp_locked = raw_data.get('total_lp_locked_usd', 0)
+        token_supply = raw_data.get('token_supply', 0)
+        
+        features.update({
+            'creator_address': raw_data.get('creator_address', 'UNKNOWN'),
+            'creator_balance_pct': creator_pct,
+            'top_10_holders_pct': top_10_pct,
+            'total_lp_locked_usd': lp_locked,
+            'is_lp_locked_95_plus': raw_data.get('is_lp_locked_95_plus', 0),
+            'token_supply': token_supply,
+            'log_lp_locked': np.log1p(lp_locked),
+        })
+        
+        # LP lock quality
+        features['lp_lock_quality'] = (lp_locked / liquidity * 100) if liquidity > 0 else 0
+        
+        # === HOLDER FEATURES ===
+        features.update({
+            'holder_quality_score': 100 - top_10_pct,
+            'extreme_concentration': int(top_10_pct > 60),
+            'whale_dominated': int(top_10_pct > 70),
+            'creator_dumped': int((creator_pct < 1) and (token_age_hours < 24)),
+            'creator_holds_significant': int(creator_pct > 10),
+            'concentration_risk': top_10_pct * 0.5 + creator_pct * 0.3,
+        })
+        
+        # === INSIDER FEATURES ===
+        total_networks = raw_data.get('total_insider_networks', 0)
+        largest_network = raw_data.get('largest_insider_network_size', 0)
+        total_insider_tokens = raw_data.get('total_insider_token_amount', 0)
+        
+        features.update({
+            'total_insider_networks': total_networks,
+            'largest_insider_network_size': largest_network,
+            'total_insider_token_amount': total_insider_tokens,
+        })
+        
+        # 🔴 KEY DERIVED INSIDER FEATURES
+        features['insider_supply_pct'] = (total_insider_tokens / token_supply * 100) if token_supply > 0 else 0
+        features['avg_insider_network_size'] = largest_network / total_networks if total_networks > 0 else 0
+        features['insider_density'] = total_insider_tokens / total_networks if total_networks > 0 else 0
+        features['insider_risk_composite'] = (
+            features['insider_supply_pct'] * 0.4 +
+            largest_network * 0.3 +
+            (total_networks * 2) * 0.3
         )
-        features['price_change_h24_pct'] = _safe_float(
-            data_dict.get('price_change_h24_pct', raw_dex.get('priceChange', {}).get('h24'))
+        
+        # Update concentration risk to include insiders
+        features['concentration_risk'] = (
+            top_10_pct * 0.5 +
+            creator_pct * 0.3 +
+            features['insider_supply_pct'] * 0.2
         )
         
-        # === 6. SECURITY FEATURES ===
-        raw_rug = data_dict.get('raw_rugcheck', data_dict.get('raw', {}))
-        if not isinstance(raw_rug, dict):
-            raw_rug = {}
-        
-        features['has_mint_authority'] = int(data_dict.get('has_mint_authority', data_dict.get('mint_authority') is not None))
-        features['has_freeze_authority'] = int(data_dict.get('has_freeze_authority', data_dict.get('freeze_authority') is not None))
-        features['creator_balance_pct'] = _safe_float(data_dict.get('creator_balance_pct'))
-        features['top_10_holders_pct'] = _safe_float(data_dict.get('top_10_holders_pct'))
-        
-        lp_locked_pct = _safe_float(data_dict.get('lp_locked_pct', data_dict.get('overall_lp_locked_pct')))
-        features['is_lp_locked_95_plus'] = int(lp_locked_pct >= 95.0)
-        
-        markets = (raw_rug.get('data') or raw_rug.get('raw') or {}).get('markets', [])
-        features['total_lp_locked_usd'] = sum(m.get('lp', {}).get('lpLockedUSD', 0) for m in markets)
-        
-        features['rugcheck_risk_level'] = (data_dict.get('probation_meta') or {}).get('level', 'unknown')
-        
-        # === 7. TOKEN AGE ===
-        token_age_seconds = None
-        block_time = data_dict.get('block_time')
-        pair_created_at = raw_dex.get('pairCreatedAt')
-        
-        if block_time:
-            token_age_seconds = max(0, checked_at_timestamp - int(block_time))
-        elif pair_created_at:
-            token_age_seconds = max(0, checked_at_timestamp - int(pair_created_at / 1000))
-        
-        features['token_age_at_signal_seconds'] = token_age_seconds if token_age_seconds is not None else 100000
-        features['is_new_token'] = int((token_age_seconds or 100000) < 43200)
-        
-        # === 8. SMART MONEY FEATURES ===
-        overlap_count = _safe_float(data_dict.get('overlap_count'))
-        weighted_concentration = _safe_float(data_dict.get('weighted_concentration'))
-        total_winner_wallets = _safe_float(data_dict.get('total_winner_wallets'), 1.0)
-        holder_count = _safe_float(data_dict.get('holder_count', data_dict.get('total_holders')), 1.0)
-        
-        features['overlap_quality_score'] = _safe_divide(
-            overlap_count * weighted_concentration, total_winner_wallets
-        )
-        features['winner_wallet_density'] = _safe_divide(overlap_count, holder_count)
-        
-        # === 9. DERIVED MARKET FEATURES ===
-        features['volume_to_liquidity_ratio'] = _safe_divide(
-            features['volume_h24_usd'], features['liquidity_usd']
-        )
-        features['fdv_to_liquidity_ratio'] = _safe_divide(
-            features['fdv_usd'], features['liquidity_usd']
+        # === RISK SCORES ===
+        features['pump_dump_risk_score'] = self.calculate_pump_dump_risk(raw_data)
+        features['liquidity_risk_score'] = (100 - features['lp_lock_quality']) * 0.5 if features['is_lp_locked_95_plus'] == 0 else 0
+        features['insider_holder_risk'] = (
+            features['insider_risk_composite'] * 0.5 +
+            features['concentration_risk'] * 0.5
         )
         
-        # === 10. RISK FEATURES ===
-        top1_pct = _safe_float(data_dict.get('top1_holder_pct'))
-        top10_pct = features['top_10_holders_pct']
-        features['whale_concentration_score'] = (
-            (top1_pct * 3) + (top10_pct - top1_pct) if top10_pct >= top1_pct else top1_pct * 3
+        # === MARKET HEALTH ===
+        features['market_health_score'] = (
+            (features['liquidity_depth_pct'] / 100) * 30 +
+            (features['lp_lock_quality'] / 100) * 30 +
+            (features['holder_quality_score'] / 100) * 20 +
+            (features['volume_efficiency'] * 100) * 20
         )
         
-        transfer_fee = _safe_float(data_dict.get('transfer_fee_pct'))
-        features['authority_risk_score'] = (
-            (50 if features['has_mint_authority'] else 0) +
-            (50 if features['has_freeze_authority'] else 0) +
-            (transfer_fee * 100 if transfer_fee else 0)
-        )
+        # === MOMENTUM FEATURES ===
+        features.update({
+            'strong_uptrend': int(price_change > 50),
+            'moderate_uptrend': int(20 < price_change <= 50),
+            'weak_momentum': int(price_change < 10),
+            'volume_quality': volume / (1 + abs(price_change)) if price_change != 0 else volume,
+        })
         
-        features['creator_dumped'] = int(
-            (features['creator_balance_pct'] == 0) and 
-            (features['token_age_at_signal_seconds'] < 86400)
-        )
+        return features
+    
+    def predict(self, mint: str, threshold: float = 0.70) -> Dict:
+        """
+        Predict if token will reach 50% gain
         
-        # Pump dump risk score
-        insider_networks = (raw_rug.get('data') or raw_rug.get('raw') or {}).get('insiderNetworks', [])
-        largest_insider_network_size = max((n.get('size', 0) for n in insider_networks), default=0)
+        Args:
+            mint: Token mint address
+            threshold: Probability threshold for BUY signal (default 0.70)
         
-        pump_dump_score = 0
-        if largest_insider_network_size > 100: pump_dump_score += 30
-        elif largest_insider_network_size > 50: pump_dump_score += 20
-        elif largest_insider_network_size > 20: pump_dump_score += 10
+        Returns:
+            dict with prediction, probability, and recommendation
+        """
+        logger.info(f"Analyzing token: {mint}")
         
-        if top1_pct > 30: pump_dump_score += 25
-        elif top1_pct > 20: pump_dump_score += 15
-        elif top1_pct > 10: pump_dump_score += 8
+        # Fetch data from APIs
+        logger.info("Fetching DexScreener data...")
+        dex_data = self.fetch_dexscreener_data(mint)
+        if not dex_data:
+            return {'error': 'Could not fetch DexScreener data'}
         
-        if lp_locked_pct < 50: pump_dump_score += 20
-        elif lp_locked_pct < 80: pump_dump_score += 12
-        elif lp_locked_pct < 95: pump_dump_score += 5
+        logger.info("Fetching Rugcheck data...")
+        rug_data = self.fetch_rugcheck_data(mint)
+        if not rug_data:
+            return {'error': 'Could not fetch Rugcheck data'}
         
-        pump_dump_score += min(features['authority_risk_score'] / 100 * 15, 15)
+        # Combine data
+        raw_data = {**dex_data, **rug_data}
         
-        if features['creator_dumped']: pump_dump_score += 10
-        elif features['creator_balance_pct'] > 10: pump_dump_score += 7
-        elif features['creator_balance_pct'] > 5: pump_dump_score += 4
+        # Engineer features
+        logger.info("Engineering features...")
+        features = self.engineer_features(raw_data)
         
-        features['pump_dump_risk_score'] = pump_dump_score
-        
-        # === 11. INTERACTION FEATURES (NEW) ===
-        features['high_risk_combo'] = int(
-            (pump_dump_score > 30) and (features['authority_risk_score'] > 15)
-        )
-        features['critical_signal_quality'] = int(
-            (features['grade'] == 'CRITICAL') and (signal_source == 'alpha')
-        )
-        
-        # === 12. ENCODE CATEGORICAL FEATURES ===
-        for col in label_encoders:
-            if col in features:
-                le = label_encoders[col]
-                val = str(features[col])
-                if val not in le.classes_:
-                    val = le.classes_[0]
-                features[col] = le.transform([val])[0]
-        
-        # === 13. CREATE DATAFRAME ===
+        # Create DataFrame with all features
         df = pd.DataFrame([features])
         
-        # Add missing features with defaults
-        for col in feature_list:
-            if col not in df.columns:
-                if col in label_encoders:
-                    df[col] = label_encoders[col].transform([label_encoders[col].classes_[0]])[0]
-                elif any(k in col for k in ['pct', 'usd', 'score', 'ratio']):
-                    df[col] = 0.0
-                elif any(k in col for k in ['is_', 'has_']):
-                    df[col] = 0
-                else:
-                    df[col] = 0
+        # Ensure all expected features exist
+        for feat in self.all_features:
+            if feat not in df.columns:
+                df[feat] = 0
         
-        # Return in exact feature order
-        return df[feature_list]
+        # Select features in correct order
+        X = df[self.all_features]
         
-    except Exception as e:
-        log.error(f"❌ Failed to prepare features: {e}", exc_info=True)
-        return None
+        # Apply feature selection (returns DataFrame with selected features)
+        X_selected = self.selector.transform(X)
+        
+        # Convert back to DataFrame with selected feature names for models
+        X_selected_df = pd.DataFrame(
+            X_selected, 
+            columns=self.selected_features
+        )
+        
+        # Get predictions from all models (now with proper feature names)
+        xgb_proba = self.xgb_model.predict_proba(X_selected_df)[0, 1]
+        lgb_proba = self.lgb_model.predict_proba(X_selected_df)[0, 1]
+        cat_proba = self.cat_model.predict_proba(X_selected_df)[0, 1]
+        
+        # Ensemble prediction
+        ensemble_proba = (
+            self.ensemble_weights['catboost'] * cat_proba +
+            self.ensemble_weights['lightgbm'] * lgb_proba +
+            self.ensemble_weights['xgboost'] * xgb_proba
+        )
+        
+        # Decision logic
+        if ensemble_proba >= threshold:
+            action = "BUY"
+            confidence = "HIGH"
+            risk_tier = "LOW RISK"
+        elif ensemble_proba >= 0.60:
+            action = "CONSIDER"
+            confidence = "MEDIUM"
+            risk_tier = "MEDIUM RISK"
+        elif ensemble_proba >= 0.45:
+            action = "SKIP"
+            confidence = "LOW"
+            risk_tier = "HIGH RISK"
+        else:
+            action = "AVOID"
+            confidence = "VERY LOW"
+            risk_tier = "VERY HIGH RISK"
+        
+        # Model agreement score
+        model_predictions = [xgb_proba, lgb_proba, cat_proba]
+        agreement = 1 - (np.std(model_predictions) / np.mean(model_predictions)) if np.mean(model_predictions) > 0 else 0
+        
+        return {
+            'mint': mint,
+            'action': action,
+            'win_probability': float(ensemble_proba),
+            'confidence': confidence,
+            'risk_tier': risk_tier,
+            'model_agreement': float(agreement),
+            'individual_predictions': {
+                'xgboost': float(xgb_proba),
+                'lightgbm': float(lgb_proba),
+                'catboost': float(cat_proba)
+            },
+            'key_metrics': {
+                'token_age_hours': float(features.get('token_age_hours', 0)),
+                'liquidity_usd': float(raw_data.get('liquidity_usd', 0)),
+                'volume_h24_usd': float(raw_data.get('volume_h24_usd', 0)),
+                'price_change_h24_pct': float(raw_data.get('price_change_h24_pct', 0)),
+                'insider_supply_pct': float(features.get('insider_supply_pct', 0)),
+                'top_10_holders_pct': float(raw_data.get('top_10_holders_pct', 0)),
+                'pump_dump_risk_score': float(features.get('pump_dump_risk_score', 0)),
+                'market_health_score': float(features.get('market_health_score', 0)),
+            },
+            'warnings': self._generate_warnings(features, raw_data)
+        }
+    
+    def _generate_warnings(self, features: Dict, raw_data: Dict) -> list:
+        """Generate warning messages based on risk factors"""
+        warnings = []
+        
+        if features.get('pump_dump_risk_score', 0) > 50:
+            warnings.append("⚠️ HIGH pump & dump risk detected")
+        
+        if features.get('insider_supply_pct', 0) > 20:
+            warnings.append("🔴 Insiders control >20% of supply")
+        
+        if raw_data.get('top_10_holders_pct', 0) > 70:
+            warnings.append("⚠️ Extreme holder concentration (whale risk)")
+        
+        if raw_data.get('is_lp_locked_95_plus', 0) == 0:
+            warnings.append("⚠️ Liquidity not sufficiently locked")
+        
+        if features.get('token_age_hours', 0) > 48:
+            warnings.append("⏰ Token is >48h old (momentum may have passed)")
+        
+        if raw_data.get('liquidity_usd', 0) < 10000:
+            warnings.append("💧 Low liquidity (<$10k)")
+        
+        # Only warn about creator dump if it's NOT a very fresh token (<2h)
+        # Fresh Pump.Fun tokens often have 0% creator balance by design
+        if features.get('creator_dumped', 0) == 1 and features.get('token_age_hours', 0) > 2:
+            warnings.append("🚨 Creator appears to have dumped")
+        
+        return warnings
 
-async def predict_token_win_probability(
-    data_dict: dict,
-    signal_source: str,
-    session: aiohttp.ClientSession
-) -> float | None:
-    """
-    Main prediction function.
+
+# Example usage
+if __name__ == "__main__":
+    import sys
     
-    Args:
-        data_dict: Token data from monitor
-        signal_source: 'discovery' or 'alpha'
-        session: aiohttp session
+    predictor = SolanaTokenPredictor()
+    
+    # Get mint from command line or use example
+    if len(sys.argv) > 1:
+        mint_address = sys.argv[1]
+    else:
+        # Example mint (replace with actual)
+        mint_address = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"  # USDC as example
+        print(f"No mint provided, using example: {mint_address}")
+    
+    # Get prediction
+    result = predictor.predict(mint_address, threshold=0.70)
+    
+    if 'error' in result:
+        print(f"\n❌ Error: {result['error']}")
+    else:
+        print("\n" + "="*80)
+        print("🎯 PREDICTION RESULT")
+        print("="*80)
+        print(f"\nMint: {result['mint']}")
+        print(f"\n🎲 Action: {result['action']}")
+        print(f"📊 Win Probability: {result['win_probability']:.1%}")
+        print(f"🎯 Confidence: {result['confidence']}")
+        print(f"⚠️  Risk Tier: {result['risk_tier']}")
+        print(f"🤝 Model Agreement: {result['model_agreement']:.1%}")
         
-    Returns:
-        Win probability [0.0-1.0] or None on failure
-    """
-    if not model:
-        return None
-    
-    features_df = await _prepare_features(data_dict, signal_source, session)
-    
-    if features_df is None:
-        return None
-    
-    try:
-        probabilities = model.predict_proba(features_df)
-        win_probability = float(probabilities[0][1])
+        print(f"\n📈 Key Metrics:")
+        for key, value in result['key_metrics'].items():
+            print(f"   • {key}: {value:.2f}")
         
-        log.debug(f"[ML_Predictor] P(win)={win_probability:.3f} for {signal_source} signal")
-        return win_probability
+        print(f"\n🤖 Individual Model Predictions:")
+        for model, prob in result['individual_predictions'].items():
+            print(f"   • {model:10s}: {prob:.1%}")
         
-    except Exception as e:
-        log.error(f"❌ Prediction failed: {e}", exc_info=True)
-        return None
+        if result['warnings']:
+            print(f"\n⚠️  Warnings:")
+            for warning in result['warnings']:
+                print(f"   {warning}")
+        
+        print("\n" + "="*80)

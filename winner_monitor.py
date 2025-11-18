@@ -51,8 +51,7 @@ from token_monitor import (
     calculate_overlap_grade,
     evaluate_probation_from_rugcheck
 )
-# --- NEW ML IMPORT ---
-from ml_predictor_v2 import SolanaMemeTokenClassifier
+from ml_predictor import SolanaTokenPredictor
 
 load_dotenv()
 
@@ -818,7 +817,7 @@ class AlphaTokenAnalyzer:
         helius_limiter: AsyncRateLimiter,
         rugcheck_client: RugCheckClient,
         dex_limiter: AsyncRateLimiter, # Add new limiter
-        ml_classifier: SolanaMemeTokenClassifier, # NEW: ML Classifier
+        ml_classifier: SolanaTokenPredictor, 
         debug: bool = False
     ):
         self.http_session = http_session
@@ -834,32 +833,31 @@ class AlphaTokenAnalyzer:
             print("[TokenAnalyzer] Initialized.")
 
     async def _run_rugcheck_check(self, mint: str) -> Dict[str, Any]:
-        """Check token security using RugCheck API."""
-        result = await self.rugcheck_client.get_token_report(mint)
-        
-        if not result.get("ok"):
-            if self.debug:
-                print(f"[TokenAnalyzer] ⚠️ RugCheck failed for {mint}: {result.get('error')}")
-            return result
-        
-        data = result.get("data", {})
-        
-        probation_result = evaluate_probation_from_rugcheck(
-            data, top_n=PROBATION_TOP_N, threshold_pct=PROBATION_THRESHOLD_PCT
-        )
-        
-        top_n_pct = probation_result.get("top_n_pct", 0)
-        if top_n_pct > 150.0:
-            if self.debug:
-                print(f"[RugCheck] ⚠️ {mint} - SUSPICIOUS DATA: Top {probation_result.get('top_n')} holders = {top_n_pct:.2f}%")
-        
-        elif self.debug and probation_result.get("probation"):
-            print(f"[RugCheck] {mint} - Probation triggered!")
-            print(f"[RugCheck] {mint} - {probation_result.get('explanation')}")
-        
+        """
+        Check token security using RugCheck API with comprehensive risk analysis.
+        FIXED: Handle zero supply edge case
+        """
+        url = f"https://api.rugcheck.xyz/v1/tokens/{mint}/report"
+        session = self.http_session
+        async with self._api_sema:
+            try:
+                async with session.get(url, timeout=30) as resp:
+                    if resp.status != 200:
+                        text = await resp.text()
+                        return {"ok": False, "error": f"rugcheck_status_{resp.status}", "error_text": text}
+                    data = await resp.json()
+            except asyncio.TimeoutError:
+                return {"ok": False, "error": "rugcheck_timeout", "error_text": "API call timed out after 30s"}
+            except Exception as e:
+                return {"ok": False, "error": "rugcheck_exception", "error_text": f"{type(e).__name__}: {str(e)}"}
+
+        # Extract key security metrics
+        probation_result = evaluate_probation_from_rugcheck(data)
+
         top_holders = data.get("topHolders", [])
         rugged = data.get("rugged", False)
         
+        # Authorities and Creator Balance
         freeze_authority = data.get("freezeAuthority")
         mint_authority = data.get("mintAuthority")
         has_authorities = bool(freeze_authority or mint_authority)
@@ -870,54 +868,60 @@ class AlphaTokenAnalyzer:
         if isinstance(creator_balance_raw, dict):
             creator_balance_pct = float(creator_balance_raw.get('pct', 0.0) or 0.0)
         # if it's an int (like 0) or None, pct is 0.0
-        creator_balance = creator_balance_pct # Store the float percentage
+        creator_balance = creator_balance_pct
 
         transfer_fee_pct = data.get("transferFee", {}).get("pct", 0)
-
-        total_holders = data.get("totalHolders", 0)
         
-        # --- MODIFIED: Get Top 1 and Top 10 pct ---
+        # Holder metrics
+        total_holders = data.get("totalHolders", 0)
         top1_holder_pct = top_holders[0].get("pct", 0) if top_holders else 0.0
         top_10_holders_pct = sum(h.get("pct", 0) for h in top_holders[:10])
-        # --- End Modification ---
 
+        # --- Liquidity Aggregation ---
         markets = data.get("markets", [])
         total_lp_locked_usd = 0.0
         total_lp_usd = 0.0
+        lp_lock_details = []
 
         for market in markets:
             lp_data = market.get("lp", {})
             if lp_data:
-                # Ensure the values are treated as numbers
-                lp_locked_usd = float(lp_data.get("lpLockedUSD") or 0.0)
-                lp_unlocked_usd = float(lp_data.get("lpUnlocked") or 0.0)
+                lp_locked_usd = float(lp_data.get("lpLockedUSD", 0))
+                lp_unlocked_usd = float(lp_data.get("lpUnlocked", 0))
+                
                 lp_total_usd_market = lp_locked_usd + lp_unlocked_usd
                 
-                # Check for locked status for this market
-                market_lp_locked_pct = (lp_locked_usd / lp_total_usd_market * 100) if lp_total_usd_market > 0 else 0.0
-                
-                # Only count markets with sufficient lock towards totals? No, let's keep all
                 total_lp_locked_usd += lp_locked_usd
                 total_lp_usd += lp_total_usd_market
+                
+                lp_lock_details.append({
+                    "market_type": market.get("marketType"),
+                    "locked_usd": lp_locked_usd,
+                    "total_usd": lp_total_usd_market,
+                    "locked_pct": lp_data.get("lpLockedPct", 0)
+                })
         
         overall_lp_locked_pct = (total_lp_locked_usd / total_lp_usd * 100) if total_lp_usd > 0 else 0.0
+        lp_lock_sufficient = overall_lp_locked_pct >= 95.0
 
         return {
             "ok": True,
             "rugged": rugged,
             "total_holders": total_holders,
             "top1_holder_pct": top1_holder_pct,
-            "top_10_holders_pct": top_10_holders_pct, # NEW: Add this
+            "top_10_holders_pct": top_10_holders_pct,
             "creator_balance": creator_balance,
             "freeze_authority": freeze_authority,
             "mint_authority": mint_authority,
             "has_authorities": has_authorities,
             "transfer_fee_pct": transfer_fee_pct,
             "total_lp_usd": total_lp_usd,
+            "total_lp_locked_usd": total_lp_locked_usd,
             "overall_lp_locked_pct": overall_lp_locked_pct,
-            "lp_lock_sufficient": overall_lp_locked_pct >= MIN_LP_LOCKED_PCT,
+            "lp_lock_sufficient": lp_lock_sufficient,
             "probation": probation_result["probation"],
             "probation_meta": probation_result,
+            "lp_lock_details": lp_lock_details,
             "raw": data
         }
 
@@ -1051,8 +1055,7 @@ class AlphaTokenAnalyzer:
     async def analyze_token(self, mint: str) -> Dict[str, Any]:
         """
         Comprehensive token analysis.
-        If RugCheck fails OR probation=True OR security requirements fail, returns immediately without checking overlap.
-        Failed tokens enter 24h monitoring loop and are NOT uploaded to Supabase.
+        FIXED: Handle zero supply edge case in security requirements check
         """
         if self.debug:
             print(f"[TokenAnalyzer] 🔬 Analyzing token: {mint}")
@@ -1080,7 +1083,7 @@ class AlphaTokenAnalyzer:
                 security_report["rugcheck"] = {
                     "rugged": rugcheck.get("rugged"),
                     "top1_holder_pct": rugcheck.get("top1_holder_pct"),
-                    "top_10_holders_pct": rugcheck.get("top_10_holders_pct"), # NEW
+                    "top_10_holders_pct": rugcheck.get("top_10_holders_pct"),
                     "holder_count": rugcheck.get("total_holders"),
                     "has_authorities": rugcheck.get("has_authorities"),
                     "creator_balance": rugcheck.get("creator_balance"),
@@ -1102,7 +1105,7 @@ class AlphaTokenAnalyzer:
 
         # --- PRE-OVERLAP SECURITY GATE ---
         
-        # 2. CHECK RUGCHECK API SUCCESS - RETURN IMMEDIATELY IF FAILED
+        # 2. CHECK RUGCHECK API SUCCESS
         if security_report["rugcheck_passed"] is False:
             if self.debug:
                 print(f"[TokenAnalyzer] ⚠️ RugCheck API failed for {mint} - SKIPPING overlap check")
@@ -1117,7 +1120,7 @@ class AlphaTokenAnalyzer:
                 "grade": "NONE",
                 "overlap_wallets_sample": [],
                 "security": security_report,
-                "needs_monitoring": True, # Keep in memory for recheck
+                "needs_monitoring": True,
                 "skip_reason": "rugcheck_api_failed"
             }
         
@@ -1136,7 +1139,7 @@ class AlphaTokenAnalyzer:
                 "grade": "NONE",
                 "overlap_wallets_sample": [],
                 "security": security_report,
-                "needs_monitoring": True, # Keep in memory for recheck
+                "needs_monitoring": True,
                 "skip_reason": "rugged"
             }
         
@@ -1156,11 +1159,12 @@ class AlphaTokenAnalyzer:
                 "grade": "NONE",
                 "overlap_wallets_sample": [],
                 "security": security_report,
-                "needs_monitoring": True, # Keep in memory for recheck
+                "needs_monitoring": True,
                 "skip_reason": "probation"
             }
         
-        # 5. CHECK MINIMUM SECURITY REQUIREMENTS (User-Requested Filtering)
+        # 5. CHECK MINIMUM SECURITY REQUIREMENTS
+        # *** FIXED: Handle zero supply edge case ***
         rugcheck_details = security_report.get("rugcheck", {})
         security_failures = []
         
@@ -1168,13 +1172,31 @@ class AlphaTokenAnalyzer:
         if rugcheck_details.get("has_authorities"):
             security_failures.append("has_active_authorities")
         
-        supply = rugcheck_details.get("token", {}).get("supply", 0)
-        decimals = rugcheck_details.get("token", {}).get("decimals", 0)
-        total_supply = supply / (10 ** decimals) if decimals > 0 else supply
-
-        # Check for creator balance percentage
-        if rugcheck_details.get("creator_balance", 0) / total_supply * 100 > MAX_CREATOR_BALANCE_PCT:
-            security_failures.append(f"creator_balance_pct:{rugcheck_details.get('creator_balance')/ total_supply * 100}_req_{MAX_CREATOR_BALANCE_PCT}%")
+        # *** FIX: Get supply and decimals from raw data safely ***
+        raw_data = security_report.get("rugcheck_raw", {}).get("raw", {})
+        token_data = raw_data.get("token", {})
+        
+        supply = token_data.get("supply", 0)
+        decimals = token_data.get("decimals", 0)
+        
+        # Calculate total supply with zero check
+        total_supply = 0
+        if supply and decimals:
+            try:
+                total_supply = supply / (10 ** decimals)
+            except (ZeroDivisionError, ValueError, TypeError):
+                total_supply = 0
+        
+        # Check for creator balance percentage (FIXED: safe division)
+        creator_balance_raw = rugcheck_details.get("creator_balance", 0)
+        if total_supply > 0:
+            creator_balance_pct = (creator_balance_raw / total_supply) * 100
+            if creator_balance_pct > MAX_CREATOR_BALANCE_PCT:
+                security_failures.append(f"creator_balance_pct:{creator_balance_pct:.2f}_req_{MAX_CREATOR_BALANCE_PCT}%")
+        else:
+            # If total_supply is 0, consider it suspicious
+            if creator_balance_raw > 0:
+                security_failures.append(f"invalid_supply:creator_has_balance_but_supply_is_zero")
         
         # Check transfer fee (must be low)
         if rugcheck_details.get("transfer_fee_pct", 0) > MAX_TRANSFER_FEE_PCT:
@@ -1183,11 +1205,11 @@ class AlphaTokenAnalyzer:
         # Check holder count
         if rugcheck_details.get("holder_count", 0) < MIN_HOLDER_COUNT:
             security_failures.append(f"holder_count:{rugcheck_details.get('holder_count')}_req_{MIN_HOLDER_COUNT}")
-             
+            
         # Check LP lock percentage
         if rugcheck_details.get("lp_locked_pct", 0) < MIN_LP_LOCKED_PCT:
             security_failures.append(f"lp_locked:{rugcheck_details.get('lp_locked_pct')}%_req_{MIN_LP_LOCKED_PCT}%")
-             
+            
         # Check total liquidity USD
         if rugcheck_details.get("total_liquidity_usd", 0) < MIN_LIQUIDITY_USD:
             security_failures.append(f"liquidity_usd:{rugcheck_details.get('total_liquidity_usd'):.2f}_req_{MIN_LIQUIDITY_USD:.0f}")
@@ -1208,11 +1230,11 @@ class AlphaTokenAnalyzer:
                 "grade": "NONE",
                 "overlap_wallets_sample": [],
                 "security": security_report,
-                "needs_monitoring": True, # Keep in memory for recheck
+                "needs_monitoring": True,
                 "skip_reason": "security_requirements_failed",
                 "security_failures": security_failures
             }
-        
+            
         # --- END PRE-OVERLAP SECURITY GATE ---
         
         # 6. ONLY IF ALL RUGCHECK REQUIREMENTS PASS, PROCEED WITH OVERLAP CHECK
@@ -2020,7 +2042,7 @@ async def main():
 
         # --- NEW: Initialize ML Classifier ---
         try:
-            ml_classifier = SolanaMemeTokenClassifier(model_dir='models')
+            ml_classifier = SolanaTokenPredictor(model_dir='models')
         except Exception as e:
             print(f"❌ CRITICAL: Failed to load ML models: {e}")
             print("--- 💀 Winner Monitor Halted ---")

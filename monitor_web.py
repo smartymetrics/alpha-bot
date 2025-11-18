@@ -38,12 +38,25 @@ from wallet import (
     get_holdings_paginated       
 )
 
+# import the predictor script
+from ml_predictor import SolanaTokenPredictor
+
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+# Initialize the predictor globally (loads models once at startup)
+try:
+    ml_predictor = SolanaTokenPredictor(model_dir='models')
+    ML_PREDICTOR_AVAILABLE = True
+    logger.info("✅ ML Predictor loaded successfully")
+except Exception as e:
+    ml_predictor = None
+    ML_PREDICTOR_AVAILABLE = False
+    logger.warning(f"⚠️ ML Predictor not available: {e}")
 
 # Track service status
 service_status = {
@@ -53,7 +66,10 @@ service_status = {
     "winner_monitor_running": False,
     "error": None,
     "wallet_requests": 0,
-    "last_wallet_request": None
+    "last_wallet_request": None,
+    "ml_predictor_available": ML_PREDICTOR_AVAILABLE,  
+    "ml_predictions": 0,  
+    "last_ml_prediction": None 
 }
 
 async def run_monitor():
@@ -959,3 +975,257 @@ if __name__ == "__main__":
         port=port,
         log_level="info"
     )
+
+# ==================== ML PREDICTOR ENDPOINTS ====================
+
+@app.get("/token/{mint}/predict")
+async def predict_token(
+    mint: str,
+    threshold: float = Query(0.70, ge=0.0, le=1.0, description="Probability threshold for BUY signal")
+):
+    """
+    Predict if a token will reach 50% gain using ML model
+    
+    - **mint**: Token mint address
+    - **threshold**: Probability threshold for BUY recommendation (default 0.70)
+    
+    Returns:
+    - action: BUY/CONSIDER/SKIP/AVOID
+    - win_probability: Probability of 50%+ gain (0-1)
+    - confidence: HIGH/MEDIUM/LOW/VERY LOW
+    - risk_tier: Risk assessment
+    - key_metrics: Important token metrics
+    - warnings: List of risk warnings
+    """
+    if not ML_PREDICTOR_AVAILABLE:
+        raise HTTPException(
+            status_code=503, 
+            detail="ML Predictor service not available. Ensure models are trained and saved in 'models/' directory."
+        )
+    
+    try:
+        logger.info(f"ML prediction request for token: {mint[:8]}... (threshold: {threshold})")
+        service_status["ml_predictions"] += 1
+        service_status["last_ml_prediction"] = datetime.utcnow().isoformat()
+        
+        # Run prediction in thread pool to avoid blocking
+        result = await asyncio.to_thread(
+            ml_predictor.predict,
+            mint,
+            threshold
+        )
+        
+        # Check if prediction failed
+        if 'error' in result:
+            raise HTTPException(status_code=500, detail=result['error'])
+        
+        return {
+            "mint": mint,
+            "timestamp": datetime.utcnow().isoformat(),
+            "prediction": result,
+            "model_info": {
+                "test_auc": ml_predictor.metadata['performance']['test_auc'],
+                "cv_auc": ml_predictor.metadata['performance']['cv_auc_mean'],
+                "features_used": len(ml_predictor.selected_features),
+                "trained_at": ml_predictor.metadata['trained_at']
+            }
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error during ML prediction: {e}")
+        raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
+
+
+@app.post("/token/predict/batch")
+async def predict_tokens_batch(
+    mints: list[str],
+    threshold: float = Query(0.70, ge=0.0, le=1.0, description="Probability threshold for BUY signal")
+):
+    """
+    Predict multiple tokens at once (max 10)
+    
+    - **mints**: List of token mint addresses (max 10)
+    - **threshold**: Probability threshold for BUY recommendation
+    
+    Returns predictions for all tokens
+    """
+    if not ML_PREDICTOR_AVAILABLE:
+        raise HTTPException(
+            status_code=503, 
+            detail="ML Predictor service not available"
+        )
+    
+    if len(mints) > 10:
+        raise HTTPException(
+            status_code=400, 
+            detail="Maximum 10 tokens per batch request"
+        )
+    
+    try:
+        logger.info(f"Batch ML prediction request for {len(mints)} tokens")
+        service_status["ml_predictions"] += len(mints)
+        service_status["last_ml_prediction"] = datetime.utcnow().isoformat()
+        
+        # Run predictions concurrently
+        tasks = [
+            asyncio.to_thread(ml_predictor.predict, mint, threshold)
+            for mint in mints
+        ]
+        
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Process results
+        predictions = []
+        for mint, result in zip(mints, results):
+            if isinstance(result, Exception):
+                predictions.append({
+                    "mint": mint,
+                    "error": str(result),
+                    "success": False
+                })
+            elif 'error' in result:
+                predictions.append({
+                    "mint": mint,
+                    "error": result['error'],
+                    "success": False
+                })
+            else:
+                predictions.append({
+                    "mint": mint,
+                    "prediction": result,
+                    "success": True
+                })
+        
+        # Summary statistics
+        successful = sum(1 for p in predictions if p.get('success', False))
+        buy_signals = sum(
+            1 for p in predictions 
+            if p.get('success') and p['prediction']['action'] == 'BUY'
+        )
+        
+        return {
+            "timestamp": datetime.utcnow().isoformat(),
+            "total_tokens": len(mints),
+            "successful_predictions": successful,
+            "failed_predictions": len(mints) - successful,
+            "buy_signals": buy_signals,
+            "predictions": predictions
+        }
+        
+    except Exception as e:
+        logger.error(f"Error during batch prediction: {e}")
+        raise HTTPException(status_code=500, detail=f"Batch prediction failed: {str(e)}")
+
+
+@app.get("/ml/status")
+async def ml_predictor_status():
+    """
+    Get ML predictor service status and model information
+    """
+    if not ML_PREDICTOR_AVAILABLE:
+        return {
+            "available": False,
+            "message": "ML Predictor not loaded. Ensure models are trained and saved."
+        }
+    
+    return {
+        "available": True,
+        "model_info": {
+            "type": ml_predictor.metadata['model_type'],
+            "trained_at": ml_predictor.metadata['trained_at'],
+            "training_samples": ml_predictor.metadata['training_samples'],
+            "test_samples": ml_predictor.metadata['test_samples'],
+            "features_total": len(ml_predictor.metadata['all_features']),
+            "features_selected": len(ml_predictor.metadata['selected_features']),
+        },
+        "performance": {
+            "test_auc": ml_predictor.metadata['performance']['test_auc'],
+            "cv_auc_mean": ml_predictor.metadata['performance']['cv_auc_mean'],
+            "cv_auc_std": ml_predictor.metadata['performance']['cv_auc_std'],
+        },
+        "ensemble_weights": ml_predictor.metadata['ensemble_weights'],
+        "usage_stats": {
+            "total_predictions": service_status["ml_predictions"],
+            "last_prediction": service_status["last_ml_prediction"]
+        }
+    }
+
+
+@app.get("/ml/features")
+async def get_model_features():
+    """
+    Get list of features used by the ML model
+    """
+    if not ML_PREDICTOR_AVAILABLE:
+        raise HTTPException(
+            status_code=503, 
+            detail="ML Predictor not available"
+        )
+    
+    # Get feature importance if available
+    feature_importance = ml_predictor.metadata.get('feature_importance', {})
+    
+    # Sort by importance
+    features_sorted = sorted(
+        feature_importance.items(),
+        key=lambda x: x[1],
+        reverse=True
+    )
+    
+    return {
+        "total_features": len(ml_predictor.metadata['all_features']),
+        "selected_features": len(ml_predictor.metadata['selected_features']),
+        "core_features": ml_predictor.metadata.get('core_features', []),
+        "derived_features": ml_predictor.metadata.get('derived_features', []),
+        "top_10_important_features": [
+            {"name": name, "importance": importance}
+            for name, importance in features_sorted[:10]
+        ],
+        "all_selected_features": ml_predictor.metadata['selected_features']
+    }
+
+
+# Update the root endpoint to include ML predictor info
+# Modify the existing @app.get("/") endpoint:
+
+@app.get("/")
+async def root():
+    """Root endpoint"""
+    return {
+        "service": "Token Monitor & Wallet PnL Service with ML Predictor",
+        "status": "running" if service_status["monitor_running"] else "stopped",
+        "uptime_start": service_status["started_at"],
+        "features": [
+            "24/7 Token Monitoring",
+            "Wallet PnL Analysis",
+            "Behavioral Metrics",
+            "Phishing Detection",
+            "ML-Powered Token Prediction"  # ADD THIS
+        ],
+        "endpoints": {
+            "monitor": ["/health", "/status"],
+            "wallet_analysis": [
+                "/wallet/{address}/pnl",
+                "/wallet/{address}/behavior",
+                "/wallet/{address}/full-analysis",
+                "/wallet/{address}/distribution",
+                "/wallet/{address}/tokens",
+                "/wallet/{address}/token-pnl",
+                "/wallet/{address}/trades",
+                "/wallet/{address}/holdings",
+                "/wallet/{address}/overall-analysis"
+            ],
+            "ml_predictor": [  # ADD THIS
+                "/token/{mint}/predict",
+                "/token/predict/batch",
+                "/ml/status",
+                "/ml/features"
+            ]
+        },
+        "ml_predictor_status": {
+            "available": ML_PREDICTOR_AVAILABLE,
+            "total_predictions": service_status["ml_predictions"]
+        }
+    }

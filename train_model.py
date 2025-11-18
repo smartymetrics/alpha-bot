@@ -27,11 +27,11 @@ os.makedirs('models', exist_ok=True)
 os.makedirs('outputs', exist_ok=True)
 
 print("="*80)
-print("🚀 ADVANCED SOLANA MEMECOIN SIGNAL CLASSIFIER V2")
+print("🚀 FOCUSED SOLANA MEMECOIN CLASSIFIER - PRODUCTION READY")
 print("="*80)
 
 # ============================================================================
-# LOAD AND INITIAL DATA INSPECTION
+# LOAD DATA
 # ============================================================================
 
 df = pd.read_csv('data/token_datasets.csv')
@@ -42,219 +42,306 @@ df['target'] = (df['label_status'] == 'win').astype(int)
 print(f"🎯 Overall Win rate: {df['target'].mean()*100:.2f}%")
 
 # ============================================================================
-# CRITICAL FIX 1: Filter by Token Age
+# FOCUSED FEATURE ENGINEERING
 # ============================================================================
 
 print("\n" + "="*80)
-print("🔧 FIX 1: FILTERING BY TOKEN AGE")
+print("🔧 FEATURE ENGINEERING - PRODUCTION FOCUSED")
 print("="*80)
 
-# MAX_TOKEN_AGE_HOURS = 24
-# df_filtered = df[df['token_age_at_signal_seconds'] < (MAX_TOKEN_AGE_HOURS * 3600)].copy()
-
-# print(f"\n✅ Filtered to tokens < {MAX_TOKEN_AGE_HOURS}h old:")
-# print(f"   Before: {len(df)} samples")
-# print(f"   After:  {len(df_filtered)} samples ({len(df_filtered)/len(df)*100:.1f}%)")
-# print(f"   Win rate after filtering: {df_filtered['target'].mean()*100:.2f}%")
-
-# df = df_filtered
-
-# ============================================================================
-# ADVANCED FEATURE ENGINEERING (New Ideas Integrated!)
-# ============================================================================
-
-print("\n" + "="*80)
-print("🔧 FIX 2: ADVANCED FEATURE ENGINEERING")
-print("="*80)
-
-# Basic transformations
+# === TIME FEATURES ===
 df['token_age_hours'] = df['token_age_at_signal_seconds'] / 3600
-df['token_age_hours_capped'] = df['token_age_hours'].clip(0, 24)
-df['is_ultra_fresh'] = (df['token_age_at_signal_seconds'] < 3600).astype(int)
+df['token_age_minutes'] = df['token_age_at_signal_seconds'] / 60
 
-# Log transforms for skewed features
+# Token freshness categories
+df['is_ultra_fresh'] = (df['token_age_hours'] < 1).astype(int)  # < 1 hour
+df['is_very_fresh'] = (df['token_age_hours'] < 4).astype(int)   # < 4 hours
+df['is_fresh'] = (df['token_age_hours'] < 12).astype(int)        # < 12 hours
+
+# Time decay features (exponential)
+df['freshness_score'] = np.exp(-df['token_age_hours'] / 6)  # Half-life of 6 hours
+df['age_penalty'] = 1 / (1 + df['token_age_hours'])
+
+# === DERIVED INSIDER FEATURES ===
+print("📊 Creating insider-related features...")
+
+# Insider concentration (what % of supply do insiders control?)
+df['insider_supply_pct'] = np.where(
+    df['token_supply'] > 0,
+    (df['total_insider_token_amount'] / df['token_supply']) * 100,
+    0
+)
+
+# Insider per network average
+df['avg_insider_network_size'] = np.where(
+    df['total_insider_networks'] > 0,
+    df['largest_insider_network_size'] / df['total_insider_networks'],
+    0
+)
+
+# Insider density score (how concentrated are insiders?)
+df['insider_density'] = np.where(
+    df['total_insider_networks'] > 0,
+    df['total_insider_token_amount'] / df['total_insider_networks'],
+    0
+)
+
+# Combined insider risk
+df['insider_risk_composite'] = (
+    df['insider_supply_pct'] * 0.4 +
+    df['largest_insider_network_size'] * 0.3 +
+    (df['total_insider_networks'] * 2) * 0.3  # Scale networks to similar range
+)
+
+# === LIQUIDITY & VOLUME FEATURES ===
+print("💧 Creating liquidity/volume features...")
+
+# Log transforms for skewed distributions
 df['log_liquidity'] = np.log1p(df['liquidity_usd'])
 df['log_volume'] = np.log1p(df['volume_h24_usd'])
 df['log_fdv'] = np.log1p(df['fdv_usd'])
+df['log_lp_locked'] = np.log1p(df['total_lp_locked_usd'])
 
-# Basic ratios
-df['volume_to_liquidity_ratio'] = np.where(
-    df['liquidity_usd'] > 0,
-    df['volume_h24_usd'] / df['liquidity_usd'],
-    0
-)
-
-df['fdv_to_liquidity_ratio'] = np.where(
-    df['liquidity_usd'] > 0,
-    df['fdv_usd'] / df['liquidity_usd'],
-    0
-)
-
-# Risk signals
-df['high_risk_signal'] = (
-    (df['pump_dump_risk_score'] > 30) & 
-    (df['authority_risk_score'] > 15)
-).astype(int)
-
-df['premium_signal'] = (
-    (df['grade'] == 'CRITICAL') & 
-    (df['signal_source'] == 'alpha')
-).astype(int)
-
-df['extreme_concentration'] = (df['top_10_holders_pct'] > 60).astype(int)
-
-print("✅ Basic features created")
-
-# ============================================================================
-# 🆕 NEW ADVANCED FEATURES (Your Ideas!)
-# ============================================================================
-
-print("\n🆕 Creating Advanced Composite Features...")
-
-# 1. Liquidity per holder (distribution efficiency)
-df['liquidity_per_holder'] = np.where(
-    df['top_10_holders_pct'] > 0,
-    df['liquidity_usd'] / (df['top_10_holders_pct'] / 10),  # Approximate holder count
-    0
-)
-
-# 2. Smart money composite score (combines two signals)
-df['smart_money_score'] = (
-    df['overlap_quality_score'] * df['winner_wallet_density']
-)
-
-# 3. Risk-adjusted volume (volume quality, not just quantity)
-df['risk_adjusted_volume'] = np.where(
-    df['pump_dump_risk_score'] > 0,
-    df['volume_h24_usd'] / (1 + df['pump_dump_risk_score']),
-    df['volume_h24_usd']
-)
-
-# 4. Liquidity velocity (how active is the liquidity pool?)
-df['liquidity_velocity'] = np.where(
-    df['liquidity_usd'] > 0,
-    df['volume_h24_usd'] / df['liquidity_usd'],
-    0
-)
-
-# 5. Holder quality score (less concentration = better)
-df['holder_quality_score'] = 100 - df['top_10_holders_pct']
-
-# 6. Market efficiency ratio (balanced market indicator)
-df['market_efficiency'] = np.where(
-    (df['liquidity_usd'] > 0) & (df['fdv_usd'] > 0),
-    (df['volume_h24_usd'] / df['liquidity_usd']) / (df['fdv_usd'] / df['liquidity_usd']),
-    0
-)
-
-# 7. Risk-weighted smart money (smart money score adjusted for risk)
-df['risk_weighted_smart_money'] = np.where(
-    df['pump_dump_risk_score'] + df['authority_risk_score'] > 0,
-    df['smart_money_score'] / (1 + df['pump_dump_risk_score'] + df['authority_risk_score']),
-    df['smart_money_score']
-)
-
-# 8. Concentration risk score (combines multiple risk factors)
-df['concentration_risk'] = (
-    df['top_10_holders_pct'] * 0.4 +
-    df['creator_balance_pct'] * 0.3 +
-    df['whale_concentration_score'] * 0.3
-)
-
-# 9. Liquidity depth indicator (is there enough liquidity?)
-df['liquidity_depth_score'] = np.where(
+# Liquidity depth (is there enough liquidity relative to FDV?)
+df['liquidity_depth_pct'] = np.where(
     df['fdv_usd'] > 0,
     (df['liquidity_usd'] / df['fdv_usd']) * 100,
     0
 )
 
-# 10. Time-weighted freshness (exponential decay for token age)
-df['freshness_score'] = np.exp(-df['token_age_hours'] / 6)  # Half-life of 6 hours
+# LP lock quality score
+df['lp_lock_quality'] = np.where(
+    df['liquidity_usd'] > 0,
+    (df['total_lp_locked_usd'] / df['liquidity_usd']) * 100,
+    0
+)
 
-print(f"✅ Created 10 advanced composite features")
+# Volume efficiency (volume relative to market cap)
+df['volume_efficiency'] = np.where(
+    df['fdv_usd'] > 0,
+    df['volume_h24_usd'] / df['fdv_usd'],
+    0
+)
+
+# === HOLDER CONCENTRATION FEATURES ===
+print("👥 Creating holder concentration features...")
+
+# Holder quality (inverse of concentration)
+df['holder_quality_score'] = 100 - df['top_10_holders_pct']
+
+# Extreme concentration flags
+df['extreme_concentration'] = (df['top_10_holders_pct'] > 60).astype(int)
+df['whale_dominated'] = (df['top_10_holders_pct'] > 70).astype(int)
+
+# Creator risk assessment
+df['creator_dumped'] = ((df['creator_balance_pct'] < 1) & (df['token_age_hours'] < 24)).astype(int)
+df['creator_holds_significant'] = (df['creator_balance_pct'] > 10).astype(int)
+
+# Combined concentration risk
+df['concentration_risk'] = (
+    df['top_10_holders_pct'] * 0.5 +
+    df['creator_balance_pct'] * 0.3 +
+    df['insider_supply_pct'] * 0.2
+)
+
+# === RISK COMPOSITE FEATURES ===
+print("⚠️ Creating composite risk scores...")
+
+# Liquidity risk (not enough locked LP)
+df['liquidity_risk_score'] = np.where(
+    df['is_lp_locked_95_plus'] == 0,
+    (100 - df['lp_lock_quality']) * 0.5,
+    0
+)
+
+# Insider + Holder combined risk
+df['insider_holder_risk'] = (
+    df['insider_risk_composite'] * 0.5 +
+    df['concentration_risk'] * 0.5
+)
+
+# Market health score (combines multiple positive signals)
+df['market_health_score'] = (
+    (df['liquidity_depth_pct'] / 100) * 30 +  # Good liquidity depth
+    (df['lp_lock_quality'] / 100) * 30 +      # Good LP lock
+    (df['holder_quality_score'] / 100) * 20 + # Good distribution
+    (df['volume_efficiency'] * 100) * 20      # Good volume
+)
+
+# === MOMENTUM & PRICE ACTION ===
+print("📈 Creating momentum features...")
+
+# Price momentum categories
+df['strong_uptrend'] = (df['price_change_h24_pct'] > 50).astype(int)
+df['moderate_uptrend'] = ((df['price_change_h24_pct'] > 20) & (df['price_change_h24_pct'] <= 50)).astype(int)
+df['weak_momentum'] = (df['price_change_h24_pct'] < 10).astype(int)
+
+# Price-adjusted volume (is volume real or just price moving?)
+df['volume_quality'] = np.where(
+    abs(df['price_change_h24_pct']) > 0,
+    df['volume_h24_usd'] / (1 + abs(df['price_change_h24_pct'])),
+    df['volume_h24_usd']
+)
+
+# === RATIO INTERACTIONS ===
+print("🔄 Creating ratio interactions...")
+
+# Efficiency score (combines both ratios)
+df['market_efficiency'] = np.where(
+    df['liquidity_to_volume_ratio'] > 0,
+    df['volume_to_liquidity_ratio'] / df['liquidity_to_volume_ratio'],
+    df['volume_to_liquidity_ratio']
+)
+
+# Liquidity coverage (can liquidity handle the volume?)
+df['liquidity_coverage'] = np.where(
+    df['volume_h24_usd'] > 0,
+    df['liquidity_usd'] / df['volume_h24_usd'],
+    0
+)
+
+# === TIME-BASED PATTERNS ===
+print("🕐 Creating time-based features...")
+
+# Trading session indicators
+df['asian_hours'] = ((df['time_of_day_utc'] >= 0) & (df['time_of_day_utc'] < 8)).astype(int)
+df['european_hours'] = ((df['time_of_day_utc'] >= 8) & (df['time_of_day_utc'] < 16)).astype(int)
+df['us_hours'] = ((df['time_of_day_utc'] >= 16) & (df['time_of_day_utc'] < 24)).astype(int)
+
+# Peak trading time
+df['peak_hours'] = ((df['time_of_day_utc'] >= 14) & (df['time_of_day_utc'] <= 20)).astype(int)
+
+# Weekend/holiday combined
+df['off_peak_day'] = (df['is_weekend_utc'] | df['is_public_holiday_any']).astype(int)
+
+print("✅ Feature engineering complete!")
 
 # ============================================================================
 # COMPREHENSIVE FEATURE LIST
 # ============================================================================
 
-NUMERIC_FEATURES = [
-    # Market fundamentals (log-transformed)
-    'log_liquidity',
-    'log_volume',
-    'log_fdv',
+CORE_FEATURES = [
+    # === ORIGINAL REQUESTED FEATURES ===
     'price_change_h24_pct',
-    
-    # Raw market features
-    'liquidity_usd',
-    'volume_h24_usd',
-    'fdv_usd',
-    
-    # Security/Risk
+    'volume_to_liquidity_ratio',
+    'fdv_to_liquidity_ratio',
+    'liquidity_to_volume_ratio',
     'creator_balance_pct',
     'top_10_holders_pct',
     'total_lp_locked_usd',
-    'whale_concentration_score',
+    'is_lp_locked_95_plus',
+    'total_insider_networks',
+    'largest_insider_network_size',
+    'total_insider_token_amount',
     'pump_dump_risk_score',
-    'authority_risk_score',
-    
-    # Smart money
-    'overlap_quality_score',
-    'winner_wallet_density',
-    
-    # Basic derived metrics
-    'volume_to_liquidity_ratio',
-    'fdv_to_liquidity_ratio',
-    'token_age_hours_capped',
+    'time_of_day_utc',
+    'day_of_week_utc',
+    'is_weekend_utc',
+    'is_public_holiday_any',
+    'token_age_at_signal_seconds',
+]
+
+DERIVED_FEATURES = [
+    # === TIME FEATURES ===
+    'token_age_hours',
     'is_ultra_fresh',
-    'high_risk_signal',
-    'extreme_concentration',
-    'premium_signal',
-    
-    # 🆕 ADVANCED COMPOSITE FEATURES
-    'liquidity_per_holder',
-    'smart_money_score',
-    'risk_adjusted_volume',
-    'liquidity_velocity',
-    'holder_quality_score',
-    'market_efficiency',
-    'risk_weighted_smart_money',
-    'concentration_risk',
-    'liquidity_depth_score',
+    'is_very_fresh',
+    'is_fresh',
     'freshness_score',
+    'age_penalty',
+    
+    # === INSIDER FEATURES ===
+    'insider_supply_pct',              # 🆕 KEY METRIC
+    'avg_insider_network_size',
+    'insider_density',
+    'insider_risk_composite',
+    
+    # === LIQUIDITY FEATURES ===
+    'log_liquidity',
+    'log_volume',
+    'log_fdv',
+    'log_lp_locked',
+    'liquidity_depth_pct',
+    'lp_lock_quality',
+    'volume_efficiency',
+    
+    # === HOLDER FEATURES ===
+    'holder_quality_score',
+    'extreme_concentration',
+    'whale_dominated',
+    'creator_dumped',
+    'creator_holds_significant',
+    'concentration_risk',
+    
+    # === RISK FEATURES ===
+    'liquidity_risk_score',
+    'insider_holder_risk',
+    'market_health_score',
+    
+    # === MOMENTUM FEATURES ===
+    'strong_uptrend',
+    'moderate_uptrend',
+    'weak_momentum',
+    'volume_quality',
+    
+    # === RATIO INTERACTIONS ===
+    'market_efficiency',
+    'liquidity_coverage',
+    
+    # === TIME PATTERNS ===
+    'asian_hours',
+    'european_hours',
+    'us_hours',
+    'peak_hours',
+    'off_peak_day',
 ]
 
-CATEGORICAL_FEATURES = [
-    'signal_source',
-    'grade',
+# Add raw market metrics that might be useful
+MARKET_FUNDAMENTALS = [
+    'liquidity_usd',
+    'volume_h24_usd',
+    'fdv_usd',
+    'token_supply',
 ]
 
-ALL_FEATURES = NUMERIC_FEATURES + CATEGORICAL_FEATURES
+ALL_FEATURES = CORE_FEATURES + DERIVED_FEATURES + MARKET_FUNDAMENTALS
 
-print(f"\n📋 Total Features: {len(ALL_FEATURES)}")
-print(f"   - {len(NUMERIC_FEATURES)} numeric (including 10 new advanced features)")
-print(f"   - {len(CATEGORICAL_FEATURES)} categorical")
+print(f"\n📋 Feature Summary:")
+print(f"   • Core features (requested): {len(CORE_FEATURES)}")
+print(f"   • Derived features: {len(DERIVED_FEATURES)}")
+print(f"   • Market fundamentals: {len(MARKET_FUNDAMENTALS)}")
+print(f"   • TOTAL: {len(ALL_FEATURES)}")
 
 # Handle missing values
-for col in NUMERIC_FEATURES:
+for col in ALL_FEATURES:
     if col in df.columns:
         df[col] = df[col].fillna(0)
     else:
-        print(f"⚠️  Creating missing column: {col}")
+        print(f"⚠️ Creating missing column: {col}")
         df[col] = 0
 
-for col in CATEGORICAL_FEATURES:
-    if col in df.columns:
-        df[col] = df[col].fillna('UNKNOWN')
-    else:
-        print(f"⚠️  Creating missing column: {col}")
-        df[col] = 'UNKNOWN'
-
 # ============================================================================
-# STRATIFIED TRAIN/TEST SPLIT
+# OPTIONAL: FILTER BY TOKEN AGE
 # ============================================================================
 
 print("\n" + "="*80)
-print("🔧 FIX 3: STRATIFIED TRAIN/TEST SPLIT")
+print("🔍 DATA FILTERING")
+print("="*80)
+
+# Uncomment to filter by token age
+# MAX_TOKEN_AGE_HOURS = 24
+# df = df[df['token_age_hours'] <= MAX_TOKEN_AGE_HOURS].copy()
+# print(f"✅ Filtered to tokens <= {MAX_TOKEN_AGE_HOURS}h old: {len(df)} samples")
+
+print(f"📊 Using all data: {len(df)} samples")
+print(f"   Token age range: {df['token_age_hours'].min():.1f}h to {df['token_age_hours'].max():.1f}h")
+
+# ============================================================================
+# TRAIN/TEST SPLIT
+# ============================================================================
+
+print("\n" + "="*80)
+print("📊 STRATIFIED TRAIN/TEST SPLIT")
 print("="*80)
 
 train_df, test_df = train_test_split(
@@ -274,47 +361,31 @@ X_test = test_df[ALL_FEATURES].copy()
 y_test = test_df['target'].copy()
 
 # ============================================================================
-# LABEL ENCODING
+# FEATURE SELECTION
 # ============================================================================
 
 print("\n" + "="*80)
-print("📝 ENCODING CATEGORICAL FEATURES")
+print("🎯 FEATURE SELECTION")
 print("="*80)
 
-X_train_encoded = X_train.copy()
-X_test_encoded = X_test.copy()
-
-label_encoders = {}
-for col in CATEGORICAL_FEATURES:
-    le = LabelEncoder()
-    X_train_encoded[col] = le.fit_transform(X_train_encoded[col].astype(str))
-    X_test_encoded[col] = le.transform(X_test_encoded[col].astype(str))
-    label_encoders[col] = le
-    print(f"  ✓ Encoded {col}: {list(le.classes_)}")
-
-# ============================================================================
-# ADVANCED FEATURE SELECTION (Try k=12 for stronger signals)
-# ============================================================================
-
-print("\n" + "="*80)
-print("🔧 FIX 4: ADVANCED FEATURE SELECTION (k=12)")
-print("="*80)
-
-# Test both k=12 and k=15 to see which is better
-k_values = [12, 15]
+# Test different k values
+k_values = [15, 20, 25, 30]
 best_k = None
 best_cv_score = 0
 
 print("\n📊 Testing different k values...")
 
 for k in k_values:
-    selector = SelectKBest(f_classif, k=k)
-    X_train_selected = selector.fit_transform(X_train_encoded, y_train)
+    selector = SelectKBest(f_classif, k=min(k, len(ALL_FEATURES)))
+    X_train_selected = selector.fit_transform(X_train, y_train)
     
-    # Quick CV test
+    # Quick CV test with XGBoost
     temp_model = xgb.XGBClassifier(
-        max_depth=3, learning_rate=0.05, n_estimators=30,
-        random_state=42, eval_metric='auc'
+        max_depth=3, 
+        learning_rate=0.05, 
+        n_estimators=30,
+        random_state=42, 
+        eval_metric='auc'
     )
     
     skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
@@ -337,51 +408,50 @@ for k in k_values:
 
 print(f"\n✅ Best k value: {best_k} (CV AUC: {best_cv_score:.4f})")
 
-# Use best k for final feature selection
+# Apply best k
 selector_f = SelectKBest(f_classif, k=best_k)
-X_train_selected = selector_f.fit_transform(X_train_encoded, y_train)
-X_test_selected = selector_f.transform(X_test_encoded)
+X_train_selected = selector_f.fit_transform(X_train, y_train)
+X_test_selected = selector_f.transform(X_test)
 
 # Get selected features
 f_scores = selector_f.scores_
 f_selected_mask = selector_f.get_support()
 selected_features = [ALL_FEATURES[i] for i in range(len(ALL_FEATURES)) if f_selected_mask[i]]
 
-print(f"\n📊 Top {best_k} Selected Features (F-statistic):")
+print(f"\n📊 Top {best_k} Selected Features:")
 feature_scores = list(zip(ALL_FEATURES, f_scores))
 feature_scores.sort(key=lambda x: x[1] if not np.isnan(x[1]) else -1, reverse=True)
 
 for i, (feat, score) in enumerate(feature_scores[:best_k], 1):
     selected = "✓" if feat in selected_features else " "
-    score_str = f"{score:8.2f}" if not np.isnan(score) else "     nan"
-    is_new = "🆕" if feat in [
-        'liquidity_per_holder', 'smart_money_score', 'risk_adjusted_volume',
-        'liquidity_velocity', 'holder_quality_score', 'market_efficiency',
-        'risk_weighted_smart_money', 'concentration_risk', 
-        'liquidity_depth_score', 'freshness_score'
-    ] else "  "
-    print(f"  {selected} {is_new} {i:2d}. {feat:40s} | F-score: {score_str}")
+    score_str = f"{score:10.2f}" if not np.isnan(score) else "       nan"
+    
+    # Mark key features
+    is_insider = "🔴" if 'insider' in feat.lower() else "  "
+    is_derived = "🆕" if feat in DERIVED_FEATURES else "  "
+    
+    print(f"  {selected} {is_insider}{is_derived} {i:2d}. {feat:45s} | F-score: {score_str}")
 
 # ============================================================================
-# TRAINING WITH ENSEMBLE STRATEGY
+# TRAIN ENSEMBLE MODELS
 # ============================================================================
 
 print("\n" + "="*80)
-print("🔧 FIX 5: TRAINING ENSEMBLE MODELS")
+print("🚀 TRAINING ENSEMBLE MODELS")
 print("="*80)
 
 scale_pos_weight = (y_train == 0).sum() / (y_train == 1).sum()
 print(f"Class weight ratio: {scale_pos_weight:.2f}")
 
-# XGBoost
-print("\n🔷 Training XGBoost...")
+# === XGBoost ===
+print("\n🟦 Training XGBoost...")
 xgb_model = xgb.XGBClassifier(
-    max_depth=3,
+    max_depth=4,
     learning_rate=0.03,
-    n_estimators=50,
+    n_estimators=100,
     min_child_weight=10,
-    subsample=0.7,
-    colsample_bytree=0.7,
+    subsample=0.8,
+    colsample_bytree=0.8,
     reg_alpha=1.0,
     reg_lambda=5.0,
     scale_pos_weight=scale_pos_weight,
@@ -402,19 +472,18 @@ xgb_test_auc = roc_auc_score(y_test, xgb_test_proba)
 print(f"  Training Accuracy: {xgb_train_acc:.4f}")
 print(f"  Test Accuracy:     {xgb_test_acc:.4f}")
 print(f"  Test AUC:          {xgb_test_auc:.4f}")
-print(f"  Overfit Gap:       {abs(xgb_train_acc - xgb_test_acc):.4f}")
 
-# LightGBM
-print("\n🔶 Training LightGBM...")
+# === LightGBM ===
+print("\n🟩 Training LightGBM...")
 lgb_model = lgb.LGBMClassifier(
-    num_leaves=10,
-    max_depth=3,
+    num_leaves=15,
+    max_depth=4,
     learning_rate=0.03,
-    n_estimators=50,
+    n_estimators=100,
     min_child_samples=15,
     min_split_gain=0.02,
-    subsample=0.7,
-    colsample_bytree=0.7,
+    subsample=0.8,
+    colsample_bytree=0.8,
     reg_alpha=1.0,
     reg_lambda=5.0,
     class_weight='balanced',
@@ -435,13 +504,12 @@ lgb_test_auc = roc_auc_score(y_test, lgb_test_proba)
 print(f"  Training Accuracy: {lgb_train_acc:.4f}")
 print(f"  Test Accuracy:     {lgb_test_acc:.4f}")
 print(f"  Test AUC:          {lgb_test_auc:.4f}")
-print(f"  Overfit Gap:       {abs(lgb_train_acc - lgb_test_acc):.4f}")
 
-# CatBoost
-print("\n🔸 Training CatBoost...")
+# === CatBoost ===
+print("\n🟨 Training CatBoost...")
 cat_model = CatBoostClassifier(
-    iterations=50,
-    depth=3,
+    iterations=100,
+    depth=4,
     learning_rate=0.03,
     l2_leaf_reg=15,
     min_data_in_leaf=15,
@@ -463,22 +531,20 @@ cat_test_auc = roc_auc_score(y_test, cat_test_proba)
 print(f"  Training Accuracy: {cat_train_acc:.4f}")
 print(f"  Test Accuracy:     {cat_test_acc:.4f}")
 print(f"  Test AUC:          {cat_test_auc:.4f}")
-print(f"  Overfit Gap:       {abs(cat_train_acc - cat_test_acc):.4f}")
 
 # ============================================================================
-# 🆕 ENSEMBLE PREDICTIONS
+# ENSEMBLE TESTING
 # ============================================================================
 
 print("\n" + "="*80)
-print("🆕 TESTING ENSEMBLE COMBINATIONS")
+print("🎯 ENSEMBLE TESTING")
 print("="*80)
 
-# Test different ensemble weights
 ensemble_configs = [
-    ("CatBoost 60% + LightGBM 40%", [0.6, 0.4, 0.0]),
     ("CatBoost 70% + LightGBM 30%", [0.7, 0.3, 0.0]),
-    ("CatBoost 50% + LightGBM 30% + XGBoost 20%", [0.5, 0.3, 0.2]),
-    ("Equal Weight Average", [0.33, 0.33, 0.34]),
+    ("CatBoost 60% + LightGBM 30% + XGBoost 10%", [0.6, 0.3, 0.1]),
+    ("Equal Weight", [0.33, 0.33, 0.34]),
+    ("CatBoost 50% + LightGBM 50%", [0.5, 0.5, 0.0]),
 ]
 
 best_ensemble_name = None
@@ -512,7 +578,7 @@ print(f"   Test AUC: {best_ensemble_auc:.4f}")
 # ============================================================================
 
 print("\n" + "="*80)
-print("📊 5-FOLD STRATIFIED CROSS-VALIDATION")
+print("📊 5-FOLD CROSS-VALIDATION")
 print("="*80)
 
 skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
@@ -521,8 +587,8 @@ cv_scores = {'xgb': [], 'lgb': [], 'cat': [], 'ensemble': []}
 for fold, (train_idx, val_idx) in enumerate(skf.split(X_train_selected, y_train), 1):
     # XGBoost
     fold_xgb = xgb.XGBClassifier(
-        max_depth=3, learning_rate=0.03, n_estimators=50,
-        min_child_weight=10, subsample=0.7, colsample_bytree=0.7,
+        max_depth=4, learning_rate=0.03, n_estimators=100,
+        min_child_weight=10, subsample=0.8, colsample_bytree=0.8,
         reg_alpha=1.0, reg_lambda=5.0,
         scale_pos_weight=scale_pos_weight, random_state=42
     )
@@ -532,7 +598,7 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(X_train_selected, y_train)
     
     # LightGBM
     fold_lgb = lgb.LGBMClassifier(
-        num_leaves=10, max_depth=3, learning_rate=0.03, n_estimators=50,
+        num_leaves=15, max_depth=4, learning_rate=0.03, n_estimators=100,
         min_child_samples=15, reg_alpha=1.0, reg_lambda=5.0,
         class_weight='balanced', random_state=42, verbose=-1
     )
@@ -542,7 +608,7 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(X_train_selected, y_train)
     
     # CatBoost
     fold_cat = CatBoostClassifier(
-        iterations=50, depth=3, learning_rate=0.03, l2_leaf_reg=15,
+        iterations=100, depth=4, learning_rate=0.03, l2_leaf_reg=15,
         auto_class_weights='Balanced', random_state=42, verbose=False
     )
     fold_cat.fit(X_train_selected[train_idx], y_train.iloc[train_idx])
@@ -561,428 +627,118 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(X_train_selected, y_train)
           f"LGB: {cv_scores['lgb'][-1]:.3f} | CAT: {cv_scores['cat'][-1]:.3f} | "
           f"ENS: {cv_scores['ensemble'][-1]:.3f}")
 
-print(f"\nCV AUC (mean ± std):")
+print(f"\n📊 CV AUC (mean ± std):")
 print(f"  XGBoost:  {np.mean(cv_scores['xgb']):.3f} ± {np.std(cv_scores['xgb']):.3f}")
 print(f"  LightGBM: {np.mean(cv_scores['lgb']):.3f} ± {np.std(cv_scores['lgb']):.3f}")
 print(f"  CatBoost: {np.mean(cv_scores['cat']):.3f} ± {np.std(cv_scores['cat']):.3f}")
 print(f"  Ensemble: {np.mean(cv_scores['ensemble']):.3f} ± {np.std(cv_scores['ensemble']):.3f}")
 
 # ============================================================================
-# FINAL MODEL SELECTION
+# SAVE MODELS
 # ============================================================================
 
 print("\n" + "="*80)
-print("🏆 FINAL MODEL COMPARISON")
+print("💾 SAVING MODELS")
 print("="*80)
 
-baseline_acc = y_test.mean()
-print(f"\n📊 Baseline (always predict Win): {baseline_acc:.4f}")
-
-results = pd.DataFrame({
-    'Model': ['XGBoost', 'LightGBM', 'CatBoost', 'Ensemble'],
-    'Train Acc': [xgb_train_acc, lgb_train_acc, cat_train_acc, np.nan],
-    'Test Acc': [xgb_test_acc, lgb_test_acc, cat_test_acc, 
-                 ((best_ensemble_weights[0] * cat_test_proba +
-                   best_ensemble_weights[1] * lgb_test_proba +
-                   best_ensemble_weights[2] * xgb_test_proba) >= 0.5).mean()],
-    'Test AUC': [xgb_test_auc, lgb_test_auc, cat_test_auc, best_ensemble_auc],
-    'Overfit Gap': [
-        abs(xgb_train_acc - xgb_test_acc),
-        abs(lgb_train_acc - lgb_test_acc),
-        abs(cat_train_acc - cat_test_acc),
-        np.nan
-    ],
-    'CV AUC': [
-        np.mean(cv_scores['xgb']),
-        np.mean(cv_scores['lgb']),
-        np.mean(cv_scores['cat']),
-        np.mean(cv_scores['ensemble'])
-    ]
-})
-
-results['Score'] = (
-    results['Test AUC'] * 0.5 +
-    results['CV AUC'] * 0.4 +
-    results['Test Acc'] * 0.1
-)
-
-print("\n" + results.to_string(index=False))
-
-print("\n📊 Model Ranking:")
-ranked = results.sort_values('Score', ascending=False)
-print(ranked[['Model', 'Test AUC', 'CV AUC', 'Score']].to_string(index=False))
-
-# Use ensemble or best single model
-use_ensemble = best_ensemble_auc > max(xgb_test_auc, lgb_test_auc, cat_test_auc)
-
-if use_ensemble:
-    best_model_name = "Ensemble"
-    print(f"\n✅ Best Model: Ensemble ({best_ensemble_name})")
-    print(f"   Weights: Cat={best_ensemble_weights[0]}, LGB={best_ensemble_weights[1]}, XGB={best_ensemble_weights[2]}")
-else:
-    best_model_idx = results[results['Model'] != 'Ensemble']['Score'].idxmax()
-    best_model_name = results.iloc[best_model_idx]['Model']
-    print(f"\n✅ Best Model: {best_model_name}")
-
-# ============================================================================
-# SAVE ALL MODELS
-# ============================================================================
-
-print("\n" + "="*80)
-print("💾 SAVING MODELS FOR PRODUCTION")
-print("="*80)
-
-# Save feature selector
-selector_path = 'models/feature_selector.pkl'
-joblib.dump(selector_f, selector_path)
-print(f"✅ Feature selector saved: {selector_path}")
-
-# Save all three models for ensemble
+# Save all models
 joblib.dump(xgb_model, 'models/xgboost_model.pkl')
 joblib.dump(lgb_model, 'models/lightgbm_model.pkl')
 joblib.dump(cat_model, 'models/catboost_model.pkl')
-print(f"✅ All three models saved")
+joblib.dump(selector_f, 'models/feature_selector.pkl')
+print("✅ Models saved")
 
-# Save label encoders
-encoders_path = 'models/label_encoders.pkl'
-joblib.dump(label_encoders, encoders_path)
-print(f"✅ Label encoders saved: {encoders_path}")
-
-# Save comprehensive metadata
+# Save metadata
 metadata = {
-    'model_type': best_model_name,
+    'model_type': 'Ensemble',
     'ensemble_weights': {
         'catboost': float(best_ensemble_weights[0]),
         'lightgbm': float(best_ensemble_weights[1]),
         'xgboost': float(best_ensemble_weights[2])
-    } if use_ensemble else None,
+    },
     'trained_at': datetime.now().isoformat(),
     'training_samples': len(train_df),
     'test_samples': len(test_df),
-    # 'max_token_age_hours': MAX_TOKEN_AGE_HOURS,
-    'num_features_selected': len(selected_features),
-    'best_k': best_k,
+    'num_features_selected': best_k,
     'selected_features': selected_features,
     'all_features': ALL_FEATURES,
-    'advanced_features': [
-        'liquidity_per_holder', 'smart_money_score', 'risk_adjusted_volume',
-        'liquidity_velocity', 'holder_quality_score', 'market_efficiency',
-        'risk_weighted_smart_money', 'concentration_risk', 
-        'liquidity_depth_score', 'freshness_score'
-    ],
-    'numeric_features': NUMERIC_FEATURES,
-    'categorical_features': CATEGORICAL_FEATURES,
-    'categorical_encodings': {
-        col: list(label_encoders[col].classes_) 
-        for col in CATEGORICAL_FEATURES
-    },
+    'core_features': CORE_FEATURES,
+    'derived_features': DERIVED_FEATURES,
     'performance': {
-        'train_accuracy': float(cat_train_acc) if not use_ensemble else None,
-        'test_accuracy': float(results.loc[results['Model'] == best_model_name, 'Test Acc'].iloc[0]),
-        'test_auc': float(results.loc[results['Model'] == best_model_name, 'Test AUC'].iloc[0]),
-        'overfit_gap': float(results.loc[results['Model'] == 'CatBoost', 'Overfit Gap'].iloc[0]),
-        'cv_auc_mean': float(results.loc[results['Model'] == best_model_name, 'CV AUC'].iloc[0]),
-        'baseline_accuracy': float(baseline_acc),
+        'test_auc': float(best_ensemble_auc),
+        'cv_auc_mean': float(np.mean(cv_scores['ensemble'])),
+        'cv_auc_std': float(np.std(cv_scores['ensemble'])),
     },
-    'all_models_comparison': results.to_dict('records'),
     'feature_scores': {
         feat: float(score) if not np.isnan(score) else 0.0
         for feat, score in zip(ALL_FEATURES, f_scores)
-    }
-}
-
-# Add feature importance from best single model (CatBoost)
-if hasattr(cat_model, 'feature_importances_'):
-    metadata['feature_importance'] = {
+    },
+    'feature_importance': {
         selected_features[i]: float(cat_model.feature_importances_[i])
         for i in range(len(selected_features))
     }
+}
 
-metadata_path = 'models/model_metadata.json'
-with open(metadata_path, 'w') as f:
+with open('models/model_metadata.json', 'w') as f:
     json.dump(metadata, f, indent=2)
-print(f"✅ Metadata saved: {metadata_path}")
+print("✅ Metadata saved")
 
 # ============================================================================
-# CREATE PRODUCTION INFERENCE SCRIPT
+# THRESHOLD OPTIMIZATION
 # ============================================================================
 
-inference_script = '''
-"""
-Production Inference Script for Solana Memecoin Classifier
-Uses ensemble of XGBoost, LightGBM, and CatBoost models
-"""
+print("\n" + "="*80)
+print("🎯 THRESHOLD OPTIMIZATION")
+print("="*80)
 
-import pandas as pd
-import numpy as np
-import joblib
-import json
+final_proba = (
+    best_ensemble_weights[0] * cat_test_proba +
+    best_ensemble_weights[1] * lgb_test_proba +
+    best_ensemble_weights[2] * xgb_test_proba
+)
 
-class SolanaMemeTokenClassifier:
-    def __init__(self, model_dir='models'):
-        """Load all models and preprocessing artifacts"""
-        self.selector = joblib.load(f'{model_dir}/feature_selector.pkl')
-        self.xgb_model = joblib.load(f'{model_dir}/xgboost_model.pkl')
-        self.lgb_model = joblib.load(f'{model_dir}/lightgbm_model.pkl')
-        self.cat_model = joblib.load(f'{model_dir}/catboost_model.pkl')
-        self.label_encoders = joblib.load(f'{model_dir}/label_encoders.pkl')
-        
-        with open(f'{model_dir}/model_metadata.json', 'r') as f:
-            self.metadata = json.load(f)
-        
-        self.ensemble_weights = self.metadata['ensemble_weights']
-        self.selected_features = self.metadata['selected_features']
-        self.all_features = self.metadata['all_features']
-        
-        print(f"✅ Loaded {self.metadata['model_type']} model")
-        print(f"   Test AUC: {self.metadata['performance']['test_auc']:.4f}")
-        print(f"   Selected features: {len(self.selected_features)}")
-    
-    def engineer_features(self, df):
-        """Apply same feature engineering as training"""
-        df = df.copy()
-        
-        # Basic features
-        df['token_age_hours'] = df['token_age_at_signal_seconds'] / 3600
-        df['token_age_hours_capped'] = df['token_age_hours'].clip(0, 24)
-        df['is_ultra_fresh'] = (df['token_age_at_signal_seconds'] < 3600).astype(int)
-        
-        # Log transforms
-        df['log_liquidity'] = np.log1p(df['liquidity_usd'])
-        df['log_volume'] = np.log1p(df['volume_h24_usd'])
-        df['log_fdv'] = np.log1p(df['fdv_usd'])
-        
-        # Basic ratios
-        df['volume_to_liquidity_ratio'] = np.where(
-            df['liquidity_usd'] > 0,
-            df['volume_h24_usd'] / df['liquidity_usd'],
-            0
-        )
-        df['fdv_to_liquidity_ratio'] = np.where(
-            df['liquidity_usd'] > 0,
-            df['fdv_usd'] / df['liquidity_usd'],
-            0
-        )
-        
-        # Risk signals
-        df['high_risk_signal'] = (
-            (df['pump_dump_risk_score'] > 30) & 
-            (df['authority_risk_score'] > 15)
-        ).astype(int)
-        df['premium_signal'] = (
-            (df['grade'] == 'CRITICAL') & 
-            (df['signal_source'] == 'alpha')
-        ).astype(int)
-        df['extreme_concentration'] = (df['top_10_holders_pct'] > 60).astype(int)
-        
-        # ADVANCED COMPOSITE FEATURES
-        df['liquidity_per_holder'] = np.where(
-            df['top_10_holders_pct'] > 0,
-            df['liquidity_usd'] / (df['top_10_holders_pct'] / 10),
-            0
-        )
-        df['smart_money_score'] = (
-            df['overlap_quality_score'] * df['winner_wallet_density']
-        )
-        df['risk_adjusted_volume'] = np.where(
-            df['pump_dump_risk_score'] > 0,
-            df['volume_h24_usd'] / (1 + df['pump_dump_risk_score']),
-            df['volume_h24_usd']
-        )
-        df['liquidity_velocity'] = np.where(
-            df['liquidity_usd'] > 0,
-            df['volume_h24_usd'] / df['liquidity_usd'],
-            0
-        )
-        df['holder_quality_score'] = 100 - df['top_10_holders_pct']
-        df['market_efficiency'] = np.where(
-            (df['liquidity_usd'] > 0) & (df['fdv_usd'] > 0),
-            (df['volume_h24_usd'] / df['liquidity_usd']) / (df['fdv_usd'] / df['liquidity_usd']),
-            0
-        )
-        df['risk_weighted_smart_money'] = np.where(
-            df['pump_dump_risk_score'] + df['authority_risk_score'] > 0,
-            df['smart_money_score'] / (1 + df['pump_dump_risk_score'] + df['authority_risk_score']),
-            df['smart_money_score']
-        )
-        df['concentration_risk'] = (
-            df['top_10_holders_pct'] * 0.4 +
-            df['creator_balance_pct'] * 0.3 +
-            df['whale_concentration_score'] * 0.3
-        )
-        df['liquidity_depth_score'] = np.where(
-            df['fdv_usd'] > 0,
-            (df['liquidity_usd'] / df['fdv_usd']) * 100,
-            0
-        )
-        df['freshness_score'] = np.exp(-df['token_age_hours'] / 6)
-        
-        return df
-    
-    def predict(self, token_data, threshold=0.70):
-        """
-        Predict if token will reach 50% gain
-        
-        Args:
-            token_data: dict or DataFrame with token features
-            threshold: probability threshold for BUY signal (default 0.70 for high precision)
-        
-        Returns:
-            dict with prediction, probability, and recommendation
-        """
-        # Convert to DataFrame if dict
-        if isinstance(token_data, dict):
-            df = pd.DataFrame([token_data])
-        else:
-            df = token_data.copy()
-        
-        # Engineer features
-        df = self.engineer_features(df)
-        
-        # Select features
-        X = df[self.all_features].copy()
-        
-        # Encode categorical features
-        for col in self.metadata['categorical_features']:
-            if col in X.columns:
-                X[col] = self.label_encoders[col].transform(X[col].astype(str))
-        
-        # Apply feature selection
-        X_selected = self.selector.transform(X)
-        
-        # Get predictions from all models
-        xgb_proba = self.xgb_model.predict_proba(X_selected)[:, 1]
-        lgb_proba = self.lgb_model.predict_proba(X_selected)[:, 1]
-        cat_proba = self.cat_model.predict_proba(X_selected)[:, 1]
-        
-        # Ensemble prediction
-        if self.ensemble_weights:
-            ensemble_proba = (
-                self.ensemble_weights['catboost'] * cat_proba +
-                self.ensemble_weights['lightgbm'] * lgb_proba +
-                self.ensemble_weights['xgboost'] * xgb_proba
-            )
-        else:
-            ensemble_proba = cat_proba  # Use best single model
-        
-        # Decision logic with risk tiers
-        results = []
-        for i, prob in enumerate(ensemble_proba):
-            if prob >= threshold:
-                action = "BUY"
-                confidence = "HIGH"
-                risk_tier = "LOW RISK"
-            elif prob >= 0.60:
-                action = "CONSIDER"
-                confidence = "MEDIUM"
-                risk_tier = "MEDIUM RISK"
-            elif prob >= 0.45:
-                action = "SKIP"
-                confidence = "LOW"
-                risk_tier = "HIGH RISK"
-            else:
-                action = "AVOID"
-                confidence = "VERY LOW"
-                risk_tier = "VERY HIGH RISK"
-            
-            results.append({
-                'action': action,
-                'win_probability': float(prob),
-                'confidence': confidence,
-                'risk_tier': risk_tier,
-                'individual_predictions': {
-                    'xgboost': float(xgb_proba[i]),
-                    'lightgbm': float(lgb_proba[i]),
-                    'catboost': float(cat_proba[i])
-                }
-            })
-        
-        return results[0] if len(results) == 1 else results
-    
-    def batch_predict(self, tokens_df, threshold=0.70):
-        """Predict for multiple tokens at once"""
-        results = self.predict(tokens_df, threshold)
-        
-        # Add to DataFrame
-        tokens_df = tokens_df.copy()
-        tokens_df['win_probability'] = [r['win_probability'] for r in results]
-        tokens_df['action'] = [r['action'] for r in results]
-        tokens_df['confidence'] = [r['confidence'] for r in results]
-        tokens_df['risk_tier'] = [r['risk_tier'] for r in results]
-        
-        return tokens_df.sort_values('win_probability', ascending=False)
+print(f"\n{'Threshold':<12} {'Accuracy':<10} {'Precision':<12} {'Recall':<10} {'F1-Score':<10}")
+print("-" * 54)
 
+thresholds = [0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80]
+best_threshold = 0.5
+best_f1 = 0
 
-# Example usage
-if __name__ == "__main__":
-    # Initialize classifier
-    classifier = SolanaMemeTokenClassifier()
+for thresh in thresholds:
+    pred = (final_proba >= thresh).astype(int)
+    acc = (pred == y_test).mean()
     
-    # Example token data
-    example_token = {
-        'signal_source': 'alpha',
-        'grade': 'CRITICAL',
-        'liquidity_usd': 50000,
-        'volume_h24_usd': 150000,
-        'fdv_usd': 100000,
-        'price_change_h24_pct': 25.5,
-        'creator_balance_pct': 5.0,
-        'top_10_holders_pct': 35.0,
-        'total_lp_locked_usd': 30000,
-        'whale_concentration_score': 40.0,
-        'pump_dump_risk_score': 15.0,
-        'authority_risk_score': 5.0,
-        'overlap_quality_score': 0.8,
-        'winner_wallet_density': 0.6,
-        'token_age_at_signal_seconds': 1800,  # 30 minutes old
-    }
+    tp = ((pred == 1) & (y_test == 1)).sum()
+    fp = ((pred == 1) & (y_test == 0)).sum()
+    fn = ((pred == 0) & (y_test == 1)).sum()
     
-    # Get prediction
-    result = classifier.predict(example_token, threshold=0.70)
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+    f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
     
-    print("\\n" + "="*60)
-    print("PREDICTION RESULT")
-    print("="*60)
-    print(f"Action: {result['action']}")
-    print(f"Win Probability: {result['win_probability']:.2%}")
-    print(f"Confidence: {result['confidence']}")
-    print(f"Risk Tier: {result['risk_tier']}")
-    print("\\nIndividual Model Predictions:")
-    for model, prob in result['individual_predictions'].items():
-        print(f"  {model:10s}: {prob:.2%}")
-'''
+    print(f"{thresh:<12.2f} {acc:<10.3f} {precision:<12.3f} {recall:<10.3f} {f1:<10.3f}")
+    
+    if f1 > best_f1:
+        best_f1 = f1
+        best_threshold = thresh
 
-# Save inference script
-with open('ml_predictor_v2.py', 'w', encoding='utf-8') as f:
-    f.write(inference_script)
-
-print(f"✅ Production inference script saved: ml_predictor_v2.py")
+print(f"\n✅ Optimal threshold for balanced F1: {best_threshold:.2f}")
+print(f"   Recommended for BUY signals: 0.70+ (high precision)")
+print(f"   Recommended for AVOID signals: <0.40 (high recall for losses)")
 
 # ============================================================================
 # DETAILED EVALUATION
 # ============================================================================
 
 print("\n" + "="*80)
-print(f"📋 DETAILED EVALUATION")
+print("📋 DETAILED EVALUATION")
 print("="*80)
 
-# Use best ensemble probabilities
-if use_ensemble:
-    final_proba = (
-        best_ensemble_weights[0] * cat_test_proba +
-        best_ensemble_weights[1] * lgb_test_proba +
-        best_ensemble_weights[2] * xgb_test_proba
-    )
-    final_pred = (final_proba >= 0.5).astype(int)
-else:
-    final_proba = cat_test_proba
-    final_pred = cat_test_pred
+final_pred = (final_proba >= 0.5).astype(int)
 
-print("\nClassification Report:")
-print(classification_report(y_test, final_pred, 
-                          target_names=['Loss', 'Win'], digits=3))
+print("\nClassification Report (threshold=0.5):")
+print(classification_report(y_test, final_pred, target_names=['Loss', 'Win'], digits=3))
 
-# Confusion Matrix
 cm = confusion_matrix(y_test, final_pred)
 print("\nConfusion Matrix:")
 print(f"              Predicted")
@@ -990,93 +746,66 @@ print(f"              Loss  Win")
 print(f"Actual Loss    {cm[0,0]:3d}  {cm[0,1]:3d}")
 print(f"       Win     {cm[1,0]:3d}  {cm[1,1]:3d}")
 
-# Optimal threshold analysis
-print("\n📊 Threshold Optimization:")
-thresholds = [0.40, 0.50, 0.60, 0.70, 0.80]
-print(f"\n{'Threshold':<12} {'Accuracy':<10} {'Precision':<12} {'Recall':<10}")
-print("-" * 44)
+# ============================================================================
+# FEATURE IMPORTANCE ANALYSIS
+# ============================================================================
 
-for thresh in thresholds:
-    pred = (final_proba >= thresh).astype(int)
-    acc = (pred == y_test).mean()
-    
-    # Calculate precision and recall for Win class
-    tp = ((pred == 1) & (y_test == 1)).sum()
-    fp = ((pred == 1) & (y_test == 0)).sum()
-    fn = ((pred == 0) & (y_test == 1)).sum()
-    
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-    
-    print(f"{thresh:<12.2f} {acc:<10.3f} {precision:<12.3f} {recall:<10.3f}")
+print("\n" + "="*80)
+print("📊 FEATURE IMPORTANCE ANALYSIS")
+print("="*80)
 
-# Feature Importance from CatBoost
-print("\n📊 Top 15 Feature Importances (CatBoost):")
+print("\n🏆 Top 20 Most Important Features (CatBoost):")
 importances = cat_model.feature_importances_
 feature_importance = list(zip(selected_features, importances))
 feature_importance.sort(key=lambda x: x[1], reverse=True)
 
-for i, (feat, imp) in enumerate(feature_importance[:15], 1):
-    is_new = "🆕" if feat in metadata['advanced_features'] else "  "
-    print(f"  {is_new} {i:2d}. {feat:40s} | {imp:8.4f}")
-
-# ============================================================================
-# VERIFICATION
-# ============================================================================
-
-print("\n" + "="*80)
-print("🔍 VERIFICATION")
-print("="*80)
-
-try:
-    loaded_xgb = joblib.load('models/xgboost_model.pkl')
-    loaded_lgb = joblib.load('models/lightgbm_model.pkl')
-    loaded_cat = joblib.load('models/catboost_model.pkl')
-    loaded_selector = joblib.load('models/feature_selector.pkl')
-    loaded_encoders = joblib.load('models/label_encoders.pkl')
-    loaded_metadata = json.load(open('models/model_metadata.json', 'r'))
+for i, (feat, imp) in enumerate(feature_importance[:20], 1):
+    # Mark special feature types
+    marker = ""
+    if 'insider' in feat.lower():
+        marker = "🔴"
+    elif feat in CORE_FEATURES:
+        marker = "⭐"
+    elif feat in DERIVED_FEATURES:
+        marker = "🆕"
     
-    print(f"✅ All artifacts load successfully!")
-    print(f"   XGBoost: {type(loaded_xgb).__name__}")
-    print(f"   LightGBM: {type(loaded_lgb).__name__}")
-    print(f"   CatBoost: {type(loaded_cat).__name__}")
-    print(f"   Selector: k={loaded_selector.k}")
-    print(f"   Selected features: {len(loaded_metadata['selected_features'])}")
-    print(f"   Advanced features: {len(loaded_metadata['advanced_features'])}")
-    
-except Exception as e:
-    print(f"❌ ERROR loading artifacts: {e}")
+    print(f"  {marker} {i:2d}. {feat:45s} | {imp:8.4f}")
+
+# Check if insider features made the cut
+insider_features_selected = [f for f in selected_features if 'insider' in f.lower()]
+print(f"\n🔴 Insider features selected: {len(insider_features_selected)}")
+for feat in insider_features_selected:
+    imp = dict(feature_importance).get(feat, 0)
+    print(f"   • {feat}: {imp:.4f}")
 
 # ============================================================================
 # SUMMARY
 # ============================================================================
 
 print("\n" + "="*80)
-print("✅ TRAINING COMPLETE - ADVANCED MODEL V2")
+print("✅ TRAINING COMPLETE - FOCUSED MODEL")
 print("="*80)
 
-print(f"\n🎯 Key Improvements:")
-# print(f"   • Dataset: {len(df_filtered)} samples (filtered < {MAX_TOKEN_AGE_HOURS}h)")
-print(f"   • Features: {len(ALL_FEATURES)} total → {best_k} selected")
-print(f"   • 🆕 Added 10 advanced composite features")
-print(f"   • Optimal k-value: {best_k} (tested via CV)")
-print(f"   • Best model: {best_model_name}")
+print(f"\n🎯 Model Configuration:")
+print(f"   • Total features: {len(ALL_FEATURES)}")
+print(f"   • Features selected: {best_k}")
+print(f"   • Training samples: {len(train_df)}")
+print(f"   • Test samples: {len(test_df)}")
 
-if use_ensemble:
-    print(f"   • Ensemble weights: Cat={best_ensemble_weights[0]:.1f}, "
-          f"LGB={best_ensemble_weights[1]:.1f}, XGB={best_ensemble_weights[2]:.1f}")
+print(f"\n📈 Performance:")
+print(f"   • Test AUC: {best_ensemble_auc:.4f}")
+print(f"   • CV AUC: {np.mean(cv_scores['ensemble']):.4f} ± {np.std(cv_scores['ensemble']):.4f}")
+print(f"   • Best Ensemble: {best_ensemble_name}")
 
-print(f"\n📈 Performance Metrics:")
-print(f"   • Test AUC: {results.loc[results['Model'] == best_model_name, 'Test AUC'].iloc[0]:.4f}")
-print(f"   • CV AUC: {results.loc[results['Model'] == best_model_name, 'CV AUC'].iloc[0]:.4f}")
-print(f"   • Test Accuracy: {results.loc[results['Model'] == best_model_name, 'Test Acc'].iloc[0]:.4f}")
-if not use_ensemble:
-    print(f"   • Overfit Gap: {results.loc[results['Model'] == best_model_name, 'Overfit Gap'].iloc[0]:.4f}")
+print(f"\n🎯 Key Features:")
+print(f"   • 🔴 Insider supply %: {'insider_supply_pct' in selected_features}")
+print(f"   • ⭐ Core features: {sum(1 for f in selected_features if f in CORE_FEATURES)}/{len(CORE_FEATURES)}")
+print(f"   • 🆕 Derived features: {sum(1 for f in selected_features if f in DERIVED_FEATURES)}/{len(DERIVED_FEATURES)}")
 
-print(f"\n💡 Production Usage:")
-print(f"   1. Run: python ml_predictor_v2.py")
-print(f"   2. Use threshold ≥ 0.70 for BUY signals (high precision)")
-print(f"   3. Use threshold < 0.35 for AVOID signals (high risk)")
-print(f"   4. Monitor ensemble individual predictions for consensus")
+print(f"\n💡 Next Steps:")
+print(f"   1. Create production inference script")
+print(f"   2. Test with live DexScreener + Rugcheck API data")
+print(f"   3. Use threshold ≥0.70 for BUY signals")
+print(f"   4. Monitor individual model agreement")
 
 print("\n" + "="*80)

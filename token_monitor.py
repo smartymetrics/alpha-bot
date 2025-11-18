@@ -41,8 +41,7 @@ from typing import List, Set
 import sqlite3
 import threading
 
-# --- NEW ML IMPORT ---
-from ml_predictor_v2 import SolanaMemeTokenClassifier
+from ml_predictor import SolanaTokenPredictor
 
 load_dotenv()
 
@@ -1828,7 +1827,7 @@ class Monitor:
         # ------------------ 🚀 CHANGE 1: Accept http_session ------------------
         http_session: aiohttp.ClientSession,
         # --- NEW: Accept ML Classifier ---
-        ml_classifier: SolanaMemeTokenClassifier,
+        ml_classifier: SolanaTokenPredictor,
         *,
         coingecko_poll_interval_seconds: int = 30,
         initial_check_delay_seconds: int = 600, # 10 minutes
@@ -2151,7 +2150,7 @@ class Monitor:
             total_supply = supply / (10 ** decimals) if decimals > 0 else supply
 
             # Rule 3: Check creator token balance
-            if r.get("creator_balance", 0)/total_supply *100 if total_supply > 0 else 1 >  MAX_CREATOR_PCT:
+            if r.get("creator_balance", 0)/(total_supply *100 if total_supply > 0 else 1) >  MAX_CREATOR_PCT:
                 reasons.append(f"creator_balance_pct:{r.get('creator_balance')/total_supply *100 if total_supply > 0 else 1 } ")
 
             # Rule 4: Check transfer fee (must be <= 5%)
@@ -2160,13 +2159,13 @@ class Monitor:
 
             # Rule 5: Check holder count (must be >= 50)
             if r.get("total_holders", 0) < 50:
-                reasons.append(f"holder_count:{r.get('total_holders')}_req_5")
+                reasons.append(f"holder_count:{r.get('total_holders')}_req_50")
 
             # Rule 6: Check aggregated liquidity lock percentage (must be >= 80%)
             if r.get("overall_lp_locked_pct", 0.0) < 80.0:
                 reasons.append(f"lp_locked:{r.get('overall_lp_locked_pct'):.1f}%_req_80%")
 
-            # Rule 7: Check aggregated total liquidity (must be >= $15,000)
+            # Rule 7: Check aggregated total liquidity (must be >= $10,000)
             if r.get("total_lp_usd", 0.0) < 10000.0:
                 reasons.append(f"liquidity_usd:{r.get('total_lp_usd'):.2f}_req_10000")
 
@@ -2933,7 +2932,7 @@ async def main_loop():
 
             try:
                 # Assuming models are in the 'models' directory relative to execution
-                ml_classifier = SolanaMemeTokenClassifier(model_dir='models') 
+                ml_classifier = SolanaTokenPredictor(model_dir='models') 
             except Exception as e:
                 print(f"❌ CRITICAL: Failed to load ML models: {e}")
                 print("--- 💀 Token Monitor Halted ---")

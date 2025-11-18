@@ -1,26 +1,9 @@
 #!/usr/bin/env python3
 """
-extract_features_from_datasets.py
+extract_datasets.py
 
 Extracts training data from your Supabase datasets (created by collector.py)
 and prepares it in the EXACT format needed for model training.
-
-This script:
-1. Downloads labeled datasets from Supabase
-2. Extracts ONLY features that exist in collector.py
-3. Creates derived features
-4. Applies 'first-per-tracking-period' cleaning logic (24h/168h)
-5. Saves to CSV for training
-
-Usage:
-    # Extract ALL available data (automatic)
-    python extract_features_from_datasets.py
-    
-    # Extract with date range
-    python extract_features_from_datasets.py --start-date 2025-10-01 --end-date 2025-11-12
-    
-    # Custom output path
-    python extract_features_from_datasets.py --output data/my_training_data.csv
 """
 
 import os
@@ -48,14 +31,23 @@ logger = logging.getLogger(__name__)
 class FeatureExtractor:
     """Extract ML features from collector.py snapshots."""
     
-    # CRITICAL: These must match collector.py exactly!
+    # Updated Mapping to include creator_address and all requested metrics
     FEATURE_MAPPING = {
-        # Market features (from collector.py)
+        # Identifiers
+        'mint': 'mint',
+        'creator_address': 'creator_address',
+        
+        # Market features
         'price_usd': 'price_usd',
         'fdv_usd': 'fdv_usd',
         'liquidity_usd': 'liquidity_usd',
         'volume_h24_usd': 'volume_h24_usd',
         'price_change_h24_pct': 'price_change_h24_pct',
+        
+        # Ratios
+        'volume_to_liquidity_ratio': 'volume_to_liquidity_ratio',
+        'fdv_to_liquidity_ratio': 'fdv_to_liquidity_ratio',
+        'liquidity_to_volume_ratio': 'liquidity_to_volume_ratio',
         
         # Security features
         'creator_balance_pct': 'creator_balance_pct',
@@ -65,8 +57,15 @@ class FeatureExtractor:
         'has_freeze_authority': 'has_freeze_authority',
         'is_lp_locked_95_plus': 'is_lp_locked_95_plus',
         
+        # Insider / Supply Features
+        'token_supply': 'token_supply',
+        'total_insider_networks': 'total_insider_networks',
+        'largest_insider_network_size': 'largest_insider_network_size',
+        'total_insider_token_amount': 'total_insider_token_amount',
+        
         # Risk encoding
         'rugcheck_risk_level': 'rugcheck_risk_level',
+        'pump_dump_risk_score': 'pump_dump_risk_score',
         
         # Time features
         'time_of_day_utc': 'time_of_day_utc',
@@ -84,13 +83,7 @@ class FeatureExtractor:
         # Timestamp for sorting
         'checked_at_timestamp': 'checked_at_timestamp',
         
-        # Identifier
-        'mint': 'mint',
-        
-        # ---
-        # NOTE: This is an internal-only mapping used by the extractor
-        # It is NOT a feature used by the model, but is required
-        # for the cleaning logic.
+        # Internal Use (Needed for deduplication logic)
         'checked_at_utc': 'checked_at_utc',
         'token_age_hours_at_signal': 'token_age_hours_at_signal',
     }
@@ -115,33 +108,26 @@ class FeatureExtractor:
             return None
     
     async def list_all_dataset_folders(self, pipeline: str) -> List[str]:
-        """List all date folders in the datasets directory for a pipeline."""
         try:
             folders = await asyncio.to_thread(
                 self.supabase.storage.from_(self.bucket).list,
                 f"datasets/{pipeline}"
             )
-            # Extract folder names that look like dates (YYYY-MM-DD)
             date_folders = []
             for folder in folders:
                 name = folder.get('name', '')
-                # Skip 'expired_no_label' folder
-                if name == 'expired_no_label':
-                    continue
-                # Check if it matches YYYY-MM-DD pattern
+                if name == 'expired_no_label': continue
                 if len(name) == 10 and name[4] == '-' and name[7] == '-':
                     try:
                         datetime.strptime(name, '%Y-%m-%d')
                         date_folders.append(name)
-                    except ValueError:
-                        continue
+                    except ValueError: continue
             return sorted(date_folders)
         except Exception as e:
             logger.error(f"Failed to list folders for {pipeline}: {e}")
             return []
     
     async def list_dataset_files(self, pipeline: str, date_str: str) -> List[str]:
-        """List all dataset files for a date."""
         folder = f"datasets/{pipeline}/{date_str}"
         try:
             files = await asyncio.to_thread(
@@ -153,575 +139,442 @@ class FeatureExtractor:
             return []
     
     def extract_features_from_snapshot(self, snapshot: dict) -> dict:
-            """
-            Extract ML features from a single snapshot.
-            Returns a flat dict with all features needed for training.
-            
-            This is a corrected function that merges the robust feature
-            engineering from 'datasets.ipynb' with the structure of
-            'extract_datasets.py'.
-            """
-            
-            # --- [START] Logic from datasets.ipynb: flatten_snapshot_to_row ---
-            
-            features_dict = {}
-            
-            # 1. Define a helper function for safe division
-            def safe_divide(a, b, default=None):
-                if a is None or b is None or b == 0:
+        """
+        Robust extraction logic that specifically targets nested JSON structures
+        to fix zero-value issues.
+        """
+        features_dict = {}
+        
+        # --- 1. Helper Functions ---
+        def safe_divide(a, b, default=0.0):
+            try:
+                if not b or float(b) == 0: return default
+                return float(a) / float(b)
+            except (ValueError, TypeError):
+                return default
+
+        def get_nested(data, path, default=None):
+            """Safely retrieve nested keys: get_nested(d, 'a.b.c')"""
+            keys = path.split('.')
+            curr = data
+            for k in keys:
+                if isinstance(curr, dict) and k in curr:
+                    curr = curr[k]
+                else:
                     return default
-                try:
-                    return float(a) / float(b)
-                except (ValueError, TypeError):
-                    return default
+            return curr
 
-            # 2. Get Raw Input Data Sources
-            inputs = snapshot.get('inputs', {})
-            signal_data = inputs.get('signal_data', {})
-            signal_data_result = signal_data.get('result', {})
-            security_data = signal_data_result.get('security', {})
-            rugcheck_data = security_data.get('rugcheck', {})
-            dexscreener_data = signal_data_result.get('dexscreener', {})
-            holiday_check = inputs.get('holiday_check', {})
-            rugcheck_raw_data = inputs.get('rugcheck_raw', {})
-            dexscreener_raw = inputs.get('dexscreener_raw', {})
+        # --- 2. Data Source Normalization ---
+        inputs = snapshot.get('inputs', {})
+        features_block = snapshot.get('features', {})
+        
+        # Signal Data (Reliable fallback for market data)
+        signal_result = get_nested(inputs, 'signal_data.result', {})
+        
+        # === RUGCHECK DATA STRATEGY ===
+        rc_raw_wrapper = inputs.get('rugcheck_raw', {})
+        
+        # Primary Source: The deep 'raw' object
+        rc_inner = rc_raw_wrapper.get('raw')
+        
+        # Fallback Source: signal_data -> security -> rugcheck_raw -> raw
+        if not rc_inner:
+            rc_inner = get_nested(signal_result, 'security.rugcheck_raw.raw', {})
+        
+        # Ensure rc_inner is a dict
+        if not isinstance(rc_inner, dict):
+            rc_inner = {}
             
-            dex_pairs = dexscreener_raw.get('pairs')
-            primary_dex_pair = dex_pairs[0] if dex_pairs and isinstance(dex_pairs, list) and len(dex_pairs) > 0 else {}
-            primary_dex_liquidity = primary_dex_pair.get('liquidity', {})
-            primary_dex_volume = primary_dex_pair.get('volume', {})
-            primary_dex_price_change = primary_dex_pair.get('priceChange', {})
+        # Summary Source (for simple flags like lp_locked_pct)
+        rc_summary = get_nested(signal_result, 'security.rugcheck', {})
 
-            # 3. Features (Robust Population with Fallbacks)
-            # Get base features from 'features' block, with fallbacks to raw inputs
+        # === DEXSCREENER DATA STRATEGY ===
+        dex_raw = inputs.get('dexscreener_raw', {})
+        dex_inner = {}
+        
+        # 1. Check if dexscreener_raw has pair data directly
+        if dex_raw.get('pair_exists') or (dex_raw.get('pairs') and len(dex_raw['pairs']) > 0):
+            pairs = dex_raw.get('pairs', [])
+            if pairs: dex_inner = pairs[0]
+        # 2. Fallback to signal_data
+        else:
+            dex_signal = get_nested(signal_result, 'dexscreener', {})
+            if dex_signal.get('ok'):
+                raw_signal = dex_signal.get('raw', {})
+                # Check if raw_signal is the pair directly or contains pairs
+                if 'pairs' in raw_signal:
+                    pairs = raw_signal.get('pairs', [])
+                    if pairs: dex_inner = pairs[0]
+                elif 'pairAddress' in raw_signal:
+                    dex_inner = raw_signal
+                elif 'baseToken' in raw_signal:
+                    dex_inner = raw_signal
+
+        # --- 3. Feature Extraction ---
+
+        # Identifiers
+        features_dict['mint'] = features_block.get('mint', signal_result.get('mint'))
+        
+        # Creator Address: From rc_inner (raw data)
+        features_dict['creator_address'] = rc_inner.get('creator', 'UNKNOWN')
+        
+        features_dict['signal_source'] = features_block.get('signal_source', 'unknown')
+        features_dict['grade'] = features_block.get('grade', signal_result.get('grade'))
+        
+        # Timestamps
+        features_dict['checked_at_utc'] = features_block.get('checked_at_utc', signal_result.get('checked_at'))
+        features_dict['checked_at_timestamp'] = features_block.get('checked_at_timestamp')
+        
+        features_dict['time_of_day_utc'] = features_block.get('time_of_day_utc')
+        features_dict['day_of_week_utc'] = features_block.get('day_of_week_utc')
+        features_dict['is_weekend_utc'] = features_block.get('is_weekend_utc')
+        
+        holiday_check = inputs.get('holiday_check', {})
+        features_dict['is_public_holiday_any'] = features_block.get('is_public_holiday_any', holiday_check.get('is_holiday'))
+
+        # --- MARKET DATA ---
+        
+        # Price
+        price = features_block.get('price_usd')
+        if price is None or price == 0:
+            price = dex_inner.get('priceUsd')
+        if price is None or price == 0:
+            price = get_nested(signal_result, 'dexscreener.price_usd')
+        if price is None or price == 0:
+            price = rc_inner.get('price')
+        features_dict['price_usd'] = float(price) if price else 0.0
+
+        # FDV
+        fdv = features_block.get('fdv_usd')
+        if fdv is None or fdv == 0:
+            fdv = dex_inner.get('fdv')
+        if fdv is None or fdv == 0:
+            fdv = dex_inner.get('marketCap')
+        if fdv is None or fdv == 0:
+            fdv = get_nested(signal_result, 'dexscreener.raw.fdv')
+        if fdv is None or fdv == 0:
+            fdv = get_nested(signal_result, 'dexscreener.raw.marketCap')
+        features_dict['fdv_usd'] = float(fdv) if fdv else 0.0
+        
+        # Liquidity
+        liq = features_block.get('liquidity_usd')
+        if liq is None or liq == 0:
+            liq = get_nested(dex_inner, 'liquidity.usd')
+        if liq is None or liq == 0:
+            liq = rc_summary.get('total_liquidity_usd')
+        if liq is None or liq == 0:
+            liq = rc_raw_wrapper.get('total_lp_usd')
+        features_dict['liquidity_usd'] = float(liq) if liq else 0.0
+
+        # Volume H24
+        vol = features_block.get('volume_h24_usd')
+        if vol is None or vol == 0:
+            vol = get_nested(dex_inner, 'volume.h24')
+        if vol is None or vol == 0:
+            vol = get_nested(signal_result, 'dexscreener.raw.volume.h24')
+        features_dict['volume_h24_usd'] = float(vol) if vol else 0.0
+        
+        # Price Change H24
+        chg = features_block.get('price_change_h24_pct')
+        if chg is None or chg == 0:
+            chg = get_nested(dex_inner, 'priceChange.h24')
+        if chg is None or chg == 0:
+            chg = get_nested(signal_result, 'dexscreener.raw.priceChange.h24')
+        features_dict['price_change_h24_pct'] = float(chg) if chg else 0.0
+
+        # Pair Age & Token Age
+        pair_created_at_ms = dex_inner.get('pairCreatedAt')
+        if not pair_created_at_ms:
+            pair_created_at_ms = get_nested(signal_result, 'dexscreener.raw.pairCreatedAt')
+
+        pair_created_ts = safe_divide(pair_created_at_ms, 1000) if pair_created_at_ms else None
+        
+        if features_dict['checked_at_timestamp'] and pair_created_ts:
+            features_dict['token_age_at_signal_seconds'] = features_dict['checked_at_timestamp'] - pair_created_ts
+        else:
+            features_dict['token_age_at_signal_seconds'] = 0
+
+        # --- SECURITY / RUGCHECK DATA ---
+        
+        # Token Supply
+        token_supply = get_nested(rc_inner, 'token.supply', 0)
+        features_dict['token_supply'] = float(token_supply) if token_supply else 0.0
+
+        # Authorities
+        has_mint = features_block.get('has_mint_authority')
+        if has_mint is None:
+            raw_auth = get_nested(rc_inner, 'token.mintAuthority')
+            has_mint = raw_auth is not None
+        features_dict['has_mint_authority'] = int(has_mint)
+
+        has_freeze = features_block.get('has_freeze_authority')
+        if has_freeze is None:
+            raw_auth = get_nested(rc_inner, 'token.freezeAuthority')
+            has_freeze = raw_auth is not None
+        features_dict['has_freeze_authority'] = int(has_freeze)
+        
+        # Creator Balance
+        creator_bal = rc_inner.get('creatorBalance', 0)
+        creator_pct = features_block.get('creator_balance_pct')
+        
+        # Calculate manually if missing or zero
+        if (creator_pct is None or creator_pct == 0) and token_supply > 0:
+            creator_pct = (float(creator_bal) / float(token_supply)) * 100
+        features_dict['creator_balance_pct'] = float(creator_pct) if creator_pct else 0.0
+
+        # Top 10 Holders
+        top_holders = rc_inner.get('topHolders') or []
+        top_10_pct = features_block.get('top_10_holders_pct')
+        if top_10_pct is None or top_10_pct == 0:
+            top_10_pct = sum(h.get('pct', 0) for h in top_holders[:10])
+        features_dict['top_10_holders_pct'] = float(top_10_pct)
+        
+        top_1_pct = sum(h.get('pct', 0) for h in top_holders[:1])
+
+        # LP Locked
+        lp_locked_usd = features_block.get('total_lp_locked_usd')
+        if lp_locked_usd is None or lp_locked_usd == 0:
+            lp_locked_usd = rc_raw_wrapper.get('total_lp_usd')
+        if lp_locked_usd is None or lp_locked_usd == 0:
+            markets = rc_inner.get('markets', [])
+            lp_locked_usd = sum(m.get('lp', {}).get('lpLockedUSD', 0) for m in markets)
+        features_dict['total_lp_locked_usd'] = float(lp_locked_usd) if lp_locked_usd else 0.0
+
+        lp_locked_pct = rc_summary.get('lp_locked_pct')
+        if lp_locked_pct is None:
+            lp_locked_pct = rc_raw_wrapper.get('overall_lp_locked_pct', 0)
+        
+        features_dict['is_lp_locked_95_plus'] = int(float(lp_locked_pct) >= 95 if lp_locked_pct is not None else 0)
+
+        features_dict['rugcheck_risk_level'] = features_block.get('rugcheck_risk_level', 'unknown')
+
+        # --- INSIDERS (Fix for zero values) ---
+        insider_networks = rc_inner.get('insiderNetworks')
+        
+        # Handle case where insiderNetworks is None (JSON null) or missing
+        if insider_networks is None:
+            insider_networks = []
+        
+        features_dict['total_insider_networks'] = len(insider_networks)
+        
+        if insider_networks:
+            features_dict['largest_insider_network_size'] = max((n.get('size', 0) for n in insider_networks), default=0)
+            features_dict['total_insider_token_amount'] = sum((n.get('tokenAmount', 0) for n in insider_networks), start=0)
+        else:
+            features_dict['largest_insider_network_size'] = 0
+            features_dict['total_insider_token_amount'] = 0
+
+        # --- DERIVED RATIOS ---
+        f_fdv = features_dict['fdv_usd']
+        f_liq = features_dict['liquidity_usd']
+        f_vol = features_dict['volume_h24_usd']
+        
+        features_dict['volume_to_liquidity_ratio'] = safe_divide(f_vol, f_liq)
+        features_dict['fdv_to_liquidity_ratio'] = safe_divide(f_fdv, f_liq)
+        features_dict['liquidity_to_volume_ratio'] = safe_divide(f_liq, f_vol)
+
+        # --- RISK SCORE ---
+        pump_dump_components = []
+        
+        # Insider risk
+        i_size = features_dict['largest_insider_network_size']
+        if i_size > 100: pump_dump_components.append(30)
+        elif i_size > 50: pump_dump_components.append(20)
+        elif i_size > 20: pump_dump_components.append(10)
+        
+        # Whale risk
+        if top_1_pct > 30: pump_dump_components.append(25)
+        elif top_1_pct > 20: pump_dump_components.append(15)
+        elif top_1_pct > 10: pump_dump_components.append(8)
+        
+        # LP Risk
+        lp_pct_val = float(lp_locked_pct) if lp_locked_pct is not None else 0
+        if lp_pct_val < 50: pump_dump_components.append(20)
+        elif lp_pct_val < 80: pump_dump_components.append(12)
+        elif lp_pct_val < 95: pump_dump_components.append(5)
+        
+        # Authority Risk
+        transfer_fee = rc_summary.get('transfer_fee_pct', 0)
+        auth_score = (50 if has_mint else 0) + (50 if has_freeze else 0) + (transfer_fee * 100)
+        pump_dump_components.append(min(auth_score / 100 * 15, 15))
+        
+        # Creator Risk / Token Age Check
+        finalization = snapshot.get('finalization', {})
+        raw_age = finalization.get('token_age_hours_at_signal')
+        
+        # Force cast string ages to float
+        try:
+            token_age_hours = float(raw_age) if raw_age is not None else None
+        except (ValueError, TypeError):
+            token_age_hours = None
             
-            features = snapshot.get('features', {})
+        features_dict['token_age_hours_at_signal'] = token_age_hours
+        
+        creator_dumped = (creator_pct == 0) and (token_age_hours is not None and token_age_hours < 24)
+        if creator_dumped: pump_dump_components.append(10)
+        elif creator_pct > 10: pump_dump_components.append(7)
+        elif creator_pct > 5: pump_dump_components.append(4)
+        
+        features_dict['pump_dump_risk_score'] = sum(pump_dump_components)
+
+        # --- 4. Clean Final Dictionary ---
+        clean_row = {}
+        for ml_key, map_key in self.FEATURE_MAPPING.items():
+            val = features_dict.get(ml_key)
             
-            features_dict['mint'] = features.get('mint', signal_data_result.get('mint'))
-            features_dict['signal_source'] = features.get('signal_source')
-            features_dict['grade'] = features.get('grade', signal_data_result.get('grade'))
-            features_dict['checked_at_utc'] = features.get('checked_at_utc', signal_data_result.get('checked_at'))
-            features_dict['checked_at_timestamp'] = features.get('checked_at_timestamp')
-            
-            features_dict['time_of_day_utc'] = features.get('time_of_day_utc')
-            features_dict['day_of_week_utc'] = features.get('day_of_week_utc')
-            features_dict['is_weekend_utc'] = features.get('is_weekend_utc')
-            features_dict['is_public_holiday_any'] = features.get('is_public_holiday_any', holiday_check.get('is_holiday'))
-
-            # Market features (with fallbacks)
-            features_dict['price_usd'] = features.get('price_usd')
-            if features_dict['price_usd'] is None:
-                features_dict['price_usd'] = primary_dex_pair.get('priceUsd')
-                if features_dict['price_usd'] is None:
-                    features_dict['price_usd'] = dexscreener_data.get('current_price_usd')
-            
-            features_dict['fdv_usd'] = features.get('fdv_usd')
-            if features_dict['fdv_usd'] is None:
-                features_dict['fdv_usd'] = primary_dex_pair.get('fdv')
-
-            features_dict['liquidity_usd'] = features.get('liquidity_usd')
-            if features_dict['liquidity_usd'] is None:
-                features_dict['liquidity_usd'] = primary_dex_liquidity.get('usd')
-                if features_dict['liquidity_usd'] is None:
-                    features_dict['liquidity_usd'] = rugcheck_data.get('total_liquidity_usd')
-
-            features_dict['volume_h24_usd'] = features.get('volume_h24_usd')
-            if features_dict['volume_h24_usd'] is None:
-                features_dict['volume_h24_usd'] = primary_dex_volume.get('h24')
-
-            features_dict['price_change_h24_pct'] = features.get('price_change_h24_pct')
-            if features_dict['price_change_h24_pct'] is None:
-                features_dict['price_change_h24_pct'] = primary_dex_price_change.get('h24')
-
-            pair_created_at_ms = primary_dex_pair.get('pairCreatedAt')
-            pair_created_at_ts_from_dex = safe_divide(pair_created_at_ms, 1000)
-            features_dict['pair_created_at_timestamp'] = features.get('pair_created_at_timestamp', pair_created_at_ts_from_dex)
-
-            # Security features (with fallbacks)
-            features_dict['rugcheck_risk_level'] = features.get('rugcheck_risk_level')
-            
-            features_dict['has_mint_authority'] = features.get('has_mint_authority')
-            if features_dict['has_mint_authority'] is None:
-                raw_mint_auth = rugcheck_raw_data.get('mintAuthority', rugcheck_data.get('mint_authority'))
-                features_dict['has_mint_authority'] = raw_mint_auth is not None
+            # Type Enforcement
+            if ml_key.endswith('_ratio') or ml_key.endswith('_usd') or ml_key.endswith('_pct'):
+                clean_row[ml_key] = float(val) if val is not None else 0.0
+            elif ml_key.startswith('is_') or ml_key.startswith('has_'):
+                clean_row[ml_key] = int(val) if val else 0
+            elif ml_key in ['token_supply', 'largest_insider_network_size', 'total_insider_networks', 'total_insider_token_amount']:
+                clean_row[ml_key] = float(val) if val is not None else 0.0
+            elif val is None:
+                clean_row[ml_key] = 'UNKNOWN' if isinstance(clean_row.get(ml_key, ''), str) else 0
+            else:
+                clean_row[ml_key] = val
                 
-            features_dict['has_freeze_authority'] = features.get('has_freeze_authority')
-            if features_dict['has_freeze_authority'] is None:
-                raw_freeze_auth = rugcheck_raw_data.get('freezeAuthority', rugcheck_data.get('freeze_authority'))
-                features_dict['has_freeze_authority'] = raw_freeze_auth is not None
+        # --- 5. Add Labels ---
+        label = snapshot.get('label', {})
+        if label:
+            clean_row['label_status'] = label.get('status', 'unknown')
+            clean_row['label_ath_roi'] = label.get('ath_roi', 0)
+            clean_row['label_final_roi'] = label.get('final_roi', 0)
+            clean_row['label_hit_50_percent'] = int(label.get('hit_50_percent', False))
+        else:
+            clean_row['label_status'] = 'expired'
+            clean_row['label_ath_roi'] = 0
+            clean_row['label_final_roi'] = 0
+            clean_row['label_hit_50_percent'] = 0
 
-            token_supply_from_raw = rugcheck_raw_data.get('token', {}).get('supply', 0)
-            creator_balance_from_raw = rugcheck_raw_data.get('creatorBalance', rugcheck_data.get('creator_balance'))
-            creator_balance_pct_from_raw = safe_divide(creator_balance_from_raw, token_supply_from_raw, 0) * 100
-            features_dict['creator_balance_pct'] = features.get('creator_balance_pct', creator_balance_pct_from_raw)
-
-            top_holders_from_raw = rugcheck_raw_data.get('topHolders', [])
-            top_10_pct_from_raw = sum(h.get('pct', 0) for h in top_holders_from_raw[:10]) if top_holders_from_raw else 0
-            features_dict['top_10_holders_pct'] = features.get('top_10_holders_pct', top_10_pct_from_raw)
-
-            lp_locked_pct_from_inputs = rugcheck_data.get('lp_locked_pct')
-            is_lp_locked_95_plus_from_inputs = (lp_locked_pct_from_inputs >= 95) if lp_locked_pct_from_inputs is not None else None
-            features_dict['is_lp_locked_95_plus'] = features.get('is_lp_locked_95_plus', is_lp_locked_95_plus_from_inputs)
-
-            total_lp_locked_usd_from_raw = rugcheck_raw_data.get('total_lp_usd')
-            if total_lp_locked_usd_from_raw is None:
-                markets_from_raw = rugcheck_raw_data.get('markets', [])
-                if markets_from_raw:
-                    total_lp_locked_usd_from_raw = sum(m.get('lp', {}).get('lpLockedUSD', 0) for m in markets_from_raw)
-            features_dict['total_lp_locked_usd'] = features.get('total_lp_locked_usd', total_lp_locked_usd_from_raw)
-            
-            # Token age
-            token_age_at_signal_seconds_from_inputs = None
-            if features_dict['checked_at_timestamp'] and features_dict['pair_created_at_timestamp']:
-                token_age_at_signal_seconds_from_inputs = features_dict['checked_at_timestamp'] - features_dict['pair_created_at_timestamp']
-            features_dict['token_age_at_signal_seconds'] = features.get('token_age_at_signal_seconds', token_age_at_signal_seconds_from_inputs)
-
-            # 4. Get Additional Data for Derived Features
-            finalization = snapshot.get('finalization', {})
-            features_dict['token_age_hours_at_signal'] = finalization.get('token_age_hours_at_signal')
-            
-            if len(top_holders_from_raw) >= 3:
-                features_dict['top_3_holders_pct'] = sum(h.get('pct', 0) for h in top_holders_from_raw[:3])
-            else:
-                features_dict['top_3_holders_pct'] = None
-            
-            insider_networks = rugcheck_raw_data.get('insiderNetworks') or []
-            features_dict['total_insider_networks'] = len(insider_networks)
-            if insider_networks:
-                features_dict['largest_insider_network_size'] = max(n.get('size', 0) for n in insider_networks)
-                features_dict['total_insider_token_amount'] = sum(n.get('tokenAmount', 0) for n in insider_networks)
-            else:
-                features_dict['largest_insider_network_size'] = 0
-                features_dict['total_insider_token_amount'] = 0
-            
-            features_dict['token_supply'] = rugcheck_raw_data.get('token', {}).get('supply')
-
-            # 5. DERIVED FEATURES
-            
-            # Smart Money & Overlap Metrics
-            overlap_count = signal_data_result.get('overlap_count') or 0
-            weighted_concentration = signal_data_result.get('weighted_concentration') or 0
-            total_winner_wallets = signal_data_result.get('total_winner_wallets') or 1
-            holder_count = rugcheck_data.get('holder_count') or 1
-            
-            features_dict['overlap_quality_score'] = safe_divide(overlap_count * weighted_concentration, total_winner_wallets, 0)
-            features_dict['winner_wallet_density'] = safe_divide(overlap_count, holder_count, 0)
-            
-            # Liquidity & Volume Metrics (replaces originals)
-            total_liquidity = features_dict['liquidity_usd'] or 0
-            fdv_usd = features_dict['fdv_usd'] or 0
-            volume_h24 = features_dict['volume_h24_usd'] or 0
-            
-            features_dict['volume_to_liquidity_ratio'] = safe_divide(volume_h24, total_liquidity, 0)
-            features_dict['fdv_to_liquidity_ratio'] = safe_divide(fdv_usd, total_liquidity, 0)
-            
-            # Holder Concentration
-            top1_pct = rugcheck_data.get('top1_holder_pct') or 0
-            top10_pct = features_dict['top_10_holders_pct'] or 0
-            features_dict['whale_concentration_score'] = (top1_pct * 3) + (top10_pct - top1_pct) if top10_pct >= top1_pct else top1_pct * 3
-            
-            # Token Age (replaces original)
-            token_age_hours = features_dict['token_age_hours_at_signal']
-            if token_age_hours is not None:
-                features_dict['is_new_token'] = int(token_age_hours < 12) # < 12 hours
-            else:
-                ts_age = features_dict['token_age_at_signal_seconds']
-                features_dict['is_new_token'] = int(ts_age < 43200) if ts_age is not None else 0
-
-            # Risk Scores
-            has_mint_auth = features_dict['has_mint_authority']
-            has_freeze_auth = features_dict['has_freeze_authority']
-            transfer_fee = rugcheck_data.get('transfer_fee_pct') or 0
-            
-            features_dict['authority_risk_score'] = (
-                (50 if has_mint_auth else 0) + 
-                (50 if has_freeze_auth else 0) + 
-                (transfer_fee * 100 if transfer_fee else 0)
-            )
-            
-            creator_balance_pct = features_dict['creator_balance_pct'] or 0
-            features_dict['creator_dumped'] = (creator_balance_pct == 0) and (token_age_hours is not None and token_age_hours < 24)
-
-            # Composite Pump & Dump Risk Score
-            pump_dump_components = []
-            insider_size = features_dict.get('largest_insider_network_size') or 0
-            if insider_size > 100: pump_dump_components.append(30)
-            elif insider_size > 50: pump_dump_components.append(20)
-            elif insider_size > 20: pump_dump_components.append(10)
-            else: pump_dump_components.append(0)
-            
-            if top1_pct > 30: pump_dump_components.append(25)
-            elif top1_pct > 20: pump_dump_components.append(15)
-            elif top1_pct > 10: pump_dump_components.append(8)
-            else: pump_dump_components.append(0)
-            
-            lp_locked_pct = lp_locked_pct_from_inputs or 0
-            if lp_locked_pct < 50: pump_dump_components.append(20)
-            elif lp_locked_pct < 80: pump_dump_components.append(12)
-            elif lp_locked_pct < 95: pump_dump_components.append(5)
-            else: pump_dump_components.append(0)
-            
-            pump_dump_components.append(min(features_dict['authority_risk_score'] / 100 * 15, 15))
-            
-            if features_dict.get('creator_dumped'): pump_dump_components.append(10)
-            elif creator_balance_pct > 10: pump_dump_components.append(7)
-            elif creator_balance_pct > 5: pump_dump_components.append(4)
-            else: pump_dump_components.append(0)
-            
-            features_dict['pump_dump_risk_score'] = sum(pump_dump_components)
-            
-            # Temporal Context Features
-            hour = features_dict['time_of_day_utc']
-            if hour is not None:
-                if 0 <= hour < 7: features_dict['hour_category'] = 'dead_hours'
-                elif 7 <= hour < 15: features_dict['hour_category'] = 'asia_hours'
-                elif 15 <= hour < 19: features_dict['hour_category'] = 'eu_hours'
-                else: features_dict['hour_category'] = 'us_hours'
-            else:
-                features_dict['hour_category'] = None
-            
-            day_of_week = features_dict['day_of_week_utc']
-            if day_of_week is not None:
-                features_dict['is_last_day_of_week'] = (day_of_week == 4)  # Friday
-            else:
-                features_dict['is_last_day_of_week'] = None         
-            
-            # 6. Apply original None/bool handling
-            # This cleans up all features in FEATURE_MAPPING for the ML model
-            
-            # We must *assume* self.FEATURE_MAPPING is available in the class.
-            for ml_feature, snapshot_key in self.FEATURE_MAPPING.items():
-                
-                # Get the value we just populated
-                value = features_dict.get(ml_feature)
-                
-                # Handle boolean -> int conversion
-                if isinstance(value, bool):
-                    value = int(value)
-                
-                # Handle None
-                if value is None:
-                    if ml_feature in ['price_usd', 'fdv_usd', 'liquidity_usd', 
-                                    'volume_h24_usd', 'price_change_h24_pct',
-                                    'creator_balance_pct', 'top_10_holders_pct',
-                                    'total_lp_locked_usd', 'token_age_at_signal_seconds',
-                                    'time_of_day_utc', 'day_of_week_utc',
-                                    'checked_at_timestamp', 'token_age_hours_at_signal']:
-                        value = 0.0
-                    elif ml_feature in ['has_mint_authority', 'has_freeze_authority',
-                                    'is_lp_locked_95_plus', 'is_weekend_utc',
-                                    'is_public_holiday_any']:
-                        value = 0
-                    elif ml_feature in ['rugcheck_risk_level', 'signal_source', 
-                                    'grade', 'mint', 'checked_at_utc']:
-                        value = 'UNKNOWN'
-                
-                features_dict[ml_feature] = value
-
-            # 7. Add label (using the robust logic from original)
-            label = snapshot.get('label', {})
-            if label:
-                features_dict['label_status'] = label.get('status', 'unknown')
-                features_dict['label_ath_roi'] = label.get('ath_roi', 0)
-                features_dict['label_final_roi'] = label.get('final_roi', 0)
-                features_dict['label_hit_50_percent'] = int(label.get('hit_50_percent', False))
-                features_dict['label_token_age_hours'] = label.get('token_age_hours', 0)
-                features_dict['label_tracking_duration_hours'] = label.get('tracking_duration_hours', 0)
-            else:
-                # Expired/unlabeled
-                features_dict['label_status'] = 'expired'
-                features_dict['label_ath_roi'] = 0
-                features_dict['label_final_roi'] = 0
-                features_dict['label_hit_50_percent'] = 0
-                features_dict['label_token_age_hours'] = 0
-                features_dict['label_tracking_duration_hours'] = 0
-                        
-            return features_dict
+        return clean_row
     
     async def extract_all_data(self, pipeline: str) -> List[Dict]:
-        """
-        Extract all datasets for a pipeline (auto-discover all dates).
-        Returns list of feature dicts.
-        """
         logger.info(f"Discovering all date folders for {pipeline}...")
         date_folders = await self.list_all_dataset_folders(pipeline)
-        
-        if not date_folders:
-            logger.warning(f"No date folders found for {pipeline}")
-            return []
-        
-        logger.info(f"Found {len(date_folders)} date folders: {date_folders[0]} to {date_folders[-1]}")
+        if not date_folders: return []
         
         all_features = []
-        
         for date_str in date_folders:
-            # List files
             files = await self.list_dataset_files(pipeline, date_str)
-            
             if files:
                 logger.info(f"Processing {pipeline}/{date_str}: {len(files)} files")
-                
                 for filename in files:
                     remote_path = f"datasets/{pipeline}/{date_str}/{filename}"
                     snapshot = await self.download_dataset_file(remote_path)
-                    
                     if snapshot:
                         try:
                             features = self.extract_features_from_snapshot(snapshot)
                             all_features.append(features)
                         except Exception as e:
-                            logger.error(f"Failed to extract features from {filename}: {e}")
-        
-        logger.info(f"Extracted {len(all_features)} samples from {len(date_folders)} dates")
+                            logger.error(f"Error in {filename}: {e}")
         return all_features
     
     async def extract_date_range(self, pipeline: str, start_date: str, end_date: str) -> List[Dict]:
-        """
-        Extract all datasets for a pipeline between two dates.
-        Returns list of feature dicts.
-        """
         start_dt = datetime.strptime(start_date, '%Y-%m-%d')
         end_dt = datetime.strptime(end_date, '%Y-%m-%d')
-        
         all_features = []
-        dates_processed = 0
-        
         current_date = start_dt
+        
         while current_date <= end_dt:
             date_str = current_date.strftime('%Y-%m-%d')
-            
-            # List files
             files = await self.list_dataset_files(pipeline, date_str)
-            
             if files:
                 logger.info(f"Processing {pipeline}/{date_str}: {len(files)} files")
-                
                 for filename in files:
                     remote_path = f"datasets/{pipeline}/{date_str}/{filename}"
                     snapshot = await self.download_dataset_file(remote_path)
-                    
                     if snapshot:
                         try:
                             features = self.extract_features_from_snapshot(snapshot)
                             all_features.append(features)
                         except Exception as e:
-                            logger.error(f"Failed to extract features from {filename}: {e}")
-                
-                dates_processed += 1
-            
+                            logger.error(f"Error in {filename}: {e}")
             current_date += timedelta(days=1)
-        
-        logger.info(f"Extracted {len(all_features)} samples from {dates_processed} dates")
         return all_features
     
     async def create_training_dataset(self, start_date: Optional[str], end_date: Optional[str], output_file: str):
-        """
-        Create complete training dataset from both pipelines.
-        If start_date/end_date are None, extracts ALL available data.
-        """
         if start_date and end_date:
             logger.info(f"Creating training dataset: {start_date} to {end_date}")
-            # Extract from both pipelines with date range
-            logger.info("\n📥 Extracting discovery signals...")
             discovery_features = await self.extract_date_range('discovery', start_date, end_date)
-            
-            logger.info("\n📥 Extracting alpha signals...")
             alpha_features = await self.extract_date_range('alpha', start_date, end_date)
         else:
             logger.info("Creating training dataset: ALL AVAILABLE DATA")
-            # Extract ALL data from both pipelines
-            logger.info("\n📥 Extracting ALL discovery signals...")
             discovery_features = await self.extract_all_data('discovery')
-            
-            logger.info("\n📥 Extracting ALL alpha signals...")
             alpha_features = await self.extract_all_data('alpha')
         
-        # Combine
         all_features = discovery_features + alpha_features
         logger.info(f"\n✅ Combined: {len(all_features)} total samples")
         
-        if len(all_features) == 0:
-            logger.error("No data extracted! Check your Supabase bucket and datasets folder.")
+        if not all_features:
+            logger.error("No data extracted!")
             return None
         
-        # Convert to DataFrame
         df = pd.DataFrame(all_features)
         
-        # --- [START] MODIFIED SECTION: Apply 'first-per-tracking-period' cleaning ---
+        # Deduplication Logic (First per tracking period)
         if 'checked_at_utc' in df.columns and 'mint' in df.columns:
-            logger.info(f"Applying 'first-per-tracking-period' deduplication logic (24h/168h)...")
+            logger.info(f"Applying deduplication...")
             
-            # 1. Define the helper function for complex deduplication
             def filter_by_tracking_period(group):
                 rows_to_keep = []
-                tracking_end_time = pd.NaT  # Not a Time
-
-                # The group is already sorted by 'checked_at_utc'
+                tracking_end_time = pd.NaT
                 for index, row in group.iterrows():
                     current_time = row['checked_at_utc']
+                    if pd.isna(current_time): continue
                     
-                    # Skip rows with invalid timestamps
-                    if pd.isna(current_time):
-                        continue
-                        
-                    # Check if this row is the start of a new tracking period
-                    # (Either the very first row, or it's after the last tracking period ended)
                     if pd.isna(tracking_end_time) or current_time >= tracking_end_time:
-                        # 1. Keep this row
                         rows_to_keep.append(index)
                         
-                        # 2. Calculate the *new* tracking period based on this row
-                        token_age = row['token_age_hours_at_signal']
-                        
-                        # Note: (np.nan < 12) evaluates to False.
-                        # This correctly defaults tokens with unknown age to the 168h period.
-                        is_new_token = (token_age < 12)
-                        
+                        # Defensive type conversion here
+                        raw_age = row.get('token_age_hours_at_signal')
+                        try:
+                            token_age = float(raw_age) if pd.notna(raw_age) else None
+                        except (ValueError, TypeError):
+                            token_age = None
+                            
+                        is_new_token = (token_age is not None and token_age < 12)
                         tracking_duration_hours = 24 if is_new_token else 168
-                        
-                        # 3. Set the end time for this new period
                         tracking_end_time = current_time + pd.Timedelta(hours=tracking_duration_hours)
-                    
-                    # else: (current_time < tracking_end_time)
-                    # This row is inside an active tracking period, so we drop it
-                    # by not adding its index to rows_to_keep.
-                
-                # Return only the rows we've selected
                 return group.loc[rows_to_keep]
-
-            # 2. Ensure checked_at_utc is datetime
-            #    Handle 'UNKNOWN' values by converting them to NaT
             df['checked_at_utc'] = pd.to_datetime(df['checked_at_utc'], errors='coerce')
-            
-            # 3. Sort by mint and timestamp (CRITICAL for the filter logic)
-            df = df.sort_values(by=['mint', 'checked_at_utc'], ascending=[True, True])
-            
-            # 4. Apply the custom filter function
-            original_count = len(df)
-            # We group by 'mint' and apply our custom logic to each group
-            df = df.groupby('mint').apply(filter_by_tracking_period)
-            
-            # 5. Clean up the DataFrame
-            # .apply() creates a multi-index; remove it.
-            df = df.reset_index(drop=True)
-            cleaned_count = len(df)
-            
-            logger.info(f"After 'first-per-tracking-period' deduplication: {cleaned_count} samples ({original_count - cleaned_count} duplicates removed)")
+            df = df.sort_values(by=['mint', 'signal_source', 'checked_at_utc'])
+            df = df.groupby(['mint', 'signal_source']).apply(filter_by_tracking_period).reset_index(drop=True)
 
-        else:
-            logger.warning("Could not apply 'first-per-tracking-period' cleaning: 'mint' or 'checked_at_utc' missing.")
-            # Fallback to original deduplication just in case
-            if 'mint' in df.columns and 'checked_at_timestamp' in df.columns:
-                df = df.drop_duplicates(subset=['mint', 'checked_at_timestamp'])
-                logger.info(f"After (fallback) timestamp deduplication: {len(df)} samples")
-        # --- [END] MODIFIED SECTION ---
         
-        
-        # Remove unlabeled samples
+        # Remove unlabeled
         df = df[df['label_status'].isin(['win', 'loss'])]
-        logger.info(f"After removing unlabeled: {len(df)} samples")
-        
-        if len(df) == 0:
-            logger.warning("No labeled samples (win/loss) found in the data!")
-            return None
-        
-        # Sort by timestamp
-        if 'checked_at_timestamp' in df.columns:
-            df = df.sort_values('checked_at_timestamp')
-        
-        # Print statistics
-        logger.info("\n📊 Dataset Statistics:")
-        logger.info(f"  Total samples: {len(df)}")
-        logger.info(f"  Wins: {(df['label_status'] == 'win').sum()} ({(df['label_status'] == 'win').mean()*100:.2f}%)")
-        logger.info(f"  Losses: {(df['label_status'] == 'loss').sum()} ({(df['label_status'] == 'loss').mean()*100:.2f}%)")
-        
-        logger.info("\n📊 By Signal Source:")
-        if 'signal_source' in df.columns:
-            for source in df['signal_source'].unique():
-                source_df = df[df['signal_source'] == source]
-                win_rate = (source_df['label_status'] == 'win').mean()
-                logger.info(f"  {source}: {len(source_df)} samples, {win_rate*100:.2f}% win rate")
-        
-        logger.info("\n📊 By Grade:")
-        if 'grade' in df.columns:
-            for grade in sorted(df['grade'].unique()):
-                grade_df = df[df['grade'] == grade]
-                win_rate = (grade_df['label_status'] == 'win').mean()
-                logger.info(f"  {grade}: {len(grade_df)} samples, {win_rate*100:.2f}% win rate")
         
         # Save
         df.to_csv(output_file, index=False)
         logger.info(f"\n✅ Saved to: {output_file}")
         
-        # Print feature list
-        logger.info("\n📋 Features extracted:")
-        feature_cols = [c for c in df.columns if not c.startswith('label_') and c != 'checked_at_date']
+        # Print sample statistics
+        logger.info(f"\n📊 Dataset Statistics:")
+        logger.info(f"Total rows: {len(df)}")
+        logger.info(f"Unique tokens: {df['mint'].nunique()}")
+        logger.info(f"Win/Loss distribution:\n{df['label_status'].value_counts()}")
         
-        for i, col in enumerate(feature_cols, 1):
-            logger.info(f"  {i:2}. {col}")
+        # Check for zero values in problematic columns
+        problem_cols = ['fdv_usd', 'volume_h24_usd', 'creator_balance_pct', 'token_supply']
+        for col in problem_cols:
+            zero_count = (df[col] == 0).sum()
+            if zero_count > 0:
+                logger.warning(f"⚠️  {col}: {zero_count} zero values ({zero_count/len(df)*100:.1f}%)")
         
         return df
 
 
 async def main():
-    parser = argparse.ArgumentParser(
-        description="Extract training features from Supabase datasets",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Extract ALL available data (automatic discovery)
-  python extract_features_from_datasets.py
-  
-  # Extract with custom output path
-  python extract_features_from_datasets.py --output data/my_dataset.csv
-  
-  # Extract specific date range
-  python extract_features_from_datasets.py --start-date 2025-10-01 --end-date 2025-11-12
-        """
-    )
-    parser.add_argument('--output', type=str, default='data/token_datasets.csv', 
-                       help='Output CSV file (default: data/token_datasets.csv)')
-    parser.add_argument('--start-date', type=str, default=None, 
-                       help='Optional: Start date YYYY-MM-DD (extracts all if not provided)')
-    parser.add_argument('--end-date', type=str, default=None, 
-                       help='Optional: End date YYYY-MM-DD (extracts all if not provided)')
-    
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--output', type=str, default='data/token_datasets.csv')
+    parser.add_argument('--start-date', type=str, default=None)
+    parser.add_argument('--end-date', type=str, default=None)
     args = parser.parse_args()
     
-    # Validate date arguments
-    if (args.start_date and not args.end_date) or (args.end_date and not args.start_date):
-        logger.error("Both --start-date and --end-date must be provided together, or neither.")
-        return
-    
-    # Create output directory
     os.makedirs(os.path.dirname(args.output) or '.', exist_ok=True)
-    
-    # Extract features
     extractor = FeatureExtractor()
-    df = await extractor.create_training_dataset(
-        args.start_date,
-        args.end_date,
-        args.output
-    )
-    
-    if df is not None and len(df) > 0:
-        print("\n" + "="*60)
-        print("✅ FEATURE EXTRACTION COMPLETE!")
-        print("="*60)
-        print(f"\n📁 Dataset saved: {args.output}")
-        print(f"📊 Total samples: {len(df)}")
-        print(f"🎯 Win rate: {(df['label_status'] == 'win').mean()*100:.2f}%")
-        print("\nNext step: Run the training notebook!")
-    else:
-        print("\n" + "="*60)
-        print("⚠️  NO DATA EXTRACTED")
-        print("="*60)
-        print("\nPlease check:")
-        print("  1. Supabase credentials in .env file")
-        print("  2. datasets/ folder exists in your bucket")
-        print("  3. Date folders contain .json files")
-        print("  4. Files have been labeled (status: win/loss)")
-
+    await extractor.create_training_dataset(args.start_date, args.end_date, args.output)
 
 if __name__ == "__main__":
     asyncio.run(main())
