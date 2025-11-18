@@ -67,17 +67,17 @@ SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "monitor-data")
 
 # --- Probation Config ---
 PROBATION_TOP_N = int(os.getenv("PROBATION_TOP_N", "3"))
-PROBATION_THRESHOLD_PCT = float(os.getenv("PROBATION_THRESHOLD_PCT", "90"))
+PROBATION_THRESHOLD_PCT = float(os.getenv("PROBATION_THRESHOLD_PCT", "40"))
 
 # --- Monitoring Window Config ---
 TOKEN_MONITORING_WINDOW_HOURS = int(os.getenv("TOKEN_MONITORING_WINDOW_HOURS", "6"))
 
 # --- MINIMUM SECURITY REQUIREMENTS ---
-MIN_HOLDER_COUNT = 5
+MIN_HOLDER_COUNT = 50
 MIN_LIQUIDITY_USD = 10000.0
-MIN_LP_LOCKED_PCT = 55.0 
+MIN_LP_LOCKED_PCT = 80.0 
 MAX_TRANSFER_FEE_PCT = 5
-MAX_CREATOR_BALANCE = 0.0 # Must be exactly 0
+MAX_CREATOR_BALANCE_PCT = 10.0 
 
 # -----------------------------------------------
 # Re-usable Helpers
@@ -1168,9 +1168,13 @@ class AlphaTokenAnalyzer:
         if rugcheck_details.get("has_authorities"):
             security_failures.append("has_active_authorities")
         
-        # Check for creator balance (must be zero)
-        # if rugcheck_details.get("creator_balance", 0) > MAX_CREATOR_BALANCE:
-        #     security_failures.append(f"creator_balance:{rugcheck_details.get('creator_balance')}_req_{MAX_CREATOR_BALANCE}")
+        supply = rugcheck_details.get("token", {}).get("supply", 0)
+        decimals = rugcheck_details.get("token", {}).get("decimals", 0)
+        total_supply = supply / (10 ** decimals) if decimals > 0 else supply
+
+        # Check for creator balance percentage
+        if rugcheck_details.get("creator_balance", 0) / total_supply * 100 > MAX_CREATOR_BALANCE_PCT:
+            security_failures.append(f"creator_balance_pct:{rugcheck_details.get('creator_balance')/ total_supply * 100}_req_{MAX_CREATOR_BALANCE_PCT}%")
         
         # Check transfer fee (must be low)
         if rugcheck_details.get("transfer_fee_pct", 0) > MAX_TRANSFER_FEE_PCT:
