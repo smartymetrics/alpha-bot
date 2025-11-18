@@ -2151,8 +2151,8 @@ class Monitor:
             total_supply = supply / (10 ** decimals) if decimals > 0 else supply
 
             # Rule 3: Check creator token balance
-            if r.get("creator_balance", 0)/total_supply *100 >  MAX_CREATOR_PCT:
-                reasons.append(f"creator_balance_pct:{r.get('creator_balance')/total_supply *100} ")
+            if r.get("creator_balance", 0)/total_supply *100 if total_supply > 0 else 1 >  MAX_CREATOR_PCT:
+                reasons.append(f"creator_balance_pct:{r.get('creator_balance')/total_supply *100 if total_supply > 0 else 1 } ")
 
             # Rule 4: Check transfer fee (must be <= 5%)
             if r.get("transfer_fee_pct", 0) > 5:
