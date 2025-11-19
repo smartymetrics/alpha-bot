@@ -1932,7 +1932,7 @@ class Monitor:
         # --- Probation Check ---
         probation_result = evaluate_probation_from_rugcheck(data)
 
-        top_holders = data.get("topHolders", [])
+        top_holders = data.get("topHolders") or [] # FIX: Handle null
         rugged = data.get("rugged", False)
         
         # Authorities and Creator Balance
@@ -1959,12 +1959,14 @@ class Monitor:
         # --- End Modification ---
 
         # --- Liquidity Aggregation ---
-        markets = data.get("markets", [])
+        markets = data.get("markets") or [] # FIX: Handle null
         total_lp_locked_usd = 0.0
         total_lp_usd = 0.0
         lp_lock_details = []
 
         for market in markets:
+            if not market: # FIX: Handle null items in list
+                continue
             lp_data = market.get("lp", {})
             if lp_data:
                 lp_locked_usd = float(lp_data.get("lpLockedUSD", 0))
@@ -2029,74 +2031,7 @@ class Monitor:
             "total_liquidity_usd": r.get("total_lp_usd", 0.0),
             "lp_lock_details": r.get("lp_lock_details", [])
         }
-
-    def _build_ml_input(
-        self, 
-        start: TradingStart,
-        overlap_result: Dict[str, Any], 
-        security_report: Dict[str, Any],
-        dex_data: Optional[Dict[str, Any]]
-    ) -> Dict[str, Any]:
-        """Helper to construct the feature dictionary for ml_predictor_v2."""
-        
-        dex_raw = (dex_data or {}).get("raw", {}) or {} # Ensure dex_raw is a dict
-        
-        # --- Calculate Token Age ---
-        token_age_seconds = 0
-        block_time = start.block_time
-        if block_time:
-            try:
-                now_ts = int(datetime.now(timezone.utc).timestamp())
-                token_age_seconds = now_ts - int(block_time)
-            except Exception:
-                token_age_seconds = 0 # Default on error
-        
-        # --- Get DexScreener values ---
-        volume_h24 = 0.0
-        try:
-            volume_h24 = float((dex_raw.get("volume", {}).get("h24") or 0.0))
-        except (ValueError, TypeError):
-            pass
-            
-        fdv = 0.0
-        try:
-            fdv = float((dex_raw.get("fdv") or 0.0))
-        except (ValueError, TypeError):
-            pass
-            
-        price_change_h24 = 0.0
-        try:
-            price_change_h24 = float((dex_raw.get("priceChange", {}).get("h24") or 0.0))
-        except (ValueError, TypeError):
-            pass
-
-        # --- Build the feature dict ---
-        # This must match the features expected by ml_predictor_v2
-        feature_dict = {
-            # --- Available data ---
-            'signal_source': start.detected_via or 'unknown', # e.g., 'coingecko', 'dune'
-            'grade': overlap_result.get("grade", "NONE"),
-            'liquidity_usd': security_report.get("total_lp_usd", 0.0),
-            'volume_h24_usd': volume_h24,
-            'fdv_usd': fdv,
-            'price_change_h24_pct': price_change_h24,
-            'creator_balance_pct': security_report.get("creator_balance", 0.0),
-            'top_10_holders_pct': security_report.get("top_10_holders_pct", 0.0),
-            'total_lp_locked_usd': security_report.get("total_lp_locked_usd", 0.0),
-            'token_age_at_signal_seconds': max(0, token_age_seconds),
-            
-            # --- MOCKED/UNAVAILABLE data ---
-            # These are required by the ML script's engineer_features
-            # but not provided by token_monitor. We default them to 0.
-            'whale_concentration_score': 0.0,
-            'pump_dump_risk_score': 0.0,
-            'authority_risk_score': 0.0,
-            'overlap_quality_score': 0.0,
-            'winner_wallet_density': 0.0
-        }
-        
-        return feature_dict
-
+    
     async def run_token_analysis_step(self, start: TradingStart, check_count: int):
         """
         This is the new core analysis function, replacing _security_gate_and_route.
@@ -2144,14 +2079,27 @@ class Monitor:
                 if r.get("freeze_authority"): authorities.append("freeze")
                 if r.get("mint_authority"): authorities.append("mint")
                 reasons.append(f"authorities:{','.join(authorities)}")
+            
+            # --- FIX: Safe data access from rugcheck raw report ---
+            supply = 0
+            decimals = 0
+            raw_data = r.get("raw", {})
+            if raw_data:
+                token_data = raw_data.get("token", {})
+                if token_data:
+                    supply = token_data.get("supply", 0)
+                    decimals = token_data.get("decimals", 0)
 
-            supply = r.get("token", {}).get("supply", 0)
-            decimals = r.get("token", {}).get("decimals", 0)
             total_supply = supply / (10 ** decimals) if decimals > 0 else supply
+            # --- END FIX ---
 
             # Rule 3: Check creator token balance
-            if r.get("creator_balance", 0)/(total_supply *100 if total_supply > 0 else 1) >  MAX_CREATOR_PCT:
-                reasons.append(f"creator_balance_pct:{r.get('creator_balance')/total_supply *100 if total_supply > 0 else 1 } ")
+            creator_balance_val = r.get("creator_balance", 0)
+            if total_supply > 0 and (creator_balance_val / total_supply * 100) > MAX_CREATOR_PCT:
+                reasons.append(f"creator_balance_pct:{creator_balance_val / total_supply * 100}")
+            elif total_supply == 0 and creator_balance_val > 0:
+                 reasons.append(f"creator_balance_pct:invalid_supply")
+
 
             # Rule 4: Check transfer fee (must be <= 5%)
             if r.get("transfer_fee_pct", 0) > 5:
@@ -2240,17 +2188,20 @@ class Monitor:
         # --- ML PREDICTION (NEW) ---
         # Only run if all checks passed (security + overlap)
         ml_prediction_result = None
-        try:
-            # Build the feature dictionary for the ML model
-            ml_input_data = self._build_ml_input(
-                start=start,
-                overlap_result=overlap_result,
-                security_report=r, # 'r' is the rugcheck result from earlier
-                dex_data=dex_data
+        try:            
+            if self.debug:
+                print(f"[Analysis] 📞 Calling ML predictor for mint: {mint}")
+
+            # Call predict with the 'mint' string
+            ml_prediction_result = self.ml_classifier.predict(
+                mint, 
+                threshold=0.70
             )
             
-            # Run prediction
-            ml_prediction_result = self.ml_classifier.predict(ml_input_data)
+            # Handle cases where the model returns an error
+            if not ml_prediction_result or ml_prediction_result.get("error"):
+                raise ValueError(f"ML prediction returned an error: {ml_prediction_result.get('error', 'Unknown')}")
+            # --- END: MODIFICATION ---
             
         except Exception as e:
             if self.debug:
@@ -2260,6 +2211,7 @@ class Monitor:
                 'win_probability': 0.0,
                 'confidence': 'NONE',
                 'risk_tier': 'UNKNOWN',
+                'error': str(e)
             }
         # --- END ML PREDICTION ---
 
@@ -2275,13 +2227,18 @@ class Monitor:
                 "current_price_usd": dex_data.get("price_usd"),
                 "market_cap_usd": dex_data.get("market_cap_usd"),
             },
-            # --- NEW: Embed ML Result ---
+            # --- START: MODIFICATION (Attach all details) ---
+            # Attach the full prediction results, including key_metrics and warnings
             "ml_prediction": {
                 "probability": ml_prediction_result.get("win_probability"),
                 "confidence": ml_prediction_result.get("confidence"),
                 "risk_tier": ml_prediction_result.get("risk_tier"),
-                "action": ml_prediction_result.get("action")
+                "action": ml_prediction_result.get("action"),
+                "error": ml_prediction_result.get("error"),
+                "key_metrics": ml_prediction_result.get("key_metrics"), # Add key_metrics
+                "warnings": ml_prediction_result.get("warnings")       # Add warnings
             }
+            # --- END: MODIFICATION ---
         })
         self.overlap_store.save(obj)
         
@@ -2340,6 +2297,7 @@ class Monitor:
         p0 = pairs[0]
         
         # Validate priceUsd: must exist and be a positive float
+        price_str = None # Initialize
         try:
             price_str = p0.get("priceUsd")
             if price_str is None:

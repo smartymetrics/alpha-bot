@@ -849,7 +849,8 @@ class AlphaTokenAnalyzer:
         # Extract key security metrics (rest of the method remains the same)
         probation_result = evaluate_probation_from_rugcheck(data)
 
-        top_holders = data.get("topHolders", [])
+        # --- FIX: Handle data.get() returning None if key exists but value is null ---
+        top_holders = data.get("topHolders") or []
         rugged = data.get("rugged", False)
         
         # Authorities and Creator Balance
@@ -861,7 +862,16 @@ class AlphaTokenAnalyzer:
         creator_balance_raw = data.get("creatorBalance")
         creator_balance_pct = 0.0
         if isinstance(creator_balance_raw, dict):
-            creator_balance_pct = float(creator_balance_raw.get('pct', 0.0) or 0.0)
+            try:
+                creator_balance_pct = float(creator_balance_raw.get('pct', 0.0) or 0.0)
+            except (ValueError, TypeError):
+                creator_balance_pct = 0.0
+        elif creator_balance_raw is not None:
+             try:
+                creator_balance_pct = float(creator_balance_raw)
+             except (ValueError, TypeError):
+                creator_balance_pct = 0.0
+                
         creator_balance = creator_balance_pct
 
         transfer_fee_pct = data.get("transferFee", {}).get("pct", 0)
@@ -872,16 +882,31 @@ class AlphaTokenAnalyzer:
         top_10_holders_pct = sum(h.get("pct", 0) for h in top_holders[:10])
 
         # --- Liquidity Aggregation ---
-        markets = data.get("markets", [])
+        # --- FIX: Handle data.get() returning None if key exists but value is null ---
+        markets = data.get("markets") or []
         total_lp_locked_usd = 0.0
         total_lp_usd = 0.0
         lp_lock_details = []
 
         for market in markets:
+            # --- FIX: Add check to ensure market item is not None ---
+            if not market:
+                continue
+                
             lp_data = market.get("lp", {})
             if lp_data:
-                lp_locked_usd = float(lp_data.get("lpLockedUSD", 0))
-                lp_unlocked_usd = float(lp_data.get("lpUnlocked", 0))
+                lp_locked_usd = 0.0
+                lp_unlocked_usd = 0.0
+                
+                try:
+                    lp_locked_usd = float(lp_data.get("lpLockedUSD", 0.0) or 0.0)
+                except (ValueError, TypeError):
+                    lp_locked_usd = 0.0
+                
+                try:
+                    lp_unlocked_usd = float(lp_data.get("lpUnlocked", 0.0) or 0.0)
+                except (ValueError, TypeError):
+                    lp_unlocked_usd = 0.0
                 
                 lp_total_usd_market = lp_locked_usd + lp_unlocked_usd
                 
@@ -949,6 +974,7 @@ class AlphaTokenAnalyzer:
         p0 = pairs[0]
         
         # Validate priceUsd: must exist and be a positive float
+        price_str = None # Initialize
         try:
             price_str = p0.get("priceUsd")
             if price_str is None:
@@ -973,78 +999,21 @@ class AlphaTokenAnalyzer:
             "raw": p0
         }
 
-    def _build_ml_input(
-        self, 
-        overlap_result: Dict[str, Any], 
-        security_report: Dict[str, Any],
-        dex_data: Optional[Dict[str, Any]]
-    ) -> Dict[str, Any]:
-        """Helper to construct the feature dictionary for ml_predictor_v2."""
-        
-        rugcheck = security_report.get("rugcheck", {})
-        dex_raw = (dex_data or {}).get("raw", {}) or {} # Ensure dex_raw is a dict
-        
-        # --- Calculate Token Age ---
-        token_age_seconds = 0
-        pair_created_at_ms = dex_raw.get("pairCreatedAt")
-        if pair_created_at_ms:
-            try:
-                # Get timestamp in whole seconds
-                created_at_ts = int(pair_created_at_ms) // 1000
-                now_ts = int(datetime.now(timezone.utc).timestamp())
-                token_age_seconds = now_ts - created_at_ts
-            except Exception:
-                token_age_seconds = 0 # Default on error
-        
-        # --- Get DexScreener values ---
-        volume_h24 = 0.0
-        try:
-            volume_h24 = float((dex_raw.get("volume", {}).get("h24") or 0.0))
-        except (ValueError, TypeError):
-            pass
-            
-        fdv = 0.0
-        try:
-            fdv = float((dex_raw.get("fdv") or 0.0))
-        except (ValueError, TypeError):
-            pass
-            
-        price_change_h24 = 0.0
-        try:
-            price_change_h24 = float((dex_raw.get("priceChange", {}).get("h24") or 0.0))
-        except (ValueError, TypeError):
-            pass
-
-        # --- Get LP Lock value ---
-        # ml_predictor_v2 example uses total_lp_locked_usd
-        lp_locked_usd = rugcheck.get("total_liquidity_usd", 0.0) * (rugcheck.get("lp_locked_pct", 0.0) / 100.0)
-
-        # --- Build the feature dict ---
-        # This must match the features expected by ml_predictor_v2
-        feature_dict = {
-            # --- Available data ---
-            'signal_source': 'alpha', # This is always 'alpha' in this script
-            'grade': overlap_result.get("grade", "NONE"),
-            'liquidity_usd': rugcheck.get("total_liquidity_usd", 0.0),
-            'volume_h24_usd': volume_h24,
-            'fdv_usd': fdv,
-            'price_change_h24_pct': price_change_h24,
-            'creator_balance_pct': rugcheck.get("creator_balance", 0.0),
-            'top_10_holders_pct': rugcheck.get("top_10_holders_pct", 0.0),
-            'total_lp_locked_usd': lp_locked_usd,
-            'token_age_at_signal_seconds': max(0, token_age_seconds),
-            
-            # --- MOCKED/UNAVAILABLE data ---
-            # These are required by the ML script's engineer_features
-            # but not provided by winner_monitor. We default them to 0.
-            'whale_concentration_score': 0.0,
-            'pump_dump_risk_score': 0.0,
-            'authority_risk_score': 0.0, # Note: has_authorities is boolean, not a score
-            'overlap_quality_score': 0.0,
-            'winner_wallet_density': 0.0
-        }
-        
-        return feature_dict
+    # --- FIX 1: _build_ml_input (Issue 1) ---
+    # This method is obsolete. The provided ml_predictor.py expects
+    # only the 'mint' string, as it fetches and engineers its own features.
+    # We will remove this method.
+    #
+    # def _build_ml_input(
+    #     self, 
+    #     overlap_result: Dict[str, Any], 
+    #     security_report: Dict[str, Any],
+    #     dex_data: Optional[Dict[str, Any]]
+    # ) -> Dict[str, Any]:
+    #     """Helper to construct the feature dictionary for ml_predictor_v2."""
+    # ... (REMOVING lines 1127 through 1199) ...
+    #     return feature_dict
+    # --- END FIX 1 ---
 
     async def analyze_token(self, mint: str) -> Dict[str, Any]:
         """
@@ -1177,12 +1146,18 @@ class AlphaTokenAnalyzer:
         total_supply = 0
         if supply and decimals:
             try:
-                total_supply = supply / (10 ** decimals)
-            except (ZeroDivisionError, ValueError, TypeError):
+                # Use float for supply to handle large numbers
+                total_supply = float(supply) / (10 ** int(decimals))
+            except (ZeroDivisionError, ValueError, TypeError, OverflowError):
                 total_supply = 0
         
         # Check for creator balance percentage (FIXED: safe division)
-        creator_balance_raw = rugcheck_details.get("creator_balance", 0)
+        creator_balance_raw = 0.0
+        try:
+            creator_balance_raw = float(rugcheck_details.get("creator_balance", 0.0) or 0.0)
+        except (ValueError, TypeError):
+             creator_balance_raw = 0.0
+
         if total_supply > 0:
             creator_balance_pct = (creator_balance_raw / total_supply) * 100
             if creator_balance_pct > MAX_CREATOR_BALANCE_PCT:
@@ -1193,20 +1168,44 @@ class AlphaTokenAnalyzer:
                 security_failures.append(f"invalid_supply:creator_has_balance_but_supply_is_zero")
         
         # Check transfer fee (must be low)
-        if rugcheck_details.get("transfer_fee_pct", 0) > MAX_TRANSFER_FEE_PCT:
-            security_failures.append(f"transfer_fee:{rugcheck_details.get('transfer_fee_pct')}%_req_<{MAX_TRANSFER_FEE_PCT}%")
+        transfer_fee_val = 0.0
+        try:
+            transfer_fee_val = float(rugcheck_details.get("transfer_fee_pct", 0.0) or 0.0)
+        except (ValueError, TypeError):
+            transfer_fee_val = 0.0
+            
+        if transfer_fee_val > MAX_TRANSFER_FEE_PCT:
+            security_failures.append(f"transfer_fee:{transfer_fee_val}%_req_<{MAX_TRANSFER_FEE_PCT}%")
         
         # Check holder count
-        if rugcheck_details.get("holder_count", 0) < MIN_HOLDER_COUNT:
-            security_failures.append(f"holder_count:{rugcheck_details.get('holder_count')}_req_{MIN_HOLDER_COUNT}")
+        holder_count_val = 0
+        try:
+            holder_count_val = int(rugcheck_details.get("holder_count", 0) or 0)
+        except (ValueError, TypeError):
+            holder_count_val = 0
+            
+        if holder_count_val < MIN_HOLDER_COUNT:
+            security_failures.append(f"holder_count:{holder_count_val}_req_{MIN_HOLDER_COUNT}")
             
         # Check LP lock percentage
-        if rugcheck_details.get("lp_locked_pct", 0) < MIN_LP_LOCKED_PCT:
-            security_failures.append(f"lp_locked:{rugcheck_details.get('lp_locked_pct')}%_req_{MIN_LP_LOCKED_PCT}%")
+        lp_locked_val = 0.0
+        try:
+            lp_locked_val = float(rugcheck_details.get("lp_locked_pct", 0.0) or 0.0)
+        except (ValueError, TypeError):
+            lp_locked_val = 0.0
+            
+        if lp_locked_val < MIN_LP_LOCKED_PCT:
+            security_failures.append(f"lp_locked:{lp_locked_val}%_req_{MIN_LP_LOCKED_PCT}%")
             
         # Check total liquidity USD
-        if rugcheck_details.get("total_liquidity_usd", 0) < MIN_LIQUIDITY_USD:
-            security_failures.append(f"liquidity_usd:{rugcheck_details.get('total_liquidity_usd'):.2f}_req_{MIN_LIQUIDITY_USD:.0f}")
+        total_liq_val = 0.0
+        try:
+            total_liq_val = float(rugcheck_details.get("total_liquidity_usd", 0.0) or 0.0)
+        except (ValueError, TypeError):
+            total_liq_val = 0.0
+            
+        if total_liq_val < MIN_LIQUIDITY_USD:
+            security_failures.append(f"liquidity_usd:{total_liq_val:.2f}_req_{MIN_LIQUIDITY_USD:.0f}")
         
         # If any security requirement fails, SKIP overlap check
         if security_failures:
@@ -1336,7 +1335,7 @@ class AlphaTokenAnalyzer:
             if total_winner_weights else 0.0
         )
 
-# 8. GRADE CALCULATION
+        # 8. GRADE CALCULATION
         grade = calculate_overlap_grade(
             overlap_count=overlap_count,
             overlap_percentage=overlap_pct, 
@@ -1403,7 +1402,6 @@ class AlphaTokenAnalyzer:
         # (i.e., it passed all security AND has overlap AND has a valid grade)
         ml_prediction_result = None
 
-        # *** MODIFICATION START ***
         # Only run ML if it passed security, has overlap, AND has a grade.
         # This matches the final "cleared for upload" logic from the security gate.
         is_cleared_for_upload = (
@@ -1411,22 +1409,30 @@ class AlphaTokenAnalyzer:
             grade not in ("NONE", "UNKNOWN")
         )
         
+        # --- FIX 2: ML Prediction Block (Issue 2) ---
         if is_cleared_for_upload:
-        # *** MODIFICATION END ***
             try:
-                # Build the feature dictionary for the ML model
-                ml_input_data = self._build_ml_input(
-                    overlap_result=result, # Pass the partially built result
-                    security_report=security_report,
-                    dex_data=dex_data
-                )
+                # --- START: MODIFICATION ---
+                # The ml_predictor.predict method expects the 'mint' string,
+                # not a pre-built feature dictionary, as it fetches
+                # and engineers features internally.
                 
-                # Run prediction
-                # The threshold doesn't filter, it's just a default for the function
+                # The _build_ml_input method is no longer needed or called.
+                
+                if self.debug:
+                    print(f"[TokenAnalyzer] 📞 Calling ML predictor for mint: {mint}")
+
+                # Call predict with the 'mint' string
                 ml_prediction_result = self.ml_classifier.predict(
-                    ml_input_data, 
+                    mint, 
                     threshold=0.70
                 )
+                
+                # Handle cases where the model returns an error
+                if not ml_prediction_result or ml_prediction_result.get("error"):
+                    raise ValueError(f"ML prediction returned an error: {ml_prediction_result.get('error', 'Unknown')}")
+                
+                # --- END: MODIFICATION ---
                 
             except Exception as e:
                 if self.debug:
@@ -1436,28 +1442,41 @@ class AlphaTokenAnalyzer:
                     'win_probability': 0.0,
                     'confidence': 'NONE',
                     'risk_tier': 'UNKNOWN',
+                    'error': str(e)
                 }
             
-            # Embed ML results into the final result
+            # --- START: MODIFICATION (Attach all details) ---
+            # Attach the full prediction results, including key_metrics and warnings
             result["ml_prediction"] = {
                 "probability": ml_prediction_result.get("win_probability"),
                 "confidence": ml_prediction_result.get("confidence"),
                 "risk_tier": ml_prediction_result.get("risk_tier"),
-                "action": ml_prediction_result.get("action")
+                "action": ml_prediction_result.get("action"),
+                "error": ml_prediction_result.get("error"),
+                "key_metrics": ml_prediction_result.get("key_metrics"), # Add key_metrics
+                "warnings": ml_prediction_result.get("warnings")       # Add warnings
             }
-        # --- END ML PREDICTION ---
+            # --- END: MODIFICATION ---
+        # --- END FIX 2 ---
         
         if self.debug and not final_needs_monitoring:
-            # *** MODIFICATION START ***
+            # --- FIX 3: Debug Print Statement (Issue 3) ---
             ml_prob_str = "N/A (Skipped)" # Default if ML wasn't run
             if "ml_prediction" in result:
-                ml_prob_str = f"{result.get('ml_prediction', {}).get('probability', 0.0):.1%}"
+                prob_val = result.get('ml_prediction', {}).get('probability')
+                if prob_val is not None:
+                    try:
+                        ml_prob_str = f"{float(prob_val):.1%}"
+                    except (ValueError, TypeError):
+                        ml_prob_str = "N/A (Invalid)"
+                else:
+                    ml_prob_str = "N/A (None)"
             
             # Use the same flag from the ML block
             cleared_status = "CLEARED for upload" if is_cleared_for_upload else "NOT CLEARED (No Grade)"
 
             print(f"[TokenAnalyzer] ✅ {mint} -> Grade: {grade}, Overlap: {overlap_count}, ML Prob: {ml_prob_str}, Status: {cleared_status}")
-            # *** MODIFICATION END ***
+            # --- END FIX 3 ---
             
         return result
 
@@ -1473,8 +1492,16 @@ class AlphaTokenAnalyzer:
         
         for i, res in enumerate(api_results):
             if isinstance(res, Exception):
-                if self.debug:
-                    print(f"[TokenAnalyzer] ❌ Batch analysis error for {mints[i]}: {res}")
+                # This catches the format string error if it still occurs
+                err_str = str(res)
+                if "unsupported format string" in err_str:
+                     print(f"[TokenAnalyzer] ❌ CRITICAL BATCH ERROR for {mints[i]}: {err_str}")
+                     # You might want to log more details here
+                     import traceback
+                     traceback.print_exc()
+                else:
+                    if self.debug:
+                        print(f"[TokenAnalyzer] ❌ Batch analysis error for {mints[i]}: {res}")
                 results.append({"mint": mints[i], "error": str(res)})
             elif res and not res.get("error"):
                 results.append(res)
