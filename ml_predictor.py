@@ -10,6 +10,7 @@ import json
 import requests
 from datetime import datetime
 import time
+import random
 from typing import Dict, Optional
 import logging
 
@@ -38,32 +39,76 @@ class SolanaTokenPredictor:
         logger.info(f"   Selected features: {len(self.selected_features)}")
     
     def fetch_dexscreener_data(self, mint: str) -> Optional[Dict]:
-        """Fetch token data from DexScreener API"""
+        """
+        Fetch token data from DexScreener API with robust Retry/Backoff logic.
+        Retries for approx 2 minutes on 429s/5xx errors.
+        """
         url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
         
-        try:
-            response = requests.get(url, timeout=10)
-            response.raise_for_status()
-            data = response.json()
-            
-            if not data.get('pairs') or len(data['pairs']) == 0:
-                logger.warning(f"No pairs found for {mint}")
-                return None
-            
-            # Get the first/main pair (usually highest liquidity)
-            pair = data['pairs'][0]
-            
-            return {
-                'price_usd': float(pair.get('priceUsd', 0)),
-                'liquidity_usd': float(pair.get('liquidity', {}).get('usd', 0)),
-                'volume_h24_usd': float(pair.get('volume', {}).get('h24', 0)),
-                'fdv_usd': float(pair.get('fdv', 0) or pair.get('marketCap', 0)),
-                'price_change_h24_pct': float(pair.get('priceChange', {}).get('h24', 0)),
-                'pair_created_at': pair.get('pairCreatedAt', 0),
-            }
-        except Exception as e:
-            logger.error(f"Error fetching DexScreener data: {e}")
-            return None
+        # Retry Configuration
+        max_retries = 8       # Will span > 2 minutes with exponential backoff
+        base_delay = 2.0      # Start with 2 seconds
+        max_delay = 45.0      # Cap delay at 45 seconds per sleep
+        
+        for attempt in range(max_retries):
+            try:
+                # 1. Make Request (increased timeout to 15s)
+                response = requests.get(url, timeout=15)
+                
+                # 2. Handle Success
+                if response.status_code == 200:
+                    data = response.json()
+                    
+                    if not data.get('pairs') or len(data['pairs']) == 0:
+                        logger.warning(f"No pairs found for {mint}")
+                        return None
+                    
+                    # Get the first/main pair (usually highest liquidity)
+                    pair = data['pairs'][0]
+                    
+                    return {
+                        'price_usd': float(pair.get('priceUsd', 0)),
+                        'liquidity_usd': float(pair.get('liquidity', {}).get('usd', 0)),
+                        'volume_h24_usd': float(pair.get('volume', {}).get('h24', 0)),
+                        'fdv_usd': float(pair.get('fdv', 0) or pair.get('marketCap', 0)),
+                        'price_change_h24_pct': float(pair.get('priceChange', {}).get('h24', 0)),
+                        'pair_created_at': pair.get('pairCreatedAt', 0),
+                    }
+
+                # 3. Handle Rate Limiting (429)
+                elif response.status_code == 429:
+                    logger.warning(f"⚠️ DexScreener 429 Rate Limit for {mint}. Retrying...")
+                    # Check headers for specific advice, else fall back to calc
+                    retry_after = response.headers.get('Retry-After')
+                    if retry_after:
+                        sleep_time = int(retry_after) + 1
+                    else:
+                        # Exponential Backoff: 2s, 4s, 8s, 16s...
+                        sleep_time = min(max_delay, base_delay * (2 ** attempt)) + random.uniform(0, 1)
+
+                # 4. Handle Not Found (404) - Do not retry
+                elif response.status_code == 404:
+                    logger.error(f"Token not found on DexScreener: {mint}")
+                    return None
+
+                # 5. Handle Server Errors (5xx)
+                else:
+                    logger.warning(f"DexScreener HTTP {response.status_code} for {mint}. Retrying...")
+                    sleep_time = min(max_delay, base_delay * (2 ** attempt)) + random.uniform(0, 1)
+
+            except requests.exceptions.RequestException as e:
+                # Handle network level errors (DNS, connection refused, etc)
+                logger.warning(f"DexScreener Network Error for {mint}: {e}. Retrying...")
+                sleep_time = min(max_delay, base_delay * (2 ** attempt)) + random.uniform(0, 1)
+
+            # Execute the wait (unless it was the last attempt)
+            if attempt < max_retries - 1:
+                logger.info(f"Waiting {sleep_time:.1f}s before retry {attempt + 2}/{max_retries}...")
+                time.sleep(sleep_time)
+
+        # If we reach here, all retries failed
+        logger.error(f"❌ Failed to fetch DexScreener data for {mint} after {max_retries} attempts.")
+        return None
     
     def fetch_rugcheck_data(self, mint: str) -> Optional[Dict]:
         """Fetch security data from Rugcheck API"""
@@ -78,11 +123,14 @@ class SolanaTokenPredictor:
             token = data.get('token', {})
             token_meta = token if isinstance(token, dict) else {}
             
-            top_holders = data.get('topHolders', [])
-            markets = data.get('markets', [])
-            risks = data.get('risks', [])
+            # FIXED: Use 'or []' to handle cases where API returns null (None) instead of a list
+            # .get('key', []) only works if key is missing, not if value is null
+            top_holders = data.get('topHolders') or []
+            markets = data.get('markets') or []
+            risks = data.get('risks') or []
             
             # Calculate top 10 holders percentage
+            # This was previously crashing when top_holders was None
             top_10_pct = sum(h.get('pct', 0) for h in top_holders[:10])
             
             # Calculate total LP locked and liquidity from markets
@@ -90,24 +138,31 @@ class SolanaTokenPredictor:
             total_liquidity = 0
             
             for market in markets:
+                # Guard against None entries in markets list
+                if not market: 
+                    continue
+                    
                 lp_data = market.get('lp', {})
-                total_lp_locked += lp_data.get('lpLockedUSD', 0)
+                if not lp_data:
+                    continue
+                    
+                total_lp_locked += lp_data.get('lpLockedUSD', 0) or 0
                 
                 # Calculate liquidity from reserves
-                base_usd = lp_data.get('baseUSD', 0)
-                quote_usd = lp_data.get('quoteUSD', 0)
+                base_usd = lp_data.get('baseUSD', 0) or 0
+                quote_usd = lp_data.get('quoteUSD', 0) or 0
                 total_liquidity += (base_usd + quote_usd)
             
             # LP lock percentage
             lp_locked_pct = (total_lp_locked / total_liquidity * 100) if total_liquidity > 0 else 0
             
             # Insider networks
-            insider_networks = data.get('insiderNetworks', []) or []
+            insider_networks = data.get('insiderNetworks') or []
             
             # Calculate insider metrics safely
             if insider_networks:
-                largest_network = max(n.get('size', 0) for n in insider_networks)
-                total_insider_tokens = sum(n.get('tokenAmount', 0) for n in insider_networks)
+                largest_network = max((n.get('size', 0) or 0) for n in insider_networks)
+                total_insider_tokens = sum((n.get('tokenAmount', 0) or 0) for n in insider_networks)
             else:
                 largest_network = 0
                 total_insider_tokens = 0
@@ -136,6 +191,7 @@ class SolanaTokenPredictor:
             }
         except Exception as e:
             logger.error(f"Error fetching Rugcheck data: {e}")
+            # Print traceback for easier debugging
             import traceback
             logger.error(traceback.format_exc())
             return None
