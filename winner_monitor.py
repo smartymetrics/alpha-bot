@@ -835,23 +835,18 @@ class AlphaTokenAnalyzer:
     async def _run_rugcheck_check(self, mint: str) -> Dict[str, Any]:
         """
         Check token security using RugCheck API with comprehensive risk analysis.
+        Uses RugCheckClient for rate limiting and retry logic.
         FIXED: Handle zero supply edge case
         """
-        url = f"https://api.rugcheck.xyz/v1/tokens/{mint}/report"
-        session = self.http_session
-        async with self._api_sema:
-            try:
-                async with session.get(url, timeout=30) as resp:
-                    if resp.status != 200:
-                        text = await resp.text()
-                        return {"ok": False, "error": f"rugcheck_status_{resp.status}", "error_text": text}
-                    data = await resp.json()
-            except asyncio.TimeoutError:
-                return {"ok": False, "error": "rugcheck_timeout", "error_text": "API call timed out after 30s"}
-            except Exception as e:
-                return {"ok": False, "error": "rugcheck_exception", "error_text": f"{type(e).__name__}: {str(e)}"}
-
-        # Extract key security metrics
+        # Delegate to the RugCheckClient which handles rate limiting and retries
+        result = await self.rugcheck_client.get_token_report(mint)
+        
+        if not result.get("ok"):
+            return result
+        
+        data = result["data"]
+        
+        # Extract key security metrics (rest of the method remains the same)
         probation_result = evaluate_probation_from_rugcheck(data)
 
         top_holders = data.get("topHolders", [])
@@ -867,7 +862,6 @@ class AlphaTokenAnalyzer:
         creator_balance_pct = 0.0
         if isinstance(creator_balance_raw, dict):
             creator_balance_pct = float(creator_balance_raw.get('pct', 0.0) or 0.0)
-        # if it's an int (like 0) or None, pct is 0.0
         creator_balance = creator_balance_pct
 
         transfer_fee_pct = data.get("transferFee", {}).get("pct", 0)
