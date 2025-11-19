@@ -965,17 +965,6 @@ async def get_or_poll_full_analysis(
             "data_source": "cache" if not refresh and SUPABASE_AVAILABLE else "live"
         }
 
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", 8000))
-    logger.info(f"Starting web service on port {port}")
-
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=port,
-        log_level="info"
-    )
-
 # ==================== ML PREDICTOR ENDPOINTS ====================
 
 @app.get("/token/{mint}/predict")
@@ -1229,3 +1218,14 @@ async def root():
             "total_predictions": service_status["ml_predictions"]
         }
     }
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 8000))
+    logger.info(f"Starting web service on port {port}")
+
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=port,
+        log_level="info"
+    )
