@@ -6,7 +6,7 @@
     "lightgbm": 0.5,
     "xgboost": 0.0
   },
-  "trained_at": "2025-11-26T11:55:43.224354",
+  "trained_at": "2025-11-26T15:52:10.270398",
   "training_samples": 416,
   "test_samples": 104,
   "num_features_selected": 25,

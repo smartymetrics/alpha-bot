@@ -194,7 +194,7 @@ class TradingStart:
     price_change_percentage: Optional[float] = None
 
 # -----------------------
-# Token discovery (CoinGecko + FULLY ASYNC Dune)
+# Token discovery (CoinGecko + Rugcheck + FULLY ASYNC Dune)
 # -----------------------
 class TokenDiscovery:
     def __init__(
@@ -210,12 +210,19 @@ class TokenDiscovery:
     ):
         self.client = client
         self.debug = bool(debug)
-        # CoinGecko
+        
+        # --- CoinGecko Config ---
         self.coingecko_pro_api_key = coingecko_pro_api_key or os.environ.get("GECKO_API")
         self.coingecko_url = "https://pro-api.coingecko.com/api/v3/onchain/networks/solana/new_pools"
+        
+        # --- RugCheck Config (NEW) ---
+        self.rugcheck_new_url = "https://api.rugcheck.xyz/v1/stats/new_tokens"
+        
+        # --- State / Cache ---
         self.last_processed_timestamp = self._load_last_timestamp(timestamp_cache_file)
         self.timestamp_cache_file = timestamp_cache_file
-        # Dune
+        
+        # --- Dune Config ---
         self.dune_api_key = dune_api_key or os.environ.get("DUNE_API_KEY")
         self.dune_query_id = dune_query_id
         if DuneClient and self.dune_api_key:
@@ -226,8 +233,9 @@ class TokenDiscovery:
         else:
             self.dune_client = None
         self.dune_cache_file = dune_cache_file
+        
         if self.debug:
-            print("TokenDiscovery initialized with CoinGecko Pro and ASYNC Dune (NO TIMEOUTS)")
+            print("TokenDiscovery initialized with CoinGecko Pro, RugCheck, and ASYNC Dune")
 
     def _load_last_timestamp(self, cache_file: str) -> Optional[int]:
         if os.path.exists(cache_file):
@@ -273,10 +281,7 @@ class TokenDiscovery:
         return []
 
     def fetch_dune_latest_rows(self) -> List[Dict[str, Any]]:
-        """
-        Fetch the latest Dune query result (synchronous wrapper).
-        Returns a list of row dicts from Dune.
-        """
+        """Synchronous wrapper for Dune results."""
         if not self.dune_client or not self.dune_query_id:
             raise RuntimeError("Dune client or query_id not configured")
         if self.debug:
@@ -288,30 +293,21 @@ class TokenDiscovery:
         return rows
 
     async def fetch_dune_force_refresh(self) -> List[Dict[str, Any]]:
-        """
-        🚀 FULLY ASYNC: Force a new execution of the Dune query and return fresh results.
-        🚀 NO TIMEOUTS: Uses infinite polling with while True
-        🚀 NON-BLOCKING: Uses await asyncio.sleep instead of time.sleep
-        """
+        """Fully async Dune refresh with infinite polling (no timeouts)."""
         if not self.dune_client or not self.dune_query_id:
             raise RuntimeError("Dune client or query_id not configured")
 
         query_id = int(self.dune_query_id)
-
         if self.debug:
-            print(f"[Dune ASYNC] 🚀 Starting infinite polling for query {query_id} (NO TIMEOUTS)")
+            print(f"[Dune ASYNC] 🚀 Starting infinite polling for query {query_id}")
 
         try:
             from dune_client.query import QueryBase
-
-            # Method 1: Try execute_query with INFINITE polling (NO TIMEOUT)
+            # Try execute_query with INFINITE polling
             try:
                 query = QueryBase(query_id=query_id)
                 execution = self.dune_client.execute_query(query)
-                if self.debug:
-                    print(f"[Dune ASYNC] 🚀 Started execution: {execution}")
-
-                # Get execution ID
+                
                 execution_id = None
                 if hasattr(execution, 'execution_id'):
                     execution_id = execution.execution_id
@@ -321,45 +317,32 @@ class TokenDiscovery:
                     execution_id = execution
 
                 if execution_id:
-                    if self.debug:
-                        print(f"[Dune ASYNC] 🚀 Polling execution {execution_id} with INFINITE timeout")
-
                     attempt = 0
-                    while True:  # 🚀 No timeout - runs until completion
+                    while True:  # No timeout
                         try:
                             attempt += 1
                             status = self.dune_client.get_execution_status(execution_id)
-
-                            # normalize state
-                            raw_state = getattr(status, 'state',
-                                        getattr(status, 'execution_status',
-                                        getattr(status, 'execution_state', str(status))))
+                            raw_state = getattr(status, 'state', getattr(status, 'execution_status', getattr(status, 'execution_state', str(status))))
                             state_str = str(raw_state).lower()
 
                             if self.debug and attempt % 20 == 0:
-                                print(f"[Dune ASYNC] 🚀 Attempt {attempt}: {state_str} (infinite polling)")
+                                print(f"[Dune ASYNC] 🚀 Attempt {attempt}: {state_str}")
 
                             if "completed" in state_str:
-                                if self.debug:
-                                    print(f"[Dune ASYNC] ✅ Query completed after {attempt} attempts ({attempt * 3 / 60:.1f} minutes)")
                                 break
                             elif "failed" in state_str:
                                 raise RuntimeError(f"Query execution failed: {raw_state}")
 
                             await asyncio.sleep(3)
-
                         except Exception as e:
                             if self.debug:
                                 print(f"[Dune ASYNC] ⚠️ Polling error: {e}")
                             break
 
-                    # Get results
                     try:
                         payload = self.dune_client.get_result(execution_id)
                         rows = self._rows_from_dune_payload(payload)
                         if rows:
-                            if self.debug:
-                                print(f"[Dune ASYNC] ✅ Execute query successful: {len(rows)} rows after {attempt * 3 / 60:.1f} minutes")
                             return rows
                     except Exception as e:
                         if self.debug:
@@ -368,291 +351,275 @@ class TokenDiscovery:
                 if self.debug:
                     print(f"[Dune ASYNC] ❌ execute_query failed: {e}")
 
-            # Method 2: Fallback to get_latest_result
+            # Fallback
             if self.debug:
                 print("[Dune ASYNC] 🔄 Falling back to get_latest_result")
             payload = self.dune_client.get_latest_result(query_id)
             rows = self._rows_from_dune_payload(payload)
-            if self.debug:
-                print(f"[Dune ASYNC] 🔄 Fallback returned {len(rows)} rows")
-                if rows:
-                    print(f"[Dune ASYNC] Sample fallback row keys: {list(rows[0].keys())}")
             return rows
 
         except Exception as e:
             if self.debug:
                 print(f"[Dune ASYNC] ❌ All methods failed: {e}")
-                import traceback
-                traceback.print_exc()
             return []
 
     async def get_tokens_launched_yesterday_cached(self, cache_max_age_days: int = 7) -> List[TradingStart]:
-        """
-        🚀 NOW ASYNC: Return list of TradingStart objects for tokens Dune reports as launched yesterday.
-        This method retains compatibility with previous behavior (legacy single-file cache).
-        """
+        """Async retrieval of Dune tokens for 'yesterday' with local caching."""
         cache_path = self.dune_cache_file
-
+        
+        # Helper to convert raw Dune rows to TradingStart objects
         def rows_to_trading_starts(rows: List[Dict[str, Any]], target_yesterday: datetime.date) -> List[TradingStart]:
-            if not rows:
-                return []
+            if not rows: return []
             df = pd.DataFrame(rows)
-            date_col = None
-            mint_col = None
-            for c in ("first_buy_date", "first_buy_date_utc", "block_date", "first_trade_date"):
-                if c in df.columns:
-                    date_col = c
-                    break
-            for c in ("mint_address", "mint", "token_bought_mint_address"):
-                if c in df.columns:
-                    mint_col = c
-                    break
-            if date_col is None or mint_col is None:
-                return []
+            
+            # Identify columns
+            date_col = next((c for c in ("first_buy_date", "first_buy_date_utc", "block_date", "first_trade_date") if c in df.columns), None)
+            mint_col = next((c for c in ("mint_address", "mint", "token_bought_mint_address") if c in df.columns), None)
+            
+            if not date_col or not mint_col: return []
+            
             df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
             filtered = df[df[date_col].dt.date == target_yesterday]
             out = []
             for _, row in filtered.iterrows():
                 try:
                     dt = pd.to_datetime(row[date_col])
-                    if pd.isna(dt):
-                        continue
-                    if dt.tzinfo is None:
-                        dt = dt.tz_localize("UTC")
+                    if pd.isna(dt): continue
+                    if dt.tzinfo is None: dt = dt.tz_localize("UTC")
                     ts = int(dt.tz_convert("UTC").timestamp())
                 except Exception:
                     continue
-                out.append(
-                    TradingStart(mint=row[mint_col], block_time=ts, program_id="dune", detected_via="dune", extra={date_col: str(row[date_col])})
-                )
+                out.append(TradingStart(
+                    mint=row[mint_col], 
+                    block_time=ts, 
+                    program_id="dune", 
+                    detected_via="dune", 
+                    extra={date_col: str(row[date_col])}
+                ))
             return out
 
         current_yesterday = (datetime.now(timezone.utc).date() - timedelta(days=1))
         need_fetch = True
 
-        # Check if we have valid cached data
+        # Check existing cache
         if os.path.exists(cache_path):
             try:
                 cache_obj = joblib.load(cache_path)
                 cached_rows = cache_obj.get("rows", [])
                 fetched_at = None
-                
-                # Parse fetched_at timestamp
                 try:
                     fetched_at = datetime.fromisoformat(cache_obj["fetched_at"])
-                    if fetched_at.tzinfo is None:
-                        fetched_at = fetched_at.replace(tzinfo=timezone.utc)
-                except Exception:
-                    fetched_at = None
+                    if fetched_at.tzinfo is None: fetched_at = fetched_at.replace(tzinfo=timezone.utc)
+                except Exception: fetched_at = None
 
-                # Primary validation: Check if cached data contains yesterday's tokens
                 if cached_rows and fetched_at:
                     df = pd.DataFrame(cached_rows)
                     if "first_buy_date" in df.columns:
                         try:
                             first_buy = pd.to_datetime(df["first_buy_date"].iloc[0]).date()
                             if first_buy == current_yesterday:
-                                # Secondary validation: Check if cache is not too old (fallback safety)
                                 age_days = (datetime.now(timezone.utc) - fetched_at).days
                                 if age_days <= cache_max_age_days:
-                                    if self.debug:
-                                        print(f"[Dune/cache] cached first_buy_date {first_buy} matches yesterday and age {age_days} <= {cache_max_age_days} days, using cache")
-                                    need_fetch = False
                                     starts = rows_to_trading_starts(cached_rows, current_yesterday)
-                                    if starts:  # Only use cache if it actually produces results
-                                        return starts
-                                    else:
+                                    if starts:
                                         if self.debug:
-                                            print("[Dune/cache] cache data didn't produce any tokens, fetching fresh")
-                                        need_fetch = True
-                                else:
-                                    if self.debug:
-                                        print(f"[Dune/cache] cached data too old: {age_days} > {cache_max_age_days} days")
-                            else:
-                                if self.debug:
-                                    print(f"[Dune/cache] cached first_buy_date {first_buy} != yesterday {current_yesterday} -> need fresh data")
-                        except Exception as e:
-                            if self.debug:
-                                print(f"[Dune/cache] failed to validate cached data: {e}")
-                                
-                # Fallback validation using fetched_at and target_yesterday (legacy compatibility)
-                elif fetched_at and "target_yesterday" in cache_obj:
-                    try:
-                        cached_yesterday = datetime.fromisoformat(cache_obj["target_yesterday"]).date()
-                        if cached_yesterday == current_yesterday:
-                            age_days = (datetime.now(timezone.utc) - fetched_at).days
-                            if age_days <= cache_max_age_days:
-                                starts = rows_to_trading_starts(cached_rows, current_yesterday)
-                                if starts:
-                                    if self.debug:
-                                        print(f"[Dune/cache] using cached data via fallback validation for yesterday={current_yesterday}")
-                                    need_fetch = False
-                                    return starts
-                    except Exception as e:
-                        if self.debug:
-                            print(f"[Dune/cache] fallback validation failed: {e}")
-                            
-            except Exception as e:
-                if self.debug:
-                    print(f"[Dune/cache] error reading cache: {e}")
+                                            print(f"[Dune/cache] using valid cache for {current_yesterday}")
+                                        need_fetch = False
+                                        return starts
+                        except Exception: pass
+            except Exception: pass
 
-        # 🚀 ASYNC FETCH: Fetch fresh data if needed
         if need_fetch:
             try:
-                if self.debug:
-                    print("[Dune ASYNC] 🚀 Fetching fresh data from Dune API with infinite polling")
-                rows = await self.fetch_dune_force_refresh()  # 🚀 NOW ASYNC
+                rows = await self.fetch_dune_force_refresh()
+                if rows:
+                    joblib.dump({
+                        "rows": rows,
+                        "fetched_at": datetime.now(timezone.utc).isoformat(),
+                        "target_yesterday": current_yesterday.isoformat()
+                    }, cache_path)
+                    return rows_to_trading_starts(rows, current_yesterday)
             except Exception as e:
-                if self.debug:
-                    print(f"[Dune ASYNC] ❌ fetch failure: {e}")
-                return []
-
-            # Save fresh data to cache
-            try:
-                cache_obj = {
-                    "rows": rows,
-                    "fetched_at": datetime.now(timezone.utc).isoformat(),
-                    "target_yesterday": current_yesterday.isoformat()
-                }
-                joblib.dump(cache_obj, cache_path)
-                if self.debug:
-                    print(f"[Dune/cache] ✅ cached fresh data for yesterday={current_yesterday}")
-            except Exception as e:
-                if self.debug:
-                    print(f"[Dune/cache] ❌ write failed: {e}")
-
-            starts = rows_to_trading_starts(rows, current_yesterday)
-            if self.debug:
-                print(f"[Dune ASYNC] ✅ found {len(starts)} tokens for yesterday={current_yesterday} after fresh fetch")
-            return starts
-
+                if self.debug: print(f"[Dune ASYNC] ❌ fetch failure: {e}")
+        
         return []
 
-    # ---------------- CoinGecko ----------------
-    async def _fetch_coingecko_new_pools(self, limit: int = 500, timeout: int = 30) -> List[Dict[str, Any]]: # <<< CORRECTION: Increased timeout
-        """Fetch the latest 20 pools from CoinGecko and print their mint addresses, ignoring cache."""
+    # ---------------- CoinGecko Logic ----------------
+    async def _fetch_coingecko_new_pools(self, limit: int = 500, timeout: int = 30) -> List[Dict[str, Any]]:
+        """Fetch raw pool data from CoinGecko Pro."""
         headers = {"accept": "application/json", "x-cg-pro-api-key": self.coingecko_pro_api_key}
-        url = self.coingecko_url  # No pagination
-
         if self.debug:
-            print("[CoinGecko] Fetching latest 20 pools (ignoring cache)")
+            print("[CoinGecko] Fetching latest pools (ignoring cache)")
 
         async with aiohttp.ClientSession() as sess:
-            async with sess.get(url, headers=headers, timeout=timeout) as resp:
+            async with sess.get(self.coingecko_url, headers=headers, timeout=timeout) as resp:
                 resp.raise_for_status()
                 data = await resp.json()
-                pools = data.get("data", [])
-
-        if not pools:
-            if self.debug:
-                print("[CoinGecko] No pools returned")
-            return []
-
-        all_pools = []
-        for pool in pools:
-            # Extract mint address
-            base_token = pool["relationships"]["base_token"]["data"]
-            mint = base_token["id"].replace("eth_", "").replace("solana_", "")
-
-            # Extract timestamp
-            block_time = self._parse_pool_created_at(pool["attributes"]["pool_created_at"])
-
-            if self.debug:
-                print(f"  - Mint: {mint} | Created: {pool['attributes']['pool_created_at']} | TS: {block_time}")
-
-            all_pools.append(pool)
-
-        if self.debug:
-            print(f"[CoinGecko] Total pools fetched: {len(all_pools)}")
-
-        return all_pools
+                return data.get("data", [])
 
     @staticmethod
     def _parse_pool_created_at(val: Any) -> Optional[int]:
-        if not val:
-            return None
+        if not val: return None
         try:
             ts_str = str(val).replace("Z", "+00:00")
             dt = datetime.fromisoformat(ts_str)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
+            if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
             return int(dt.timestamp())
-        except Exception as e:
-            print(f"[ParseError] Could not parse timestamp {val}: {e}")
-            return None
-
-    @staticmethod
-    def _utc_day_bounds_for_date(dt: Optional[datetime] = None) -> Tuple[int, int]:
-        d = (dt or datetime.now(timezone.utc)).astimezone(timezone.utc)
-        start = datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=timezone.utc)
-        end = start + timedelta(days=1) - timedelta(seconds=1)
-        return int(start.timestamp()), int(end.timestamp())
+        except Exception: return None
 
     def _parse_coingecko_pool(self, pool: Dict[str, Any]) -> TradingStart:
-        attributes = pool["attributes"]
+        attr = pool["attributes"]
         base_token = pool["relationships"]["base_token"]["data"]
-        mint = base_token["id"].replace("eth_", "").replace("solana_", "")  # Handle both ETH and Solana
-        block_time = self._parse_pool_created_at(attributes["pool_created_at"])
+        mint = base_token["id"].replace("eth_", "").replace("solana_", "")
+        block_time = self._parse_pool_created_at(attr["pool_created_at"])
         return TradingStart(
             mint=mint,
             block_time=block_time,
             program_id="coingecko",
             detected_via="coingecko",
             extra={
-                "name": attributes["name"].split(" / ")[0],
-                "fdv_usd": attributes["fdv_usd"],
-                "market_cap_usd": attributes.get("market_cap_usd") or attributes["fdv_usd"],
-                "volume_usd": attributes["volume_usd"]["h24"],
+                "name": attr["name"].split(" / ")[0],
+                "fdv_usd": attr["fdv_usd"],
+                "market_cap_usd": attr.get("market_cap_usd") or attr["fdv_usd"],
+                "volume_usd": attr["volume_usd"]["h24"],
                 "source_dex": pool["relationships"]["dex"]["data"]["id"],
-                "price_change_percentage": attributes["price_change_percentage"]["h24"],
+                "price_change_percentage": attr["price_change_percentage"]["h24"],
             },
-            fdv_usd=attributes["fdv_usd"],
-            volume_usd=attributes["volume_usd"]["h24"],
+            fdv_usd=attr["fdv_usd"],
+            volume_usd=attr["volume_usd"]["h24"],
             source_dex=pool["relationships"]["dex"]["data"]["id"],
-            price_change_percentage=attributes["price_change_percentage"]["h24"],
+            price_change_percentage=attr["price_change_percentage"]["h24"],
         )
 
-    async def get_tokens_created_today(self, limit: int = 500) -> List[TradingStart]:
-        # <<< CORRECTION: Added retry_with_backoff to make this call robust
+    # ---------------- RugCheck Logic (NEW) ----------------
+    async def _fetch_rugcheck_new_tokens(self, timeout: int = 30) -> List[TradingStart]:
+        """Fetch the latest tokens from RugCheck API."""
+        if self.debug:
+            print("[RugCheck Discovery] Fetching new tokens...")
+
         try:
-            pools = await retry_with_backoff(
-                self._fetch_coingecko_new_pools,
-                limit=limit,
-                retries=3,
-                base_delay=2.0
-            )
+            async with aiohttp.ClientSession() as sess:
+                async with sess.get(self.rugcheck_new_url, timeout=timeout) as resp:
+                    if resp.status != 200:
+                        if self.debug:
+                            print(f"[RugCheck Discovery] Failed: Status {resp.status}")
+                        return []
+                    data = await resp.json()
         except Exception as e:
             if self.debug:
-                print(f"[CoinGecko] CRITICAL: Failed to fetch new pools after all retries: {e}. Loop will continue.")
-            return [] # Return empty list on failure
+                print(f"[RugCheck Discovery] Error: {e}")
+            return []
+
+        if not isinstance(data, list):
+            return []
 
         out = []
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+
+        for item in data:
+            mint = item.get("mint")
+            if not mint:
+                continue
+            
+            # RugCheck detections are fresh; use current time for block_time
+            # to ensure the scheduler picks them up immediately.
+            out.append(TradingStart(
+                mint=mint,
+                block_time=now_ts,
+                program_id="rugcheck_new",
+                detected_via="rugcheck",
+                extra={
+                    "symbol": item.get("symbol"),
+                    "name": item.get("name"),
+                    "supply": item.get("supply"),
+                    "uri": item.get("uri")
+                },
+                # Default these to 0 as RugCheck 'new_tokens' often lack market data
+                fdv_usd=0.0,
+                volume_usd=0.0,
+                source_dex="unknown",
+                price_change_percentage=0.0,
+            ))
+
+        if self.debug and out:
+            print(f"[RugCheck Discovery] Found {len(out)} tokens")
+        return out
+
+    # ---------------- Aggregated Discovery ----------------
+    async def get_tokens_created_today(self, limit: int = 500) -> List[TradingStart]:
+        """
+        Fetches tokens from both CoinGecko and RugCheck in parallel.
+        Merges results, prioritizing CoinGecko data if duplicates exist 
+        (because CG provides richer market data like Dex/FDV).
+        """
+        # 1. Define tasks for parallel execution
+        # Use existing retry_with_backoff for robustness
+        cg_task = retry_with_backoff(
+            self._fetch_coingecko_new_pools,
+            limit=limit,
+            retries=3,
+            base_delay=2.0
+        )
+        
+        rc_task = retry_with_backoff(
+            self._fetch_rugcheck_new_tokens,
+            retries=3,
+            base_delay=2.0
+        )
+
+        # 2. Run concurrently
+        results = await asyncio.gather(cg_task, rc_task, return_exceptions=True)
+        
+        # 3. Handle Results
+        cg_raw_pools = results[0] if not isinstance(results[0], Exception) else []
+        rc_starts = results[1] if not isinstance(results[1], Exception) else []
+        
+        # Log failures if any
+        if self.debug:
+            if isinstance(results[0], Exception):
+                print(f"[TokenDiscovery] CoinGecko failed: {results[0]}")
+            if isinstance(results[1], Exception):
+                print(f"[TokenDiscovery] RugCheck failed: {results[1]}")
+
+        # 4. Process CoinGecko Data
+        cg_starts = []
         now = int(datetime.now(timezone.utc).timestamp())
-        cutoff = now - 24 * 3600  # only include pools launched in last 24 hours
+        cutoff = now - 24 * 3600  # last 24 hours
 
-        for pool in pools:
+        for pool in cg_raw_pools:
             block_time = self._parse_pool_created_at(pool["attributes"]["pool_created_at"])
-            if not block_time:
-                continue
-
-            # ✅ filter: only pools created in last 24 hours
-            if block_time < cutoff:
-                continue
+            if not block_time: continue
+            if block_time < cutoff: continue
 
             ts = self._parse_coingecko_pool(pool)
-            out.append(ts)
+            cg_starts.append(ts)
 
-            # update last processed timestamp
+            # Update timestamp tracker (prefer CG timestamps for history)
             if self.last_processed_timestamp is None or block_time > self.last_processed_timestamp:
                 self.last_processed_timestamp = block_time
 
-        if out:
+        if cg_starts:
             self._save_last_timestamp()
 
-        if self.debug:
-            print(f"[CoinGecko] {len(out)} tokens launched")
+        # 5. Merge and Deduplicate
+        # Strategy: Use a dictionary keyed by mint.
+        # Add RugCheck first, then overwrite with CoinGecko.
+        # This ensures if a token is on both, we get the CG version (which has DEX/Price data).
+        unique_tokens = {}
+        
+        for ts in rc_starts:
+            unique_tokens[ts.mint] = ts
+            
+        for ts in cg_starts:
+            unique_tokens[ts.mint] = ts
 
-        return out
+        final_list = list(unique_tokens.values())
+
+        if self.debug:
+            print(f"[TokenDiscovery] Combined Total: {len(final_list)} unique tokens "
+                  f"({len(cg_starts)} from CG, {len(rc_starts)} from RC)")
+
+        return final_list
 
 # -----------------------
 # Dune 7-day rolling cache + builder (updated for async)
