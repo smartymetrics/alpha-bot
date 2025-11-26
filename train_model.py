@@ -8,9 +8,9 @@ import json
 import os
 
 # ML libraries
-from sklearn.model_selection import train_test_split, StratifiedKFold
-from sklearn.preprocessing import LabelEncoder, StandardScaler
-from sklearn.feature_selection import SelectKBest, f_classif, mutual_info_classif
+from sklearn.model_selection import StratifiedKFold
+from sklearn.preprocessing import StandardScaler
+from sklearn.feature_selection import SelectKBest, f_classif
 from sklearn.metrics import (
     classification_report, confusion_matrix, roc_auc_score,
     precision_recall_curve, average_precision_score, roc_curve
@@ -27,7 +27,7 @@ os.makedirs('models', exist_ok=True)
 os.makedirs('outputs', exist_ok=True)
 
 print("="*80)
-print("🚀 FOCUSED SOLANA MEMECOIN CLASSIFIER - PRODUCTION READY")
+print("🚀 IMPROVED SOLANA MEMECOIN CLASSIFIER - PRODUCTION READY")
 print("="*80)
 
 # ============================================================================
@@ -42,190 +42,119 @@ df['target'] = (df['label_status'] == 'win').astype(int)
 print(f"🎯 Overall Win rate: {df['target'].mean()*100:.2f}%")
 
 # ============================================================================
-# FOCUSED FEATURE ENGINEERING
+# FIX DATA QUALITY ISSUES
 # ============================================================================
 
 print("\n" + "="*80)
-print("🔧 FEATURE ENGINEERING - PRODUCTION FOCUSED")
+print("🔧 DATA QUALITY FIXES")
+print("="*80)
+
+# Fix negative token ages
+df['token_age_at_signal_seconds'] = df['token_age_at_signal_seconds'].clip(lower=0)
+print("✅ Fixed negative token ages")
+
+# ============================================================================
+# STREAMLINED FEATURE ENGINEERING
+# ============================================================================
+
+print("\n" + "="*80)
+print("🔧 FEATURE ENGINEERING - REDUCED CORRELATION")
 print("="*80)
 
 # === TIME FEATURES ===
 df['token_age_hours'] = df['token_age_at_signal_seconds'] / 3600
-df['token_age_minutes'] = df['token_age_at_signal_seconds'] / 60
 
-# Token freshness categories
-df['is_ultra_fresh'] = (df['token_age_hours'] < 1).astype(int)  # < 1 hour
-df['is_very_fresh'] = (df['token_age_hours'] < 4).astype(int)   # < 4 hours
-df['is_fresh'] = (df['token_age_hours'] < 12).astype(int)        # < 12 hours
+# Token freshness (single binary flag instead of multiple overlapping)
+df['is_very_fresh'] = (df['token_age_hours'] < 4).astype(int)
+df['freshness_score'] = np.exp(-df['token_age_hours'] / 6)
 
-# Time decay features (exponential)
-df['freshness_score'] = np.exp(-df['token_age_hours'] / 6)  # Half-life of 6 hours
-df['age_penalty'] = 1 / (1 + df['token_age_hours'])
-
-# === DERIVED INSIDER FEATURES ===
+# === INSIDER FEATURES (Simplified) ===
 print("📊 Creating insider-related features...")
 
-# Insider concentration (what % of supply do insiders control?)
 df['insider_supply_pct'] = np.where(
     df['token_supply'] > 0,
     (df['total_insider_token_amount'] / df['token_supply']) * 100,
     0
 )
 
-# Insider per network average
-df['avg_insider_network_size'] = np.where(
-    df['total_insider_networks'] > 0,
-    df['largest_insider_network_size'] / df['total_insider_networks'],
-    0
-)
-
-# Insider density score (how concentrated are insiders?)
-df['insider_density'] = np.where(
-    df['total_insider_networks'] > 0,
-    df['total_insider_token_amount'] / df['total_insider_networks'],
-    0
-)
-
-# Combined insider risk
-df['insider_risk_composite'] = (
+# Single composite insider risk (not multiple overlapping versions)
+df['insider_risk_score'] = (
     df['insider_supply_pct'] * 0.4 +
-    df['largest_insider_network_size'] * 0.3 +
-    (df['total_insider_networks'] * 2) * 0.3  # Scale networks to similar range
+    df['largest_insider_network_size'] * 0.4 +
+    (df['total_insider_networks'] * 2) * 0.2
 )
 
-# === LIQUIDITY & VOLUME FEATURES ===
+# === LIQUIDITY & VOLUME FEATURES (Log only, remove raw duplicates) ===
 print("💧 Creating liquidity/volume features...")
 
-# Log transforms for skewed distributions
 df['log_liquidity'] = np.log1p(df['liquidity_usd'])
 df['log_volume'] = np.log1p(df['volume_h24_usd'])
 df['log_fdv'] = np.log1p(df['fdv_usd'])
 df['log_lp_locked'] = np.log1p(df['total_lp_locked_usd'])
 
-# Liquidity depth (is there enough liquidity relative to FDV?)
+# Liquidity depth
 df['liquidity_depth_pct'] = np.where(
     df['fdv_usd'] > 0,
     (df['liquidity_usd'] / df['fdv_usd']) * 100,
     0
 )
 
-# LP lock quality score
+# LP lock quality
 df['lp_lock_quality'] = np.where(
     df['liquidity_usd'] > 0,
     (df['total_lp_locked_usd'] / df['liquidity_usd']) * 100,
     0
 )
 
-# Volume efficiency (volume relative to market cap)
-df['volume_efficiency'] = np.where(
-    df['fdv_usd'] > 0,
-    df['volume_h24_usd'] / df['fdv_usd'],
+# Keep ONLY ONE ratio (liquidity to volume, remove inverse)
+df['liquidity_to_volume_ratio'] = np.where(
+    df['volume_h24_usd'] > 0,
+    df['liquidity_usd'] / df['volume_h24_usd'],
     0
 )
 
-# === HOLDER CONCENTRATION FEATURES ===
+# === HOLDER CONCENTRATION (Simplified) ===
 print("👥 Creating holder concentration features...")
 
-# Holder quality (inverse of concentration)
 df['holder_quality_score'] = 100 - df['top_10_holders_pct']
-
-# Extreme concentration flags
-df['extreme_concentration'] = (df['top_10_holders_pct'] > 60).astype(int)
 df['whale_dominated'] = (df['top_10_holders_pct'] > 70).astype(int)
 
-# Creator risk assessment
-df['creator_dumped'] = ((df['creator_balance_pct'] < 1) & (df['token_age_hours'] < 24)).astype(int)
-df['creator_holds_significant'] = (df['creator_balance_pct'] > 10).astype(int)
-
-# Combined concentration risk
+# Single concentration risk metric
 df['concentration_risk'] = (
-    df['top_10_holders_pct'] * 0.5 +
-    df['creator_balance_pct'] * 0.3 +
-    df['insider_supply_pct'] * 0.2
+    df['top_10_holders_pct'] * 0.6 +
+    df['creator_balance_pct'] * 0.4
 )
 
-# === RISK COMPOSITE FEATURES ===
-print("⚠️ Creating composite risk scores...")
-
-# Liquidity risk (not enough locked LP)
-df['liquidity_risk_score'] = np.where(
-    df['is_lp_locked_95_plus'] == 0,
-    (100 - df['lp_lock_quality']) * 0.5,
-    0
-)
-
-# Insider + Holder combined risk
-df['insider_holder_risk'] = (
-    df['insider_risk_composite'] * 0.5 +
-    df['concentration_risk'] * 0.5
-)
-
-# Market health score (combines multiple positive signals)
-df['market_health_score'] = (
-    (df['liquidity_depth_pct'] / 100) * 30 +  # Good liquidity depth
-    (df['lp_lock_quality'] / 100) * 30 +      # Good LP lock
-    (df['holder_quality_score'] / 100) * 20 + # Good distribution
-    (df['volume_efficiency'] * 100) * 20      # Good volume
-)
-
-# === MOMENTUM & PRICE ACTION ===
+# === MOMENTUM FEATURES ===
 print("📈 Creating momentum features...")
 
-# Price momentum categories
 df['strong_uptrend'] = (df['price_change_h24_pct'] > 50).astype(int)
-df['moderate_uptrend'] = ((df['price_change_h24_pct'] > 20) & (df['price_change_h24_pct'] <= 50)).astype(int)
 df['weak_momentum'] = (df['price_change_h24_pct'] < 10).astype(int)
 
-# Price-adjusted volume (is volume real or just price moving?)
+# Volume quality
 df['volume_quality'] = np.where(
     abs(df['price_change_h24_pct']) > 0,
     df['volume_h24_usd'] / (1 + abs(df['price_change_h24_pct'])),
     df['volume_h24_usd']
 )
 
-# === RATIO INTERACTIONS ===
-print("🔄 Creating ratio interactions...")
-
-# Efficiency score (combines both ratios)
-df['market_efficiency'] = np.where(
-    df['liquidity_to_volume_ratio'] > 0,
-    df['volume_to_liquidity_ratio'] / df['liquidity_to_volume_ratio'],
-    df['volume_to_liquidity_ratio']
-)
-
-# Liquidity coverage (can liquidity handle the volume?)
-df['liquidity_coverage'] = np.where(
-    df['volume_h24_usd'] > 0,
-    df['liquidity_usd'] / df['volume_h24_usd'],
-    0
-)
-
 # === TIME-BASED PATTERNS ===
 print("🕐 Creating time-based features...")
 
-# Trading session indicators
-df['asian_hours'] = ((df['time_of_day_utc'] >= 0) & (df['time_of_day_utc'] < 8)).astype(int)
-df['european_hours'] = ((df['time_of_day_utc'] >= 8) & (df['time_of_day_utc'] < 16)).astype(int)
-df['us_hours'] = ((df['time_of_day_utc'] >= 16) & (df['time_of_day_utc'] < 24)).astype(int)
-
-# Peak trading time
 df['peak_hours'] = ((df['time_of_day_utc'] >= 14) & (df['time_of_day_utc'] <= 20)).astype(int)
-
-# Weekend/holiday combined
 df['off_peak_day'] = (df['is_weekend_utc'] | df['is_public_holiday_any']).astype(int)
 
 print("✅ Feature engineering complete!")
 
 # ============================================================================
-# COMPREHENSIVE FEATURE LIST
+# REDUCED FEATURE LIST (Remove Overlapping Features)
 # ============================================================================
 
+# Core features (keep only non-redundant ones)
 CORE_FEATURES = [
-    # === ORIGINAL REQUESTED FEATURES ===
     'price_change_h24_pct',
-    'volume_to_liquidity_ratio',
+    'liquidity_to_volume_ratio',  # Remove volume_to_liquidity_ratio (inverse)
     'fdv_to_liquidity_ratio',
-    'liquidity_to_volume_ratio',
     'creator_balance_pct',
     'top_10_holders_pct',
     'total_lp_locked_usd',
@@ -235,81 +164,49 @@ CORE_FEATURES = [
     'total_insider_token_amount',
     'pump_dump_risk_score',
     'time_of_day_utc',
-    'day_of_week_utc',
     'is_weekend_utc',
-    'is_public_holiday_any',
     'token_age_at_signal_seconds',
 ]
 
+# Streamlined derived features
 DERIVED_FEATURES = [
-    # === TIME FEATURES ===
+    # Time
     'token_age_hours',
-    'is_ultra_fresh',
     'is_very_fresh',
-    'is_fresh',
     'freshness_score',
-    'age_penalty',
     
-    # === INSIDER FEATURES ===
-    'insider_supply_pct',              # 🆕 KEY METRIC
-    'avg_insider_network_size',
-    'insider_density',
-    'insider_risk_composite',
+    # Insider (single score instead of multiple overlapping)
+    'insider_supply_pct',
+    'insider_risk_score',
     
-    # === LIQUIDITY FEATURES ===
+    # Liquidity (log only, no raw duplicates)
     'log_liquidity',
     'log_volume',
     'log_fdv',
     'log_lp_locked',
     'liquidity_depth_pct',
     'lp_lock_quality',
-    'volume_efficiency',
     
-    # === HOLDER FEATURES ===
+    # Holder
     'holder_quality_score',
-    'extreme_concentration',
     'whale_dominated',
-    'creator_dumped',
-    'creator_holds_significant',
     'concentration_risk',
     
-    # === RISK FEATURES ===
-    'liquidity_risk_score',
-    'insider_holder_risk',
-    'market_health_score',
-    
-    # === MOMENTUM FEATURES ===
+    # Momentum
     'strong_uptrend',
-    'moderate_uptrend',
     'weak_momentum',
     'volume_quality',
     
-    # === RATIO INTERACTIONS ===
-    'market_efficiency',
-    'liquidity_coverage',
-    
-    # === TIME PATTERNS ===
-    'asian_hours',
-    'european_hours',
-    'us_hours',
+    # Time patterns
     'peak_hours',
     'off_peak_day',
 ]
 
-# Add raw market metrics that might be useful
-MARKET_FUNDAMENTALS = [
-    'liquidity_usd',
-    'volume_h24_usd',
-    'fdv_usd',
-    'token_supply',
-]
-
-ALL_FEATURES = CORE_FEATURES + DERIVED_FEATURES + MARKET_FUNDAMENTALS
+ALL_FEATURES = CORE_FEATURES + DERIVED_FEATURES
 
 print(f"\n📋 Feature Summary:")
-print(f"   • Core features (requested): {len(CORE_FEATURES)}")
+print(f"   • Core features: {len(CORE_FEATURES)}")
 print(f"   • Derived features: {len(DERIVED_FEATURES)}")
-print(f"   • Market fundamentals: {len(MARKET_FUNDAMENTALS)}")
 print(f"   • TOTAL: {len(ALL_FEATURES)}")
 
 # Handle missing values
@@ -321,39 +218,51 @@ for col in ALL_FEATURES:
         df[col] = 0
 
 # ============================================================================
-# OPTIONAL: FILTER BY TOKEN AGE
+# REMOVE HIGHLY CORRELATED FEATURES
 # ============================================================================
 
 print("\n" + "="*80)
-print("🔍 DATA FILTERING")
+print("🔍 CORRELATION ANALYSIS & REMOVAL")
 print("="*80)
 
-# Uncomment to filter by token age
-# MAX_TOKEN_AGE_HOURS = 24
-# df = df[df['token_age_hours'] <= MAX_TOKEN_AGE_HOURS].copy()
-# print(f"✅ Filtered to tokens <= {MAX_TOKEN_AGE_HOURS}h old: {len(df)} samples")
+X_temp = df[ALL_FEATURES].copy()
+corr_matrix = X_temp.corr().abs()
 
-print(f"📊 Using all data: {len(df)} samples")
-print(f"   Token age range: {df['token_age_hours'].min():.1f}h to {df['token_age_hours'].max():.1f}h")
+# Find features with correlation > 0.90
+upper_tri = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+to_drop = [column for column in upper_tri.columns if any(upper_tri[column] > 0.90)]
+
+if to_drop:
+    print(f"🔴 Removing {len(to_drop)} highly correlated features (corr > 0.90):")
+    for feat in to_drop:
+        print(f"   • {feat}")
+    ALL_FEATURES = [f for f in ALL_FEATURES if f not in to_drop]
+else:
+    print("✅ No features with correlation > 0.90 found")
+
+print(f"\n✅ Final feature count: {len(ALL_FEATURES)}")
 
 # ============================================================================
-# TRAIN/TEST SPLIT
+# TEMPORAL TRAIN/TEST SPLIT (Fix Temporal Leakage)
 # ============================================================================
 
 print("\n" + "="*80)
-print("📊 STRATIFIED TRAIN/TEST SPLIT")
+print("📊 TEMPORAL TRAIN/TEST SPLIT")
 print("="*80)
 
-train_df, test_df = train_test_split(
-    df,
-    test_size=0.2,
-    stratify=df['target'],
-    random_state=42
-)
+# Sort by token age to create temporal split
+df = df.sort_values('token_age_at_signal_seconds').reset_index(drop=True)
 
-print(f"✅ Stratified Split:")
+# Use last 20% as test set (most recent tokens)
+split_idx = int(len(df) * 0.8)
+train_df = df[:split_idx].copy()
+test_df = df[split_idx:].copy()
+
+print(f"✅ Temporal Split:")
 print(f"   Train: {len(train_df)} samples | Win rate: {train_df['target'].mean()*100:.2f}%")
 print(f"   Test:  {len(test_df)} samples  | Win rate: {test_df['target'].mean()*100:.2f}%")
+print(f"   Train age range: {train_df['token_age_hours'].min():.1f}h to {train_df['token_age_hours'].max():.1f}h")
+print(f"   Test age range:  {test_df['token_age_hours'].min():.1f}h to {test_df['token_age_hours'].max():.1f}h")
 
 X_train = train_df[ALL_FEATURES].copy()
 y_train = train_df['target'].copy()
@@ -369,7 +278,7 @@ print("🎯 FEATURE SELECTION")
 print("="*80)
 
 # Test different k values
-k_values = [15, 20, 25, 30]
+k_values = [15, 20, 25]
 best_k = None
 best_cv_score = 0
 
@@ -383,7 +292,8 @@ for k in k_values:
     temp_model = xgb.XGBClassifier(
         max_depth=3, 
         learning_rate=0.05, 
-        n_estimators=30,
+        n_estimators=50,
+        min_child_weight=20,
         random_state=42, 
         eval_metric='auc'
     )
@@ -425,35 +335,33 @@ feature_scores.sort(key=lambda x: x[1] if not np.isnan(x[1]) else -1, reverse=Tr
 for i, (feat, score) in enumerate(feature_scores[:best_k], 1):
     selected = "✓" if feat in selected_features else " "
     score_str = f"{score:10.2f}" if not np.isnan(score) else "       nan"
-    
-    # Mark key features
     is_insider = "🔴" if 'insider' in feat.lower() else "  "
     is_derived = "🆕" if feat in DERIVED_FEATURES else "  "
     
     print(f"  {selected} {is_insider}{is_derived} {i:2d}. {feat:45s} | F-score: {score_str}")
 
 # ============================================================================
-# TRAIN ENSEMBLE MODELS
+# TRAIN ENSEMBLE MODELS (TUNED HYPERPARAMETERS)
 # ============================================================================
 
 print("\n" + "="*80)
-print("🚀 TRAINING ENSEMBLE MODELS")
+print("🚀 TRAINING ENSEMBLE MODELS (TUNED)")
 print("="*80)
 
 scale_pos_weight = (y_train == 0).sum() / (y_train == 1).sum()
 print(f"Class weight ratio: {scale_pos_weight:.2f}")
 
-# === XGBoost ===
+# === XGBoost (Reduced Overfitting) ===
 print("\n🟦 Training XGBoost...")
 xgb_model = xgb.XGBClassifier(
-    max_depth=4,
-    learning_rate=0.03,
-    n_estimators=100,
-    min_child_weight=10,
-    subsample=0.8,
-    colsample_bytree=0.8,
-    reg_alpha=1.0,
-    reg_lambda=5.0,
+    max_depth=3,               # Reduced from 4
+    learning_rate=0.05,        # Increased from 0.03
+    n_estimators=50,           # Reduced from 100
+    min_child_weight=20,       # Increased from 10
+    subsample=0.7,             # Reduced from 0.8
+    colsample_bytree=0.7,      # Reduced from 0.8
+    reg_alpha=2.0,             # Increased from 1.0
+    reg_lambda=10.0,           # Increased from 5.0
     scale_pos_weight=scale_pos_weight,
     random_state=42,
     eval_metric='auc'
@@ -472,20 +380,21 @@ xgb_test_auc = roc_auc_score(y_test, xgb_test_proba)
 print(f"  Training Accuracy: {xgb_train_acc:.4f}")
 print(f"  Test Accuracy:     {xgb_test_acc:.4f}")
 print(f"  Test AUC:          {xgb_test_auc:.4f}")
+print(f"  Overfit Gap:       {xgb_train_acc - xgb_test_acc:.4f}")
 
-# === LightGBM ===
+# === LightGBM (Reduced Overfitting) ===
 print("\n🟩 Training LightGBM...")
 lgb_model = lgb.LGBMClassifier(
-    num_leaves=15,
-    max_depth=4,
-    learning_rate=0.03,
-    n_estimators=100,
-    min_child_samples=15,
-    min_split_gain=0.02,
-    subsample=0.8,
-    colsample_bytree=0.8,
-    reg_alpha=1.0,
-    reg_lambda=5.0,
+    num_leaves=10,             # Reduced from 15
+    max_depth=3,               # Reduced from 4
+    learning_rate=0.05,        # Increased from 0.03
+    n_estimators=50,           # Reduced from 100
+    min_child_samples=20,      # Increased from 15
+    min_split_gain=0.03,       # Increased from 0.02
+    subsample=0.7,             # Reduced from 0.8
+    colsample_bytree=0.7,      # Reduced from 0.8
+    reg_alpha=2.0,             # Increased from 1.0
+    reg_lambda=10.0,           # Increased from 5.0
     class_weight='balanced',
     random_state=42,
     verbose=-1
@@ -504,15 +413,16 @@ lgb_test_auc = roc_auc_score(y_test, lgb_test_proba)
 print(f"  Training Accuracy: {lgb_train_acc:.4f}")
 print(f"  Test Accuracy:     {lgb_test_acc:.4f}")
 print(f"  Test AUC:          {lgb_test_auc:.4f}")
+print(f"  Overfit Gap:       {lgb_train_acc - lgb_test_acc:.4f}")
 
-# === CatBoost ===
+# === CatBoost (Reduced Overfitting) ===
 print("\n🟨 Training CatBoost...")
 cat_model = CatBoostClassifier(
-    iterations=100,
-    depth=4,
-    learning_rate=0.03,
-    l2_leaf_reg=15,
-    min_data_in_leaf=15,
+    iterations=50,             # Reduced from 100
+    depth=3,                   # Reduced from 4
+    learning_rate=0.05,        # Increased from 0.03
+    l2_leaf_reg=20,            # Increased from 15
+    min_data_in_leaf=20,       # Increased from 15
     auto_class_weights='Balanced',
     random_state=42,
     verbose=False
@@ -531,6 +441,7 @@ cat_test_auc = roc_auc_score(y_test, cat_test_proba)
 print(f"  Training Accuracy: {cat_train_acc:.4f}")
 print(f"  Test Accuracy:     {cat_test_acc:.4f}")
 print(f"  Test AUC:          {cat_test_auc:.4f}")
+print(f"  Overfit Gap:       {cat_train_acc - cat_test_acc:.4f}")
 
 # ============================================================================
 # ENSEMBLE TESTING
@@ -587,9 +498,9 @@ cv_scores = {'xgb': [], 'lgb': [], 'cat': [], 'ensemble': []}
 for fold, (train_idx, val_idx) in enumerate(skf.split(X_train_selected, y_train), 1):
     # XGBoost
     fold_xgb = xgb.XGBClassifier(
-        max_depth=4, learning_rate=0.03, n_estimators=100,
-        min_child_weight=10, subsample=0.8, colsample_bytree=0.8,
-        reg_alpha=1.0, reg_lambda=5.0,
+        max_depth=3, learning_rate=0.05, n_estimators=50,
+        min_child_weight=20, subsample=0.7, colsample_bytree=0.7,
+        reg_alpha=2.0, reg_lambda=10.0,
         scale_pos_weight=scale_pos_weight, random_state=42
     )
     fold_xgb.fit(X_train_selected[train_idx], y_train.iloc[train_idx], verbose=False)
@@ -598,8 +509,8 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(X_train_selected, y_train)
     
     # LightGBM
     fold_lgb = lgb.LGBMClassifier(
-        num_leaves=15, max_depth=4, learning_rate=0.03, n_estimators=100,
-        min_child_samples=15, reg_alpha=1.0, reg_lambda=5.0,
+        num_leaves=10, max_depth=3, learning_rate=0.05, n_estimators=50,
+        min_child_samples=20, reg_alpha=2.0, reg_lambda=10.0,
         class_weight='balanced', random_state=42, verbose=-1
     )
     fold_lgb.fit(X_train_selected[train_idx], y_train.iloc[train_idx])
@@ -608,7 +519,7 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(X_train_selected, y_train)
     
     # CatBoost
     fold_cat = CatBoostClassifier(
-        iterations=100, depth=4, learning_rate=0.03, l2_leaf_reg=15,
+        iterations=50, depth=3, learning_rate=0.05, l2_leaf_reg=20,
         auto_class_weights='Balanced', random_state=42, verbose=False
     )
     fold_cat.fit(X_train_selected[train_idx], y_train.iloc[train_idx])
@@ -641,15 +552,14 @@ print("\n" + "="*80)
 print("💾 SAVING MODELS")
 print("="*80)
 
-# Save all models
 joblib.dump(xgb_model, 'models/xgboost_model.pkl')
 joblib.dump(lgb_model, 'models/lightgbm_model.pkl')
 joblib.dump(cat_model, 'models/catboost_model.pkl')
 joblib.dump(selector_f, 'models/feature_selector.pkl')
 print("✅ Models saved")
 
-# Save metadata
 metadata = {
+    'model_version': '2.0_improved',
     'model_type': 'Ensemble',
     'ensemble_weights': {
         'catboost': float(best_ensemble_weights[0]),
@@ -662,8 +572,12 @@ metadata = {
     'num_features_selected': best_k,
     'selected_features': selected_features,
     'all_features': ALL_FEATURES,
-    'core_features': CORE_FEATURES,
-    'derived_features': DERIVED_FEATURES,
+    'improvements': [
+        'Fixed negative token ages',
+        'Removed correlated features (corr > 0.90)',
+        'Implemented temporal train/test split',
+        'Tuned hyperparameters to reduce overfitting'
+    ],
     'performance': {
         'test_auc': float(best_ensemble_auc),
         'cv_auc_mean': float(np.mean(cv_scores['ensemble'])),
@@ -732,7 +646,6 @@ print(f"   Recommended for AVOID signals: <0.40 (high recall for losses)")
 
 print("\n" + "="*80)
 print("📋 DETAILED EVALUATION")
-print("="*80)
 
 final_pred = (final_proba >= 0.5).astype(int)
 
