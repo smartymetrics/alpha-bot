@@ -328,6 +328,101 @@ class AsyncRateLimiter:
     async def __aexit__(self, exc_type, exc, tb):
         pass
 
+# --- Environment Config (near the top) ---
+# NOTE: SHYFT_API_KEY is assumed to be loaded via load_dotenv()
+SHYFT_API_KEY = os.getenv("SHYFT_API_KEY") 
+
+# -----------------------------------------------
+# Shyft Client with Retry Logic
+# -----------------------------------------------
+
+class ShyftClient:
+    """Dedicated Shyft API client with rate limiting and retry logic."""
+    BASE_URL = "https://api.shyft.to/sol/v1/token"
+
+    def __init__(
+        self, 
+        session: aiohttp.ClientSession,
+        api_semaphore: asyncio.Semaphore,
+        max_retries: int = 3,
+        debug: bool = False
+    ):
+        self.session = session
+        self.api_semaphore = api_semaphore 
+        self.max_retries = max_retries
+        self.debug = debug
+        self.headers = {"x-api-key": SHYFT_API_KEY}
+        
+    async def _make_shyft_request(self, url: str) -> Dict[str, Any]:
+        """
+        Helper to make Shyft API requests with specific 429 handling for retry_with_backoff.
+        Acquires semaphore only during the actual request to avoid holding it during backoff sleeps.
+        """
+        if not SHYFT_API_KEY:
+            raise ValueError("SHYFT_API_KEY not found in environment")
+            
+        # Acquire semaphore before the actual HTTP request
+        async with self.api_semaphore:
+            async with self.session.get(url, headers=self.headers, timeout=15) as resp:
+                if resp.status == 429:
+                    # Raise ClientResponseError to trigger retry logic in retry_with_backoff
+                    raise aiohttp.ClientResponseError(
+                        resp.request_info,
+                        resp.history,
+                        status=429,
+                        message="Shyft Rate Limit",
+                        headers=resp.headers
+                    )
+                if resp.status != 200:
+                    text = await resp.text()
+                    raise RuntimeError(f"Shyft API failed {resp.status}: {text}")
+                
+                data = await resp.json()
+                # Shyft returns 200 even on error sometimes, check the 'success' field
+                if not data.get("success"):
+                    # Don't retry on non-rate-limit 200 errors
+                    raise RuntimeError(f"Shyft API success=False: {data.get('message')}")
+                return data
+
+    async def get_token_info(self, mint: str) -> Dict[str, Any]:
+        """Fetch token info using retry_with_backoff for rate limit handling."""
+        info_url = f"{self.BASE_URL}/get_info?token_address={mint}&network=mainnet-beta"
+        
+        try:
+            info_data = await retry_with_backoff(
+                self._make_shyft_request, 
+                info_url, 
+                retries=self.max_retries, 
+                base_delay=1.0
+            )
+            return {"ok": True, "data": info_data.get("result", {})}
+        except Exception as e:
+            return {
+                "ok": False,
+                "error": "Shyft Info failed",
+                "error_text": str(e),
+                "status_code": 500
+            }
+
+    async def get_token_holders(self, mint: str) -> Dict[str, Any]:
+        """Fetch token holders using retry_with_backoff for rate limit handling."""
+        holders_url = f"{self.BASE_URL}/holders?token_address={mint}&network=mainnet-beta&page=1&size=100"
+        
+        try:
+            holders_data = await retry_with_backoff(
+                self._make_shyft_request, 
+                holders_url, 
+                retries=self.max_retries, 
+                base_delay=1.0
+            )
+            return {"ok": True, "data": holders_data.get("result", {})}
+        except Exception as e:
+            return {
+                "ok": False,
+                "error": "Shyft Holders failed",
+                "error_text": str(e),
+                "status_code": 500
+            }
 
 # -----------------------------------------------
 # RugCheck Client with Retry Logic
@@ -816,7 +911,8 @@ class AlphaTokenAnalyzer:
         dune_cache: DuneWinnersCache,
         helius_limiter: AsyncRateLimiter,
         rugcheck_client: RugCheckClient,
-        dex_limiter: AsyncRateLimiter, # Add new limiter
+        shyft_client: ShyftClient,
+        dex_limiter: AsyncRateLimiter,
         ml_classifier: SolanaTokenPredictor, 
         debug: bool = False
     ):
@@ -825,8 +921,9 @@ class AlphaTokenAnalyzer:
         self.dune_cache = dune_cache
         self.helius_limiter = helius_limiter
         self.rugcheck_client = rugcheck_client
-        self.dex_limiter = dex_limiter # Store new limiter
-        self.ml_classifier = ml_classifier # NEW: Store classifier
+        self.shyft_client = shyft_client 
+        self.dex_limiter = dex_limiter
+        self.ml_classifier = ml_classifier
         self.debug = debug
         
         if self.debug:
@@ -2011,6 +2108,8 @@ async def main():
         raise RuntimeError("No Moralis API keys found in MORALIS_API_KEYS")
         
     async with aiohttp.ClientSession() as http_session:
+        # New: Setup general semaphore for rate-limited APIs, e.g., 10 concurrent requests
+        API_SEMAPHORE = asyncio.Semaphore(1)
         
         debug_mode = True
 
@@ -2061,6 +2160,14 @@ async def main():
             debug=debug_mode
         )
 
+        # Initialize ShyftClient
+        shyft_client = ShyftClient(
+            http_session, 
+            API_SEMAPHORE, # Pass the general semaphore for concurrency control
+            max_retries=3, 
+            debug=debug_mode
+        )
+
         # --- NEW: Initialize ML Classifier ---
         try:
             ml_classifier = SolanaTokenPredictor(model_dir='models')
@@ -2076,6 +2183,7 @@ async def main():
             dune_cache=dune_cache,
             helius_limiter=helius_limiter,
             rugcheck_client=rugcheck_client,
+            shyft_client=shyft_client,
             dex_limiter=dex_limiter,
             ml_classifier=ml_classifier, # NEW: Inject classifier
             debug=debug_mode

@@ -53,6 +53,8 @@ COINGECKO_PRO_API_KEY = os.environ.get("GECKO_API")
 DUNE_API_KEY = os.environ.get("DUNE_API_KEY")
 DUNE_QUERY_ID = int(os.environ.get("DUNE_QUERY_ID"))
 
+SHYFT_API_KEY=os.getenv("SHYFT_API_KEY")
+
 def _load_keys_list(env_name: str) -> List[str]:
     """Load comma-separated API keys from environment variable"""
     value = os.getenv(env_name, "")
@@ -352,74 +354,93 @@ class TokenDiscovery:
         return rows
 
     async def fetch_dune_force_refresh(self) -> List[Dict[str, Any]]:
-        """Fully async Dune refresh with infinite polling (no timeouts)."""
-        if not self.dune_client or not self.dune_query_id:
-            raise RuntimeError("Dune client or query_id not configured")
+            """
+            Fully async Dune refresh using the new API endpoints (v1).
+            1. POST /execute -> Get execution_id
+            2. GET /results -> Poll until QUERY_STATE_COMPLETED
+            """
+            if not self.dune_api_key or not self.dune_query_id:
+                raise RuntimeError("Dune credentials or query_id not configured")
 
-        query_id = int(self.dune_query_id)
-        if self.debug:
-            print(f"[Dune ASYNC] 🚀 Starting infinite polling for query {query_id}")
+            base_url = "https://api.dune.com/api/v1"
+            headers = {"X-DUNE-API-KEY": self.dune_api_key}
+            
+            # We use a localized session for this distinct operation
+            async with aiohttp.ClientSession() as session:
+                # === STEP 1: Execute Query ===
+                exec_url = f"{base_url}/query/{self.dune_query_id}/execute"
+                if self.debug:
+                    print(f"[Dune API] 🚀 POST executing query {self.dune_query_id}...")
 
-        try:
-            from dune_client.query import QueryBase
-            # Try execute_query with INFINITE polling
-            try:
-                query = QueryBase(query_id=query_id)
-                execution = self.dune_client.execute_query(query)
+                try:
+                    async with session.post(exec_url, headers=headers) as resp:
+                        if resp.status == 429:
+                            raise RuntimeError("Dune API Rate Limited (POST execute)")
+                        if resp.status != 200:
+                            text = await resp.text()
+                            raise RuntimeError(f"Dune Execute failed {resp.status}: {text}")
+                        
+                        data = await resp.json()
+                        execution_id = data.get("execution_id")
+                        state = data.get("state")
+                        
+                        if not execution_id:
+                            raise RuntimeError(f"No execution_id returned: {data}")
+                        
+                        if self.debug:
+                            print(f"[Dune API] Execution ID: {execution_id} (State: {state})")
+
+                except Exception as e:
+                    if self.debug:
+                        print(f"[Dune API] ❌ Execute failed: {e}")
+                    return []
+
+                # === STEP 2: Poll for Results ===
+                results_url = f"{base_url}/execution/{execution_id}/results"
+                attempt = 0
                 
-                execution_id = None
-                if hasattr(execution, 'execution_id'):
-                    execution_id = execution.execution_id
-                elif hasattr(execution, 'id'):
-                    execution_id = execution.id
-                elif isinstance(execution, str):
-                    execution_id = execution
-
-                if execution_id:
-                    attempt = 0
-                    while True:  # No timeout
-                        try:
-                            attempt += 1
-                            status = self.dune_client.get_execution_status(execution_id)
-                            raw_state = getattr(status, 'state', getattr(status, 'execution_status', getattr(status, 'execution_state', str(status))))
-                            state_str = str(raw_state).lower()
-
-                            if self.debug and attempt % 20 == 0:
-                                print(f"[Dune ASYNC] 🚀 Attempt {attempt}: {state_str}")
-
-                            if "completed" in state_str:
-                                break
-                            elif "failed" in state_str:
-                                raise RuntimeError(f"Query execution failed: {raw_state}")
-
-                            await asyncio.sleep(3)
-                        except Exception as e:
-                            if self.debug:
-                                print(f"[Dune ASYNC] ⚠️ Polling error: {e}")
-                            break
-
+                while True:
+                    attempt += 1
+                    # Wait before polling (backoff slightly)
+                    await asyncio.sleep(min(3, 1 + (attempt * 0.2)))
+                    
                     try:
-                        payload = self.dune_client.get_result(execution_id)
-                        rows = self._rows_from_dune_payload(payload)
-                        if rows:
-                            return rows
+                        async with session.get(results_url, headers=headers) as resp:
+                            if resp.status == 429:
+                                if self.debug:
+                                    print("[Dune API] Rate limit polling results, waiting 5s...")
+                                await asyncio.sleep(5)
+                                continue
+                                
+                            if resp.status != 200:
+                                # 202 is sometimes used for pending, but Dune v1 usually returns 200 with state
+                                text = await resp.text()
+                                raise RuntimeError(f"Dune Results failed {resp.status}: {text}")
+                                
+                            data = await resp.json()
+                            state = data.get("state")
+                            
+                            if state == "QUERY_STATE_COMPLETED":
+                                rows = data.get("result", {}).get("rows", [])
+                                if self.debug:
+                                    print(f"[Dune API] ✅ Query completed! Returned {len(rows)} rows.")
+                                return rows
+                                
+                            elif state in ["QUERY_STATE_FAILED", "QUERY_STATE_CANCELLED", "QUERY_STATE_EXPIRED"]:
+                                raise RuntimeError(f"Query failed with state: {state}")
+                                
+                            else:
+                                # QUERY_STATE_PENDING, QUERY_STATE_EXECUTING
+                                if self.debug and attempt % 5 == 0:
+                                    print(f"[Dune API] Status: {state} (poll #{attempt})...")
+                                    
                     except Exception as e:
                         if self.debug:
-                            print(f"[Dune ASYNC] ❌ get_result failed: {e}")
-            except Exception as e:
-                if self.debug:
-                    print(f"[Dune ASYNC] ❌ execute_query failed: {e}")
-
-            # Fallback
-            if self.debug:
-                print("[Dune ASYNC] 🔄 Falling back to get_latest_result")
-            payload = self.dune_client.get_latest_result(query_id)
-            rows = self._rows_from_dune_payload(payload)
-            return rows
-
-        except Exception as e:
-            if self.debug:
-                print(f"[Dune ASYNC] ❌ All methods failed: {e}")
+                            print(f"[Dune API] ⚠️ Polling error: {e}")
+                        # If it's a transient network error, we might want to continue, 
+                        # but for now we break to avoid infinite loops on hard errors
+                        break
+            
             return []
 
     async def get_tokens_launched_yesterday_cached(self, cache_max_age_days: int = 7) -> List[TradingStart]:
@@ -1932,147 +1953,427 @@ class Monitor:
             if self.debug:
                 print(f"[Cleanup] Safety net removed {len(expired_mints_in_mem)} expired/completed tokens from _scheduled set.")
 
+# --------------------------------------------------------------------------
+    # --- 🚀 MODIFIED: Security Checks with Shyft Fallback 🚀 ---
+    # --------------------------------------------------------------------------
+
     async def _run_rugcheck_check(self, mint: str) -> Dict[str, Any]:
         """
-        Check token security using RugCheck API with comprehensive risk analysis.
-        Now properly handles 429 rate limiting by raising exceptions for retry logic.
-        
-        Args:
-            mint: Token mint address to check
-            
-        Returns:
-            Dict containing security analysis results or error information
-            
-        Raises:
-            aiohttp.ClientResponseError: On 429 status (triggers retry_with_backoff)
+        Check token security using RugCheck API.
+        If RugCheck fails (Rate Limit/Timeout/Error), fallback to Shyft API.
         """
+        # === 1. TRY RUGCHECK FIRST ===
         url = f"https://api.rugcheck.xyz/v1/tokens/{mint}/report"
         session = self.http_session
         
-        async with self._api_sema:
-            try:
+        try:
+            # We use a short internal retry for RugCheck before falling back
+            async with self._api_sema:
                 async with session.get(url, timeout=30) as resp:
-                    # Handle rate limiting by raising an exception
-                    # This triggers retry_with_backoff mechanism
                     if resp.status == 429:
-                        # Raise ClientResponseError to trigger retry logic
-                        # Include headers so Retry-After can be parsed
                         raise aiohttp.ClientResponseError(
-                            request_info=resp.request_info,
-                            history=resp.history,
-                            status=resp.status,
-                            message=f"Rate limited by RugCheck API for {mint}",
-                            headers=resp.headers
+                            resp.request_info, resp.history, status=429, message="Rate Limited"
                         )
-                    
-                    # Handle other error statuses (non-retriable)
                     if resp.status != 200:
                         text = await resp.text()
-                        return {
-                            "ok": False, 
-                            "error": f"rugcheck_status_{resp.status}", 
-                            "error_text": text
-                        }
+                        raise RuntimeError(f"RugCheck Status {resp.status}: {text}")
                     
-                    # Success - parse the response
                     data = await resp.json()
+
+            # --- Process RugCheck Data (Existing Logic) ---
+            probation_result = evaluate_probation_from_rugcheck(data)
+            
+            # Extract standard metrics
+            top_holders = data.get("topHolders") or []
+            markets = data.get("markets") or []
+            
+            # Liquidity Calc
+            total_lp_locked_usd = 0.0
+            total_lp_usd = 0.0
+            lp_lock_details = []
+
+            for market in markets:
+                if not market: continue
+                lp_data = market.get("lp", {})
+                if lp_data:
+                    lp_locked_usd = float(lp_data.get("lpLockedUSD", 0))
+                    lp_unlocked_usd = float(lp_data.get("lpUnlocked", 0))
+                    lp_total_usd_market = lp_locked_usd + lp_unlocked_usd
                     
-            except asyncio.TimeoutError:
+                    total_lp_locked_usd += lp_locked_usd
+                    total_lp_usd += lp_total_usd_market
+                    
+                    lp_lock_details.append({
+                        "market_type": market.get("marketType"),
+                        "locked_usd": lp_locked_usd,
+                        "total_usd": lp_total_usd_market,
+                        "locked_pct": lp_data.get("lpLockedPct", 0)
+                    })
+            
+            overall_lp_locked_pct = (total_lp_locked_usd / total_lp_usd * 100) if total_lp_usd > 0 else 0.0
+            
+            creator_balance_raw = data.get("creatorBalance")
+            creator_balance_pct = float(creator_balance_raw.get('pct', 0.0) or 0.0) if isinstance(creator_balance_raw, dict) else 0.0
+
+            return {
+                "ok": True,
+                "data_source": "rugcheck",
+                "rugged": data.get("rugged", False),
+                "total_holders": data.get("totalHolders", 0),
+                "top1_holder_pct": top_holders[0].get("pct", 0) if top_holders else 0.0,
+                "top_10_holders_pct": sum(h.get("pct", 0) for h in top_holders[:10]),
+                "creator_balance": creator_balance_pct,
+                "freeze_authority": data.get("freezeAuthority"),
+                "mint_authority": data.get("mintAuthority"),
+                "has_authorities": bool(data.get("freezeAuthority") or data.get("mintAuthority")),
+                "transfer_fee_pct": data.get("transferFee", {}).get("pct", 0),
+                "total_lp_usd": total_lp_usd,
+                "total_lp_locked_usd": total_lp_locked_usd,
+                "overall_lp_locked_pct": overall_lp_locked_pct,
+                "lp_lock_sufficient": overall_lp_locked_pct >= 95.0,
+                "probation": probation_result["probation"],
+                "probation_meta": probation_result,
+                "lp_lock_details": lp_lock_details,
+                "raw": data
+            }
+
+        except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError, Exception) as rc_error:
+            if self.debug:
+                print(f"[Security] RugCheck failed for {mint}: {str(rc_error)}")
+                print(f"[Security] 🔄 Falling back to Shyft API...")
+
+            # === 2. FALLBACK TO SHYFT ===
+            try:
+                result = await self._shyft_security_check(mint)
+                result["shyft_fallback_reason"] = str(rc_error)
+                return result
+            except Exception as shyft_error:
+                if self.debug:
+                    print(f"[Security] ❌ Shyft also failed for {mint}: {shyft_error}")
+                
                 return {
-                    "ok": False, 
-                    "error": "rugcheck_timeout", 
-                    "error_text": "API call timed out after 30s"
-                }
-            except aiohttp.ClientResponseError:
-                # Re-raise 429 errors to be caught by retry_with_backoff
-                # Don't catch and return error dict here
-                raise
-            except Exception as e:
-                # Other unexpected exceptions
-                return {
-                    "ok": False, 
-                    "error": "rugcheck_exception", 
-                    "error_text": f"{type(e).__name__}: {str(e)}"
+                    "ok": False,
+                    "error": "all_apis_failed",
+                    "error_text": "Both RugCheck and Shyft APIs failed",
+                    "rugcheck_error": str(rc_error),
+                    "shyft_error": str(shyft_error)
                 }
 
-        # === Extract key security metrics ===
-        
-        # Probation check
-        probation_result = evaluate_probation_from_rugcheck(data)
-        
-        # Basic data
-        top_holders = data.get("topHolders") or []
-        rugged = data.get("rugged", False)
+    async def _make_shyft_request(self, url: str) -> Dict[str, Any]:
+            """
+            Helper to make Shyft API requests with specific 429 handling for retry_with_backoff.
+            Acquires semaphore only during the actual request to avoid holding it during backoff sleeps.
+            """
+            headers = {"x-api-key": SHYFT_API_KEY}
+            
+            # Move semaphore inside the retryable function so we don't block a slot while sleeping
+            async with self._api_sema:
+                async with self.http_session.get(url, headers=headers, timeout=15) as resp:
+                    if resp.status == 429:
+                        # Raise ClientResponseError to trigger retry logic in retry_with_backoff
+                        raise aiohttp.ClientResponseError(
+                            resp.request_info,
+                            resp.history,
+                            status=429,
+                            message="Shyft Rate Limit",
+                            headers=resp.headers
+                        )
+                    if resp.status != 200:
+                        text = await resp.text()
+                        raise RuntimeError(f"Shyft API failed {resp.status}: {text}")
+                    
+                    data = await resp.json()
+                    if not data.get("success"):
+                        raise RuntimeError(f"Shyft API success=False: {data.get('message')}")
+                    return data
+
+    async def _shyft_security_check(self, mint: str) -> Dict[str, Any]:
+        """
+        Perform security check using Shyft API + DexScreener (for liquidity).
+        Uses retry_with_backoff for Shyft calls to handle rate limits.
+        Returns data in the same format as RugCheck to maintain compatibility.
+        """
+        if not SHYFT_API_KEY:
+            raise ValueError("SHYFT_API_KEY not found in environment")
+
+        base_url = "https://api.shyft.to/sol/v1/token"
+
+        # 1. Fetch Token Info (Metadata, Authorities, Supply) with Retry
+        info_url = f"{base_url}/get_info?token_address={mint}&network=mainnet-beta"
+        try:
+            info_data = await retry_with_backoff(
+                self._make_shyft_request, 
+                info_url, 
+                retries=3, 
+                base_delay=1.0
+            )
+        except Exception as e:
+            raise RuntimeError(f"Shyft Info failed: {e}")
+            
+        token_info = info_data.get("result", {})
+
+        # 2. Fetch Holders (Distribution) with Retry
+        holders_url = f"{base_url}/holders?token_address={mint}&network=mainnet-beta&page=1&size=100"
+        try:
+            holders_data = await retry_with_backoff(
+                self._make_shyft_request, 
+                holders_url, 
+                retries=3, 
+                base_delay=1.0
+            )
+        except Exception as e:
+            raise RuntimeError(f"Shyft Holders failed: {e}")
+
+        holders_result = holders_data.get("result", {})
+        holders_list = holders_result.get("holders", [])
+        total_holders = holders_result.get("total_holders", 0)
+
+        # 3. Fetch Liquidity from DexScreener (Auxiliary)
+        total_lp_usd = "unknown"
+        try:
+            # DexScreener already has its own internal retry logic
+            dex_data = await self._run_dexscreener_check(mint)
+            if dex_data.get("ok"):
+                total_lp_usd = dex_data.get("liquidity_usd", 0.0)
+        except Exception:
+            pass # Keep as "unknown" if DexScreener fails
+
+        # === DATA PROCESSING ===
         
         # Authorities
-        freeze_authority = data.get("freezeAuthority")
-        mint_authority = data.get("mintAuthority")
-        has_authorities = bool(freeze_authority or mint_authority)
+        freeze_auth = token_info.get("freeze_authority")
+        mint_auth = token_info.get("mint_authority")
+        has_authorities = bool(freeze_auth or mint_auth)
 
-        # Creator balance
-        creator_balance_raw = data.get("creatorBalance")
+        # Transfer Fee (BPS to %)
+        transfer_fee_data = token_info.get("transfer_fee", {})
+        transfer_fee_bps = transfer_fee_data.get("fee_bps", 0) if isinstance(transfer_fee_data, dict) else 0
+        transfer_fee_pct = float(transfer_fee_bps) / 100.0
+
+        # Holders Analysis
+        top1_pct = holders_list[0].get("percentage", 0) if holders_list else 0.0
+        top10_pct = sum(h.get("percentage", 0) for h in holders_list[:10])
+
+        # Creator Balance Calculation
+        creators = token_info.get("creators", [])
+        creator_address = creators[0].get("address") if creators else None
         creator_balance_pct = 0.0
-        if isinstance(creator_balance_raw, dict):
-            creator_balance_pct = float(creator_balance_raw.get('pct', 0.0) or 0.0)
-        creator_balance = creator_balance_pct
-
-        # Transfer fee
-        transfer_fee_pct = data.get("transferFee", {}).get("pct", 0)
         
-        # Holder metrics
-        total_holders = data.get("totalHolders", 0)
-        top1_holder_pct = top_holders[0].get("pct", 0) if top_holders else 0.0
-        top_10_holders_pct = sum(h.get("pct", 0) for h in top_holders[:10])
-
-        # Liquidity aggregation across all markets
-        markets = data.get("markets") or []
-        total_lp_locked_usd = 0.0
-        total_lp_usd = 0.0
-        lp_lock_details = []
-
-        for market in markets:
-            if not market:
-                continue
-            lp_data = market.get("lp", {})
-            if lp_data:
-                lp_locked_usd = float(lp_data.get("lpLockedUSD", 0))
-                lp_unlocked_usd = float(lp_data.get("lpUnlocked", 0))
-                lp_total_usd_market = lp_locked_usd + lp_unlocked_usd
-                
-                total_lp_locked_usd += lp_locked_usd
-                total_lp_usd += lp_total_usd_market
-                
-                lp_lock_details.append({
-                    "market_type": market.get("marketType"),
-                    "locked_usd": lp_locked_usd,
-                    "total_usd": lp_total_usd_market,
-                    "locked_pct": lp_data.get("lpLockedPct", 0)
-                })
+        if creator_address:
+            # Look for creator in top 100 holders
+            for h in holders_list:
+                if h.get("address") == creator_address:
+                    creator_balance_pct = float(h.get("percentage", 0))
+                    break
         
-        # Calculate overall LP lock percentage
-        overall_lp_locked_pct = (total_lp_locked_usd / total_lp_usd * 100) if total_lp_usd > 0 else 0.0
-        lp_lock_sufficient = overall_lp_locked_pct >= 95.0
+        # Probation Logic (Manual, since RugCheck isn't doing it)
+        # We consider creator holding > 10% as probation-worthy
+        probation = creator_balance_pct > 10.0
+        probation_meta = {
+            "probation": probation,
+            "explanation": f"Shyft: Creator balance {creator_balance_pct:.2f}% (>10%)" if probation else "Shyft: Clean"
+        }
 
         return {
             "ok": True,
-            "rugged": rugged,
+            "data_source": "shyft",
+            "rugged": False, # Shyft doesn't have a rugged registry
             "total_holders": total_holders,
-            "top1_holder_pct": top1_holder_pct,
-            "top_10_holders_pct": top_10_holders_pct,
-            "creator_balance": creator_balance,
-            "freeze_authority": freeze_authority,
-            "mint_authority": mint_authority,
+            "top1_holder_pct": top1_pct,
+            "top_10_holders_pct": top10_pct,
+            "creator_balance": creator_balance_pct,
+            "freeze_authority": freeze_auth,
+            "mint_authority": mint_auth,
             "has_authorities": has_authorities,
             "transfer_fee_pct": transfer_fee_pct,
-            "total_lp_usd": total_lp_usd,
-            "total_lp_locked_usd": total_lp_locked_usd,
-            "overall_lp_locked_pct": overall_lp_locked_pct,
-            "lp_lock_sufficient": lp_lock_sufficient,
-            "probation": probation_result["probation"],
-            "probation_meta": probation_result,
-            "lp_lock_details": lp_lock_details,
-            "raw": data
+            # LP Data (Mixed Source)
+            "total_lp_usd": total_lp_usd,        # From DexScreener or "unknown"
+            "total_lp_locked_usd": "unknown",    # Not available via basic Shyft
+            "overall_lp_locked_pct": "unknown",  # Not available via basic Shyft
+            "lp_lock_sufficient": "unknown",     # Cannot determine
+            "probation": probation,
+            "probation_meta": probation_meta,
+            "lp_lock_details": [],
+            "raw": {"info": token_info, "holders": holders_list[:5]}
         }
+
+    async def run_token_analysis_step(self, start: TradingStart, check_count: int):
+        """
+        Core analysis function that runs the full analysis lifecycle.
+        Handles both RugCheck and Shyft (fallback) data sources.
+        """
+        mint = start.mint
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        
+        if self.debug:
+            print(f"[Analysis] Running check #{check_count} for {mint}")
+
+        # === 1. RUN SECURITY CHECK (RUGCHECK -> SHYFT) ===
+        try:
+            # We call _run_rugcheck_check directly now as it handles its own fallback/retries internally
+            r = await self._run_rugcheck_check(mint)
+        except Exception as e:
+            if self.debug:
+                print(f"[Security] Fatal error checking security for {mint}: {e}")
+            reasons = [f"security_check_exception:{str(e)}"]
+            await self._start_or_update_probation(mint, start, {"mint": mint, "grade": "NONE"}, reasons)
+            return
+
+        # === 2. SECURITY GATE ===
+        reasons = []
+        if not r.get("ok"):
+            reasons.append(f"security_error:{r.get('error')}")
+        else:
+            data_source = r.get("data_source", "unknown")
+            
+            # Rule 0: Probation
+            if r.get("probation"):
+                reasons.append(r.get("probation_meta", {}).get("explanation", "Probation"))
+
+            # Rule 1: Rugged (Only valid for RugCheck)
+            if r.get("rugged"):
+                reasons.append("rugged:true")
+
+            # Rule 2: Authorities
+            if r.get("has_authorities"):
+                authorities = []
+                if r.get("freeze_authority"): authorities.append("freeze")
+                if r.get("mint_authority"): authorities.append("mint")
+                reasons.append(f"authorities:{','.join(authorities)}")
+            
+            # Rule 3: Creator Balance
+            creator_pct = r.get("creator_balance", 0)
+            if creator_pct > MAX_CREATOR_PCT:
+                reasons.append(f"creator_balance_pct:{creator_pct:.2f}")
+
+            # Rule 4: Transfer Fee
+            if r.get("transfer_fee_pct", 0) > 5:
+                reasons.append(f"transfer_fee:{r.get('transfer_fee_pct')}%")
+
+            # Rule 5: Holder Count
+            if r.get("total_holders", 0) < 50:
+                reasons.append(f"holder_count:{r.get('total_holders')}_req_50")
+
+            # Rule 6: LP Lock % (Conditional on Data Source)
+            lp_locked_pct = r.get("overall_lp_locked_pct")
+            
+            if data_source == "rugcheck":
+                # Strict check for RugCheck data
+                if isinstance(lp_locked_pct, (int, float)) and lp_locked_pct < 80.0:
+                    reasons.append(f"lp_locked:{lp_locked_pct:.1f}%_req_80%")
+            elif data_source == "shyft":
+                # Shyft doesn't provide lock info, so we skip this rule gracefully
+                # If we wanted to be strict, we could fail here, but fallback implies best-effort
+                pass
+
+            # Rule 7: Liquidity Amount (Available from both sources via DexScreener)
+            total_lp = r.get("total_lp_usd")
+            if total_lp != "unknown":
+                if total_lp < 10000.0:
+                    reasons.append(f"liquidity_usd:{total_lp:.2f}_req_10000")
+            else:
+                # If LP is unknown (DexScreener failed during Shyft check), that's a risk
+                if data_source == "shyft":
+                     reasons.append("liquidity_usd:unknown")
+
+        if reasons: 
+            if self.debug:
+                print(f"[Security] {mint} FAILED Gate ({r.get('data_source')}): {reasons}")
+            overlap_result_stub = {"mint": mint, "grade": "NONE", "probation_meta": r.get("probation_meta")}
+            await self._start_or_update_probation(mint, start, overlap_result_stub, reasons)
+            
+            self.scheduling_store.update_token_state(mint, {
+                "status": "probation",
+                "last_completed_check": now_ts,
+                "next_scheduled_check": now_ts + self.repeat_interval_seconds,
+                "total_checks_completed": check_count
+            })
+            return
+
+        # === 3. HELIUS CALL (GATE PASSED) ===
+        if self.debug:
+            print(f"[Security] {mint} PASSED Gate ({r.get('data_source')}). Fetching holders...")
+        
+        try:
+            overlap_result = await self._fetch_and_calculate_overlap(start)
+        except Exception as e:
+            if self.debug:
+                print(f"[Analysis] Helius call failed for {mint}: {e}")
+            self.scheduling_store.update_token_state(mint, {
+                "last_error": f"Helius_fail: {e}",
+                "last_error_at": datetime.now(timezone.utc).isoformat()
+            })
+            return
+
+        # === 4. POST-HELIUS PROCESSING ===
+        grade = overlap_result.get("grade", "NONE")
+        
+        if grade == "NONE":
+            # Save NONE result
+            obj = safe_load_overlap(self.overlap_store)
+            obj.setdefault(mint, []).append({
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "result": overlap_result,
+                "security": f"passed_grade_none_{r.get('data_source')}",
+                "rugcheck": self._extract_rugcheck_summary(r)
+            })
+            self.overlap_store.save(obj)
+            
+            self.scheduling_store.update_token_state(mint, {
+                "status": "active",
+                "last_completed_check": now_ts,
+                "next_scheduled_check": now_ts + self.repeat_interval_seconds,
+                "total_checks_completed": check_count
+            })
+            return
+
+        # Grade PASSED -> DexScreener + ML + Final Save
+        if self.debug:
+            print(f"[Analysis] {mint} PASSED ALL CHECKS (Grade: {grade}).")
+
+        try:
+            dex_data = await retry_with_backoff(
+                self._run_dexscreener_check, mint, retries=8, base_delay=1.5
+            )
+        except Exception:
+            dex_data = {"ok": False, "price_usd": None, "market_cap_usd": None}
+
+        # ML Prediction
+        ml_prediction_result = None
+        try:            
+            ml_prediction_result = self.ml_classifier.predict(mint, threshold=0.70)
+        except Exception as e:
+            ml_prediction_result = {'action': 'ERROR', 'error': str(e)}
+
+        # Save Final
+        obj = safe_load_overlap(self.overlap_store)
+        obj.setdefault(mint, []).append({
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "result": overlap_result,
+            "security": f"passed_{r.get('data_source')}",
+            "probation_meta": r.get("probation_meta"),
+            "rugcheck": self._extract_rugcheck_summary(r),
+            "dexscreener": {
+                "current_price_usd": dex_data.get("price_usd"),
+                "market_cap_usd": dex_data.get("market_cap_usd"),
+            },
+            "ml_prediction": ml_prediction_result
+        })
+        self.overlap_store.save(obj)
+        
+        if mint in self.pending_risky_tokens:
+            self.pending_risky_tokens.pop(mint, None)
+        
+        self.scheduling_store.update_token_state(mint, {
+            "status": "completed",
+            "promoted_at": datetime.now(timezone.utc).isoformat(),
+            "security_passed": True,
+            "liquidity_usd": r.get("total_lp_usd", 0.0),
+            "last_completed_check": now_ts,
+            "total_checks_completed": check_count
+        })
+        if self.debug:
+            print(f"[Analysis] {mint} COMPLETED via {r.get('data_source')}.")
 
     # --------------------------------------------------------------------------
     # --- 🚀 NEW: CONSOLIDATED ANALYSIS AND ROUTING LOGIC 🚀 ---
@@ -2094,236 +2395,236 @@ class Monitor:
             "lp_lock_details": r.get("lp_lock_details", [])
         }
     
-    async def run_token_analysis_step(self, start: TradingStart, check_count: int):
-        """
-        Core analysis function that runs the full analysis lifecycle.
-        Now properly handles RugCheck rate limiting with retry logic.
+    # async def run_token_analysis_step(self, start: TradingStart, check_count: int):
+    #     """
+    #     Core analysis function that runs the full analysis lifecycle.
+    #     Now properly handles RugCheck rate limiting with retry logic.
         
-        Steps:
-        1. Run RugCheck (with retry on 429)
-        2. Run Pre-Helius Security Gate
-        3. If fail, send to probation and RETURN
-        4. If pass, run Helius call (_fetch_and_calculate_overlap)
-        5. If overlap=NONE, save and RETURN
-        6. If overlap=PASS, run DexScreener, run ML prediction, save, and mark as completed
-        """
-        mint = start.mint
-        now_ts = int(datetime.now(timezone.utc).timestamp())
+    #     Steps:
+    #     1. Run RugCheck (with retry on 429)
+    #     2. Run Pre-Helius Security Gate
+    #     3. If fail, send to probation and RETURN
+    #     4. If pass, run Helius call (_fetch_and_calculate_overlap)
+    #     5. If overlap=NONE, save and RETURN
+    #     6. If overlap=PASS, run DexScreener, run ML prediction, save, and mark as completed
+    #     """
+    #     mint = start.mint
+    #     now_ts = int(datetime.now(timezone.utc).timestamp())
         
-        if self.debug:
-            print(f"[Analysis] Running check #{check_count} for {mint}")
+    #     if self.debug:
+    #         print(f"[Analysis] Running check #{check_count} for {mint}")
 
-        # === 1. RUN RUGCHECK WITH RETRY LOGIC ===
-        try:
-            r = await retry_with_backoff(
-                self._run_rugcheck_check, 
-                mint, 
-                retries=5,      # Increased from 2 to handle rate limits better
-                base_delay=2.0  # Start with 2s delay (appropriate for rate limits)
-            )
-        except RuntimeError as e:
-            # This catches the case where all retries are exhausted
-            if self.debug:
-                print(f"[Security] RugCheck failed for {mint} after all retries: {e}")
-            reasons = [f"rugcheck_max_retries_exceeded:{str(e)}"]
-            await self._start_or_update_probation(mint, start, {"mint": mint, "grade": "NONE"}, reasons)
-            return
-        except Exception as e:
-            # Unexpected exception during RugCheck
-            if self.debug:
-                print(f"[Security] Unexpected exception fetching RugCheck data for {mint}: {e}")
-            reasons = [f"rugcheck_exception:{str(e)}"]
-            await self._start_or_update_probation(mint, start, {"mint": mint, "grade": "NONE"}, reasons)
-            return
+    #     # === 1. RUN RUGCHECK WITH RETRY LOGIC ===
+    #     try:
+    #         r = await retry_with_backoff(
+    #             self._run_rugcheck_check, 
+    #             mint, 
+    #             retries=5,      # Increased from 2 to handle rate limits better
+    #             base_delay=2.0  # Start with 2s delay (appropriate for rate limits)
+    #         )
+    #     except RuntimeError as e:
+    #         # This catches the case where all retries are exhausted
+    #         if self.debug:
+    #             print(f"[Security] RugCheck failed for {mint} after all retries: {e}")
+    #         reasons = [f"rugcheck_max_retries_exceeded:{str(e)}"]
+    #         await self._start_or_update_probation(mint, start, {"mint": mint, "grade": "NONE"}, reasons)
+    #         return
+    #     except Exception as e:
+    #         # Unexpected exception during RugCheck
+    #         if self.debug:
+    #             print(f"[Security] Unexpected exception fetching RugCheck data for {mint}: {e}")
+    #         reasons = [f"rugcheck_exception:{str(e)}"]
+    #         await self._start_or_update_probation(mint, start, {"mint": mint, "grade": "NONE"}, reasons)
+    #         return
 
-        # === 2. PRE-HELIUS SECURITY GATE ===
-        reasons = []
-        if not r.get("ok"):
-            reasons.append(f"rugcheck_error:{r.get('error')}")
-        else:
-            # Rule 0: Check for high holder concentration (probation)
-            if r.get("probation"):
-                probation_reason = r.get("probation_meta", {}).get("explanation", "Probation: High top holder concentration")
-                reasons.append(probation_reason)
+    #     # === 2. PRE-HELIUS SECURITY GATE ===
+    #     reasons = []
+    #     if not r.get("ok"):
+    #         reasons.append(f"rugcheck_error:{r.get('error')}")
+    #     else:
+    #         # Rule 0: Check for high holder concentration (probation)
+    #         if r.get("probation"):
+    #             probation_reason = r.get("probation_meta", {}).get("explanation", "Probation: High top holder concentration")
+    #             reasons.append(probation_reason)
 
-            # Rule 1: Check if token is marked as rugged
-            if r.get("rugged"):
-                reasons.append("rugged:true")
+    #         # Rule 1: Check if token is marked as rugged
+    #         if r.get("rugged"):
+    #             reasons.append("rugged:true")
 
-            # Rule 2: Check for mint/freeze authorities
-            if r.get("has_authorities"):
-                authorities = []
-                if r.get("freeze_authority"): authorities.append("freeze")
-                if r.get("mint_authority"): authorities.append("mint")
-                reasons.append(f"authorities:{','.join(authorities)}")
+    #         # Rule 2: Check for mint/freeze authorities
+    #         if r.get("has_authorities"):
+    #             authorities = []
+    #             if r.get("freeze_authority"): authorities.append("freeze")
+    #             if r.get("mint_authority"): authorities.append("mint")
+    #             reasons.append(f"authorities:{','.join(authorities)}")
             
-            # Extract supply data safely
-            supply = 0
-            decimals = 0
-            raw_data = r.get("raw", {})
-            if raw_data:
-                token_data = raw_data.get("token", {})
-                if token_data:
-                    supply = token_data.get("supply", 0)
-                    decimals = token_data.get("decimals", 0)
+    #         # Extract supply data safely
+    #         supply = 0
+    #         decimals = 0
+    #         raw_data = r.get("raw", {})
+    #         if raw_data:
+    #             token_data = raw_data.get("token", {})
+    #             if token_data:
+    #                 supply = token_data.get("supply", 0)
+    #                 decimals = token_data.get("decimals", 0)
 
-            total_supply = supply / (10 ** decimals) if decimals > 0 else supply
+    #         total_supply = supply / (10 ** decimals) if decimals > 0 else supply
 
-            # Rule 3: Check creator token balance
-            creator_balance_val = r.get("creator_balance", 0)
-            if total_supply > 0 and (creator_balance_val / total_supply * 100) > MAX_CREATOR_PCT:
-                reasons.append(f"creator_balance_pct:{creator_balance_val / total_supply * 100}")
-            elif total_supply == 0 and creator_balance_val > 0:
-                reasons.append(f"creator_balance_pct:invalid_supply")
+    #         # Rule 3: Check creator token balance
+    #         creator_balance_val = r.get("creator_balance", 0)
+    #         if total_supply > 0 and (creator_balance_val / total_supply * 100) > MAX_CREATOR_PCT:
+    #             reasons.append(f"creator_balance_pct:{creator_balance_val / total_supply * 100}")
+    #         elif total_supply == 0 and creator_balance_val > 0:
+    #             reasons.append(f"creator_balance_pct:invalid_supply")
 
-            # Rule 4: Check transfer fee (must be <= 5%)
-            if r.get("transfer_fee_pct", 0) > 5:
-                reasons.append(f"transfer_fee:{r.get('transfer_fee_pct')}%")
+    #         # Rule 4: Check transfer fee (must be <= 5%)
+    #         if r.get("transfer_fee_pct", 0) > 5:
+    #             reasons.append(f"transfer_fee:{r.get('transfer_fee_pct')}%")
 
-            # Rule 5: Check holder count (must be >= 50)
-            if r.get("total_holders", 0) < 50:
-                reasons.append(f"holder_count:{r.get('total_holders')}_req_50")
+    #         # Rule 5: Check holder count (must be >= 50)
+    #         if r.get("total_holders", 0) < 50:
+    #             reasons.append(f"holder_count:{r.get('total_holders')}_req_50")
 
-            # Rule 6: Check aggregated liquidity lock percentage (must be >= 80%)
-            if r.get("overall_lp_locked_pct", 0.0) < 80.0:
-                reasons.append(f"lp_locked:{r.get('overall_lp_locked_pct'):.1f}%_req_80%")
+    #         # Rule 6: Check aggregated liquidity lock percentage (must be >= 80%)
+    #         if r.get("overall_lp_locked_pct", 0.0) < 80.0:
+    #             reasons.append(f"lp_locked:{r.get('overall_lp_locked_pct'):.1f}%_req_80%")
 
-            # Rule 7: Check aggregated total liquidity (must be >= $10,000)
-            if r.get("total_lp_usd", 0.0) < 10000.0:
-                reasons.append(f"liquidity_usd:{r.get('total_lp_usd'):.2f}_req_10000")
+    #         # Rule 7: Check aggregated total liquidity (must be >= $10,000)
+    #         if r.get("total_lp_usd", 0.0) < 10000.0:
+    #             reasons.append(f"liquidity_usd:{r.get('total_lp_usd'):.2f}_req_10000")
 
-        if reasons: 
-            if self.debug:
-                print(f"[Security] {mint} FAILED pre-Helius check: {reasons}")
-            overlap_result_stub = {"mint": mint, "grade": "NONE", "probation_meta": r.get("probation_meta")}
-            await self._start_or_update_probation(mint, start, overlap_result_stub, reasons)
+    #     if reasons: 
+    #         if self.debug:
+    #             print(f"[Security] {mint} FAILED pre-Helius check: {reasons}")
+    #         overlap_result_stub = {"mint": mint, "grade": "NONE", "probation_meta": r.get("probation_meta")}
+    #         await self._start_or_update_probation(mint, start, overlap_result_stub, reasons)
             
-            # Update scheduler to reflect "active" (but on probation) state
-            self.scheduling_store.update_token_state(mint, {
-                "status": "probation",
-                "last_completed_check": now_ts,
-                "next_scheduled_check": now_ts + self.repeat_interval_seconds,
-                "total_checks_completed": check_count
-            })
-            return  # Stop here, don't run Helius
+    #         # Update scheduler to reflect "active" (but on probation) state
+    #         self.scheduling_store.update_token_state(mint, {
+    #             "status": "probation",
+    #             "last_completed_check": now_ts,
+    #             "next_scheduled_check": now_ts + self.repeat_interval_seconds,
+    #             "total_checks_completed": check_count
+    #         })
+    #         return  # Stop here, don't run Helius
 
-        # === 3. HELIUS CALL (GATE PASSED) ===
-        if self.debug:
-            print(f"[Security] {mint} PASSED pre-Helius check. Fetching holders...")
+    #     # === 3. HELIUS CALL (GATE PASSED) ===
+    #     if self.debug:
+    #         print(f"[Security] {mint} PASSED pre-Helius check. Fetching holders...")
         
-        try:
-            overlap_result = await self._fetch_and_calculate_overlap(start)
-        except Exception as e:
-            if self.debug:
-                print(f"[Analysis] Helius call (_fetch_and_calculate_overlap) failed for {mint}: {e}")
-            self.scheduling_store.update_token_state(mint, {
-                "last_error": f"Helius_fail: {e}",
-                "last_error_at": datetime.now(timezone.utc).isoformat()
-            })
-            return  # Retry on next loop
+    #     try:
+    #         overlap_result = await self._fetch_and_calculate_overlap(start)
+    #     except Exception as e:
+    #         if self.debug:
+    #             print(f"[Analysis] Helius call (_fetch_and_calculate_overlap) failed for {mint}: {e}")
+    #         self.scheduling_store.update_token_state(mint, {
+    #             "last_error": f"Helius_fail: {e}",
+    #             "last_error_at": datetime.now(timezone.utc).isoformat()
+    #         })
+    #         return  # Retry on next loop
 
-        # === 4. POST-HELIUS PROCESSING (SAVE/ROUTE) ===
-        grade = overlap_result.get("grade", "NONE")
+    #     # === 4. POST-HELIUS PROCESSING (SAVE/ROUTE) ===
+    #     grade = overlap_result.get("grade", "NONE")
         
-        # 4a. Handle NONE Grade (Passed security, but no overlap)
-        if grade == "NONE":
-            if self.debug:
-                print(f"[Analysis] {mint} passed security, 0 overlap. Saving as NONE.")
-            obj = safe_load_overlap(self.overlap_store)
-            obj.setdefault(mint, []).append({
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "result": overlap_result,
-                "security": "passed_grade_none",
-                "rugcheck": self._extract_rugcheck_summary(r)
-            })
-            self.overlap_store.save(obj)
+    #     # 4a. Handle NONE Grade (Passed security, but no overlap)
+    #     if grade == "NONE":
+    #         if self.debug:
+    #             print(f"[Analysis] {mint} passed security, 0 overlap. Saving as NONE.")
+    #         obj = safe_load_overlap(self.overlap_store)
+    #         obj.setdefault(mint, []).append({
+    #             "ts": datetime.now(timezone.utc).isoformat(),
+    #             "result": overlap_result,
+    #             "security": "passed_grade_none",
+    #             "rugcheck": self._extract_rugcheck_summary(r)
+    #         })
+    #         self.overlap_store.save(obj)
             
-            # Token stays "active" and will be re-checked
-            self.scheduling_store.update_token_state(mint, {
-                "status": "active",
-                "last_completed_check": now_ts,
-                "next_scheduled_check": now_ts + self.repeat_interval_seconds,
-                "total_checks_completed": check_count
-            })
-            return
+    #         # Token stays "active" and will be re-checked
+    #         self.scheduling_store.update_token_state(mint, {
+    #             "status": "active",
+    #             "last_completed_check": now_ts,
+    #             "next_scheduled_check": now_ts + self.repeat_interval_seconds,
+    #             "total_checks_completed": check_count
+    #         })
+    #         return
 
-        # 4b. Handle PASSED Token (Security PASS + Overlap PASS)
-        if self.debug:
-            print(f"[Analysis] {mint} PASSED ALL CHECKS (Grade: {grade}). Fetching DexScreener and saving.")
+    #     # 4b. Handle PASSED Token (Security PASS + Overlap PASS)
+    #     if self.debug:
+    #         print(f"[Analysis] {mint} PASSED ALL CHECKS (Grade: {grade}). Fetching DexScreener and saving.")
 
-        try:
-            dex_data = await retry_with_backoff(
-                self._run_dexscreener_check, mint, retries=8, base_delay=1.5
-            )
-        except Exception as e:
-            if self.debug:
-                print(f"[Analysis] Dexscreener check for {mint} failed after all retries: {e}")
-            dex_data = {"ok": False, "price_usd": None, "market_cap_usd": None, "raw": {}}
+    #     try:
+    #         dex_data = await retry_with_backoff(
+    #             self._run_dexscreener_check, mint, retries=8, base_delay=1.5
+    #         )
+    #     except Exception as e:
+    #         if self.debug:
+    #             print(f"[Analysis] Dexscreener check for {mint} failed after all retries: {e}")
+    #         dex_data = {"ok": False, "price_usd": None, "market_cap_usd": None, "raw": {}}
 
-        # === ML PREDICTION ===
-        ml_prediction_result = None
-        try:            
-            if self.debug:
-                print(f"[Analysis] 📞 Calling ML predictor for mint: {mint}")
+    #     # === ML PREDICTION ===
+    #     ml_prediction_result = None
+    #     try:            
+    #         if self.debug:
+    #             print(f"[Analysis] 📞 Calling ML predictor for mint: {mint}")
 
-            ml_prediction_result = self.ml_classifier.predict(mint, threshold=0.70)
+    #         ml_prediction_result = self.ml_classifier.predict(mint, threshold=0.70)
             
-            if not ml_prediction_result or ml_prediction_result.get("error"):
-                raise ValueError(f"ML prediction returned an error: {ml_prediction_result.get('error', 'Unknown')}")
+    #         if not ml_prediction_result or ml_prediction_result.get("error"):
+    #             raise ValueError(f"ML prediction returned an error: {ml_prediction_result.get('error', 'Unknown')}")
                 
-        except Exception as e:
-            if self.debug:
-                print(f"[Analysis] ML prediction failed for {mint}: {e}")
-            ml_prediction_result = {
-                'action': 'ERROR',
-                'win_probability': 0.0,
-                'confidence': 'NONE',
-                'risk_tier': 'UNKNOWN',
-                'error': str(e)
-            }
+    #     except Exception as e:
+    #         if self.debug:
+    #             print(f"[Analysis] ML prediction failed for {mint}: {e}")
+    #         ml_prediction_result = {
+    #             'action': 'ERROR',
+    #             'win_probability': 0.0,
+    #             'confidence': 'NONE',
+    #             'risk_tier': 'UNKNOWN',
+    #             'error': str(e)
+    #         }
 
-        # === SAVE TO OVERLAP STORE ===
-        obj = safe_load_overlap(self.overlap_store)
-        obj.setdefault(mint, []).append({
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "result": overlap_result,
-            "security": "passed",
-            "probation_meta": r.get("probation_meta"),
-            "rugcheck": self._extract_rugcheck_summary(r),
-            "dexscreener": {
-                "current_price_usd": dex_data.get("price_usd"),
-                "market_cap_usd": dex_data.get("market_cap_usd"),
-            },
-            "ml_prediction": {
-                "probability": ml_prediction_result.get("win_probability"),
-                "confidence": ml_prediction_result.get("confidence"),
-                "risk_tier": ml_prediction_result.get("risk_tier"),
-                "action": ml_prediction_result.get("action"),
-                "error": ml_prediction_result.get("error"),
-                "key_metrics": ml_prediction_result.get("key_metrics"),
-                "warnings": ml_prediction_result.get("warnings")
-            }
-        })
-        self.overlap_store.save(obj)
+    #     # === SAVE TO OVERLAP STORE ===
+    #     obj = safe_load_overlap(self.overlap_store)
+    #     obj.setdefault(mint, []).append({
+    #         "ts": datetime.now(timezone.utc).isoformat(),
+    #         "result": overlap_result,
+    #         "security": "passed",
+    #         "probation_meta": r.get("probation_meta"),
+    #         "rugcheck": self._extract_rugcheck_summary(r),
+    #         "dexscreener": {
+    #             "current_price_usd": dex_data.get("price_usd"),
+    #             "market_cap_usd": dex_data.get("market_cap_usd"),
+    #         },
+    #         "ml_prediction": {
+    #             "probability": ml_prediction_result.get("win_probability"),
+    #             "confidence": ml_prediction_result.get("confidence"),
+    #             "risk_tier": ml_prediction_result.get("risk_tier"),
+    #             "action": ml_prediction_result.get("action"),
+    #             "error": ml_prediction_result.get("error"),
+    #             "key_metrics": ml_prediction_result.get("key_metrics"),
+    #             "warnings": ml_prediction_result.get("warnings")
+    #         }
+    #     })
+    #     self.overlap_store.save(obj)
         
-        # Remove from probation (if it was there)
-        if mint in self.pending_risky_tokens:
-            self.pending_risky_tokens.pop(mint, None)
-            if self.debug:
-                print(f"[Analysis] {mint} promoted from probation.")
+    #     # Remove from probation (if it was there)
+    #     if mint in self.pending_risky_tokens:
+    #         self.pending_risky_tokens.pop(mint, None)
+    #         if self.debug:
+    #             print(f"[Analysis] {mint} promoted from probation.")
         
-        # Mark as "completed" in scheduler, stopping further checks
-        self.scheduling_store.update_token_state(mint, {
-            "status": "completed",
-            "promoted_at": datetime.now(timezone.utc).isoformat(),
-            "security_passed": True,
-            "liquidity_usd": r.get("total_lp_usd", 0.0),
-            "lp_locked_pct": r.get("overall_lp_locked_pct", 0.0),
-            "last_completed_check": now_ts,
-            "total_checks_completed": check_count
-        })
-        if self.debug:
-            print(f"[Analysis] {mint} successfully processed and saved. Status set to 'completed'.")
+    #     # Mark as "completed" in scheduler, stopping further checks
+    #     self.scheduling_store.update_token_state(mint, {
+    #         "status": "completed",
+    #         "promoted_at": datetime.now(timezone.utc).isoformat(),
+    #         "security_passed": True,
+    #         "liquidity_usd": r.get("total_lp_usd", 0.0),
+    #         "lp_locked_pct": r.get("overall_lp_locked_pct", 0.0),
+    #         "last_completed_check": now_ts,
+    #         "total_checks_completed": check_count
+    #     })
+    #     if self.debug:
+    #         print(f"[Analysis] {mint} successfully processed and saved. Status set to 'completed'.")
     
     # --------------------------------------------------------------------------
     # --- 🚀 END: NEW ANALYSIS LOGIC 🚀 ---
