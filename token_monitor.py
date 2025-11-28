@@ -2088,11 +2088,18 @@ class Monitor:
             Helper to make Shyft API requests with specific 429 handling for retry_with_backoff.
             Acquires semaphore only during the actual request to avoid holding it during backoff sleeps.
             """
+            if not SHYFT_API_KEY:
+                raise ValueError("SHYFT_API_KEY not found in environment")
+            
+            # Add API key to URL as query parameter (more reliable than header)
+            separator = "&" if "?" in url else "?"
+            url_with_key = f"{url}{separator}api_key={SHYFT_API_KEY}"
+            
             headers = {"x-api-key": SHYFT_API_KEY}
             
             # Move semaphore inside the retryable function so we don't block a slot while sleeping
             async with self._api_sema:
-                async with self.http_session.get(url, headers=headers, timeout=15) as resp:
+                async with self.http_session.get(url_with_key, headers=headers, timeout=15) as resp:
                     if resp.status == 429:
                         # Raise ClientResponseError to trigger retry logic in retry_with_backoff
                         raise aiohttp.ClientResponseError(

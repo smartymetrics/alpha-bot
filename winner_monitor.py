@@ -335,10 +335,9 @@ SHYFT_API_KEY = os.getenv("SHYFT_API_KEY")
 # -----------------------------------------------
 # Shyft Client with Retry Logic
 # -----------------------------------------------
-
 class ShyftClient:
     """Dedicated Shyft API client with rate limiting and retry logic."""
-    BASE_URL = "https://api.shyft.to/v1/token"
+    BASE_URL = "https://api.shyft.to/sol/v1/token"  # FIXED: Changed from "https://api.shyft.to/v1/token"
 
     def __init__(
         self, 
@@ -360,8 +359,8 @@ class ShyftClient:
         """
         if not SHYFT_API_KEY:
             raise ValueError("SHYFT_API_KEY not found in environment")
-            
-        # Acquire semaphore before the actual HTTP request
+        
+        # FIXED: Use header for API key instead of query parameter
         async with self.api_semaphore:
             async with self.session.get(url, headers=self.headers, timeout=15) as resp:
                 if resp.status == 429:
@@ -386,7 +385,8 @@ class ShyftClient:
 
     async def get_token_info(self, mint: str) -> Dict[str, Any]:
         """Fetch token info using retry_with_backoff for rate limit handling."""
-        info_url = f"{self.BASE_URL}/get_info?token_address={mint}&network=mainnet-beta"
+        # FIXED: Corrected endpoint path with proper parameter order
+        info_url = f"{self.BASE_URL}/get_info?network=mainnet-beta&token_address={mint}"
         
         try:
             info_data = await retry_with_backoff(
@@ -406,7 +406,8 @@ class ShyftClient:
 
     async def get_token_holders(self, mint: str) -> Dict[str, Any]:
         """Fetch token holders using retry_with_backoff for rate limit handling."""
-        holders_url = f"{self.BASE_URL}/holders?token_address={mint}&network=mainnet-beta&page=1&size=100"
+        # FIXED: Corrected endpoint path with proper parameter order
+        holders_url = f"{self.BASE_URL}/holders?network=mainnet-beta&token_address={mint}&page=1&size=100"
         
         try:
             holders_data = await retry_with_backoff(
