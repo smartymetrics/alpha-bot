@@ -96,6 +96,7 @@ app.add_middleware(
 
 # ==================== Service Endpoints ====================
 
+@app.head("/")
 @app.get("/")
 async def root():
     """Root endpoint"""
