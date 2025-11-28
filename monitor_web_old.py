@@ -19,8 +19,7 @@ import pandas as pd
 
 # Import the main monitoring loop
 from token_monitor import main_loop
-# COMMENTED OUT - Winner monitor moved to separate service
-# from winner_monitor import main
+from winner_monitor import main
 
 # Import wallet PnL functions
 from wallet import (
@@ -64,8 +63,7 @@ service_status = {
     "started_at": None,
     "last_activity": None,
     "monitor_running": False,
-    # COMMENTED OUT - Moved to separate service
-    # "winner_monitor_running": False,
+    "winner_monitor_running": False,
     "error": None,
     "wallet_requests": 0,
     "last_wallet_request": None,
@@ -87,21 +85,20 @@ async def run_monitor():
         logger.info("Attempting to restart monitor...")
         asyncio.create_task(run_monitor())
 
-# COMMENTED OUT - Winner monitor moved to separate service
-# async def run_winner_monitor():
-#     """
-#     Wrapper to run winner_monitor.py's main function and handle errors.
-#     """
-#     try:
-#         await main()
-#     except Exception as e:
-#         logger.error(f"Winner monitor crashed: {e}")
-#         service_status["winner_monitor_running"] = False
-#         service_status["error"] = str(e)
-#         # Attempt to restart after 10 seconds
-#         await asyncio.sleep(10)
-#         logger.info("Attempting to restart winner monitor...")
-#         asyncio.create_task(run_winner_monitor())
+async def run_winner_monitor():
+    """
+    Wrapper to run winner_monitor.py's main function and handle errors.
+    """
+    try:
+        await main()
+    except Exception as e:
+        logger.error(f"Winner monitor crashed: {e}")
+        service_status["winner_monitor_running"] = False
+        service_status["error"] = str(e)
+        # Attempt to restart after 10 seconds
+        await asyncio.sleep(10)
+        logger.info("Attempting to restart winner monitor...")
+        asyncio.create_task(run_winner_monitor())
 
 
 @asynccontextmanager
@@ -110,17 +107,13 @@ async def lifespan(app: FastAPI):
     # Startup
     service_status["started_at"] = datetime.utcnow().isoformat()
     service_status["monitor_running"] = True
-    # COMMENTED OUT - Moved to separate service
-    # service_status["winner_monitor_running"] = True
+    service_status["winner_monitor_running"] = True
 
-    logger.info("Starting token monitor background task...")
-    # COMMENTED OUT - Winner monitor moved to separate service
-    # logger.info("Starting token monitor and winner monitor background tasks...")
+    logger.info("Starting token monitor and winner monitor background tasks...")
 
-    # Run main_loop as background task
+    # Run main_loop and winner monitor as background tasks
     monitor_task = asyncio.create_task(run_monitor())
-    # COMMENTED OUT - Moved to separate service
-    # winner_monitor_task = asyncio.create_task(run_winner_monitor())
+    winner_monitor_task = asyncio.create_task(run_winner_monitor())
 
     yield
 
@@ -128,19 +121,16 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down token monitor...")
     monitor_task.cancel()
 
-    # COMMENTED OUT - Moved to separate service
-    # logger.info("Shutting down winner monitor...")
-    # winner_monitor_task.cancel()
-    
+    logger.info("Shutting down winner monitor...")
+    winner_monitor_task.cancel()
     try:
         await monitor_task
     except asyncio.CancelledError:
         pass
-    # COMMENTED OUT - Moved to separate service
-    # try:
-    #     await winner_monitor_task
-    # except asyncio.CancelledError:
-    #     pass
+    try:
+        await winner_monitor_task
+    except asyncio.CancelledError:
+        pass
 
 app = FastAPI(
     title="Token Monitor & Wallet PnL Service",
@@ -164,15 +154,14 @@ app.add_middleware(
 async def root():
     """Root endpoint"""
     return {
-        "service": "Token Monitor & Wallet PnL Service with ML Predictor",
+        "service": "Token Monitor & Wallet PnL Service",
         "status": "running" if service_status["monitor_running"] else "stopped",
         "uptime_start": service_status["started_at"],
         "features": [
             "24/7 Token Monitoring",
             "Wallet PnL Analysis",
             "Behavioral Metrics",
-            "Phishing Detection",
-            "ML-Powered Token Prediction"
+            "Phishing Detection"
         ],
         "endpoints": {
             "monitor": ["/health", "/status"],
@@ -184,19 +173,9 @@ async def root():
                 "/wallet/{address}/tokens",
                 "/wallet/{address}/token-pnl",
                 "/wallet/{address}/trades",
-                "/wallet/{address}/holdings",
-                "/wallet/{address}/overall-analysis"
-            ],
-            "ml_predictor": [
-                "/token/{mint}/predict",
-                "/token/predict/batch",
-                "/ml/status",
-                "/ml/features"
+                "/wallet/{address}/holdings"
+                "/wallet/{address}/overall-analysis"  
             ]
-        },
-        "ml_predictor_status": {
-            "available": ML_PREDICTOR_AVAILABLE,
-            "total_predictions": service_status["ml_predictions"]
         }
     }
 
@@ -476,7 +455,6 @@ async def get_wallet_token_breakdown(
     except Exception as e:
         logger.error(f"Error processing token breakdown: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
 # ===============================================
 # Background Job Management for Full Analysis
 # ===============================================
@@ -1197,6 +1175,49 @@ async def get_model_features():
         "all_selected_features": ml_predictor.metadata['selected_features']
     }
 
+
+# Update the root endpoint to include ML predictor info
+# Modify the existing @app.get("/") endpoint:
+
+@app.get("/")
+async def root():
+    """Root endpoint"""
+    return {
+        "service": "Token Monitor & Wallet PnL Service with ML Predictor",
+        "status": "running" if service_status["monitor_running"] else "stopped",
+        "uptime_start": service_status["started_at"],
+        "features": [
+            "24/7 Token Monitoring",
+            "Wallet PnL Analysis",
+            "Behavioral Metrics",
+            "Phishing Detection",
+            "ML-Powered Token Prediction"  # ADD THIS
+        ],
+        "endpoints": {
+            "monitor": ["/health", "/status"],
+            "wallet_analysis": [
+                "/wallet/{address}/pnl",
+                "/wallet/{address}/behavior",
+                "/wallet/{address}/full-analysis",
+                "/wallet/{address}/distribution",
+                "/wallet/{address}/tokens",
+                "/wallet/{address}/token-pnl",
+                "/wallet/{address}/trades",
+                "/wallet/{address}/holdings",
+                "/wallet/{address}/overall-analysis"
+            ],
+            "ml_predictor": [  # ADD THIS
+                "/token/{mint}/predict",
+                "/token/predict/batch",
+                "/ml/status",
+                "/ml/features"
+            ]
+        },
+        "ml_predictor_status": {
+            "available": ML_PREDICTOR_AVAILABLE,
+            "total_predictions": service_status["ml_predictions"]
+        }
+    }
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
