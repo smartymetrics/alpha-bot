@@ -296,9 +296,15 @@ class FeatureExtractor:
 
         # --- SECURITY / RUGCHECK DATA ---
         
-        # Token Supply
+        # Token Supply and Decimals
         token_supply = get_nested(rc_inner, 'token.supply', 0)
-        features_dict['token_supply'] = float(token_supply) if token_supply else 0.0
+        token_decimals = get_nested(rc_inner, 'token.decimals', 0)
+        
+        # Ensure numeric types (handle None gracefully)
+        token_supply = float(token_supply) if token_supply is not None else 0.0
+        token_decimals = int(token_decimals) if token_decimals is not None else 0
+        
+        features_dict['token_supply'] = token_supply
 
         # Authorities
         has_mint = features_block.get('has_mint_authority')
@@ -306,20 +312,39 @@ class FeatureExtractor:
             raw_auth = get_nested(rc_inner, 'token.mintAuthority')
             has_mint = raw_auth is not None
         features_dict['has_mint_authority'] = int(has_mint)
-
+        
         has_freeze = features_block.get('has_freeze_authority')
         if has_freeze is None:
             raw_auth = get_nested(rc_inner, 'token.freezeAuthority')
             has_freeze = raw_auth is not None
         features_dict['has_freeze_authority'] = int(has_freeze)
         
-        # Creator Balance
+        # Creator Balance - FIXED: Normalize by decimals
         creator_bal = rc_inner.get('creatorBalance', 0)
         creator_pct = features_block.get('creator_balance_pct')
         
+        # Coerce creator_bal to float safely
+        try:
+            creator_bal = float(creator_bal) if creator_bal is not None else 0.0
+        except (ValueError, TypeError):
+            creator_bal = 0.0
+        
         # Calculate manually if missing or zero
+        # IMPORTANT: Normalize creator_bal by decimals before dividing by supply
         if (creator_pct is None or creator_pct == 0) and token_supply > 0:
-            creator_pct = (float(creator_bal) / float(token_supply)) * 100
+            creator_bal_normalized = 0.0
+            if creator_bal > 0 and token_decimals > 0:
+                try:
+                    # Normalize the raw creator balance by decimals
+                    creator_bal_normalized = creator_bal / (10 ** token_decimals)
+                except (ValueError, TypeError, ZeroDivisionError):
+                    creator_bal_normalized = 0.0
+            
+            if creator_bal_normalized > 0:
+                creator_pct = (creator_bal_normalized / token_supply) * 100
+            else:
+                creator_pct = 0.0
+        
         features_dict['creator_balance_pct'] = float(creator_pct) if creator_pct else 0.0
 
         # Top 10 Holders
@@ -344,7 +369,13 @@ class FeatureExtractor:
         if lp_locked_pct is None:
             lp_locked_pct = rc_raw_wrapper.get('overall_lp_locked_pct', 0)
         
-        features_dict['is_lp_locked_95_plus'] = int(float(lp_locked_pct) >= 95 if lp_locked_pct is not None else 0)
+        # Safely convert to float
+        try:
+            lp_locked_pct = float(lp_locked_pct) if lp_locked_pct is not None else 0.0
+        except (ValueError, TypeError):
+            lp_locked_pct = 0.0
+        
+        features_dict['is_lp_locked_95_plus'] = int(lp_locked_pct >= 95)
 
         features_dict['rugcheck_risk_level'] = features_block.get('rugcheck_risk_level', 'unknown')
 
@@ -376,16 +407,19 @@ class FeatureExtractor:
         # --- RISK SCORE ---
         pump_dump_components = []
         
-        # Insider risk
-        i_size = features_dict['largest_insider_network_size']
-        if i_size > 100: pump_dump_components.append(30)
-        elif i_size > 50: pump_dump_components.append(20)
-        elif i_size > 20: pump_dump_components.append(10)
+        # Insider risk - ensure i_size is numeric
+        i_size = features_dict.get('largest_insider_network_size', 0) or 0
+        if isinstance(i_size, (int, float)):
+            if i_size > 100: pump_dump_components.append(30)
+            elif i_size > 50: pump_dump_components.append(20)
+            elif i_size > 20: pump_dump_components.append(10)
         
-        # Whale risk
-        if top_1_pct > 30: pump_dump_components.append(25)
-        elif top_1_pct > 20: pump_dump_components.append(15)
-        elif top_1_pct > 10: pump_dump_components.append(8)
+        # Whale risk - ensure top_1_pct is numeric
+        top_1_pct = sum(h.get('pct', 0) for h in top_holders[:1]) if top_holders else 0
+        if isinstance(top_1_pct, (int, float)):
+            if top_1_pct > 30: pump_dump_components.append(25)
+            elif top_1_pct > 20: pump_dump_components.append(15)
+            elif top_1_pct > 10: pump_dump_components.append(8)
         
         # LP Risk
         lp_pct_val = float(lp_locked_pct) if lp_locked_pct is not None else 0
@@ -412,8 +446,8 @@ class FeatureExtractor:
         
         creator_dumped = (creator_pct == 0) and (token_age_hours is not None and token_age_hours < 24)
         if creator_dumped: pump_dump_components.append(10)
-        elif creator_pct > 10: pump_dump_components.append(7)
-        elif creator_pct > 5: pump_dump_components.append(4)
+        elif isinstance(creator_pct, (int, float)) and creator_pct > 10: pump_dump_components.append(7)
+        elif isinstance(creator_pct, (int, float)) and creator_pct > 5: pump_dump_components.append(4)
         
         features_dict['pump_dump_risk_score'] = sum(pump_dump_components)
 

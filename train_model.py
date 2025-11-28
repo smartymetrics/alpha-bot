@@ -106,7 +106,7 @@ df['lp_lock_quality'] = np.where(
     0
 )
 
-# Keep ONLY ONE ratio (liquidity to volume, remove inverse)
+# liquidity to volume
 df['liquidity_to_volume_ratio'] = np.where(
     df['volume_h24_usd'] > 0,
     df['liquidity_usd'] / df['volume_h24_usd'],
@@ -153,7 +153,7 @@ print("✅ Feature engineering complete!")
 # Core features (keep only non-redundant ones)
 CORE_FEATURES = [
     'price_change_h24_pct',
-    'liquidity_to_volume_ratio',  # Remove volume_to_liquidity_ratio (inverse)
+    'liquidity_to_volume_ratio',  
     'fdv_to_liquidity_ratio',
     'creator_balance_pct',
     'top_10_holders_pct',

@@ -2012,8 +2012,32 @@ class Monitor:
             
             overall_lp_locked_pct = (total_lp_locked_usd / total_lp_usd * 100) if total_lp_usd > 0 else 0.0
             
+            # Creator Balance with proper normalization
             creator_balance_raw = data.get("creatorBalance")
-            creator_balance_pct = float(creator_balance_raw.get('pct', 0.0) or 0.0) if isinstance(creator_balance_raw, dict) else 0.0
+            creator_balance_pct = 0.0
+            
+            # Handle RugCheck's inconsistent creatorBalance type - can be dict with pct or raw amount
+            if isinstance(creator_balance_raw, dict):
+                creator_balance_pct = float(creator_balance_raw.get('pct', 0.0) or 0.0)
+            elif creator_balance_raw is not None:
+                try:
+                    # If it's a raw number, normalize by decimals and supply
+                    creator_balance_raw_num = float(creator_balance_raw)
+                    
+                    # Extract token metadata for normalization
+                    token_data = data.get("token", {})
+                    decimals = int(token_data.get("decimals", 0)) if token_data.get("decimals") is not None else 0
+                    supply = float(token_data.get("supply", 0)) if token_data.get("supply") is not None else 0
+                    
+                    if decimals > 0 and supply > 0:
+                        # Normalize: raw_amount / (10^decimals) / supply * 100
+                        creator_balance_normalized = creator_balance_raw_num / (10 ** decimals)
+                        creator_balance_pct = (creator_balance_normalized / supply) * 100
+                    else:
+                        # Fallback: just use raw number as-is (already percentage)
+                        creator_balance_pct = creator_balance_raw_num
+                except (ValueError, TypeError, ZeroDivisionError):
+                    creator_balance_pct = 0.0
 
             return {
                 "ok": True,
@@ -2096,7 +2120,7 @@ class Monitor:
         if not SHYFT_API_KEY:
             raise ValueError("SHYFT_API_KEY not found in environment")
 
-        base_url = "https://api.shyft.to/sol/v1/token"
+        base_url = "https://api.shyft.to/v1/token"
 
         # 1. Fetch Token Info (Metadata, Authorities, Supply) with Retry
         info_url = f"{base_url}/get_info?token_address={mint}&network=mainnet-beta"
@@ -2154,7 +2178,7 @@ class Monitor:
         top1_pct = holders_list[0].get("percentage", 0) if holders_list else 0.0
         top10_pct = sum(h.get("percentage", 0) for h in holders_list[:10])
 
-        # Creator Balance Calculation
+        # Creator Balance Calculation with proper normalization
         creators = token_info.get("creators", [])
         creator_address = creators[0].get("address") if creators else None
         creator_balance_pct = 0.0
@@ -2163,6 +2187,7 @@ class Monitor:
             # Look for creator in top 100 holders
             for h in holders_list:
                 if h.get("address") == creator_address:
+                    # Shyft already provides percentage, but normalize to ensure accuracy
                     creator_balance_pct = float(h.get("percentage", 0))
                     break
         

@@ -338,7 +338,7 @@ SHYFT_API_KEY = os.getenv("SHYFT_API_KEY")
 
 class ShyftClient:
     """Dedicated Shyft API client with rate limiting and retry logic."""
-    BASE_URL = "https://api.shyft.to/sol/v1/token"
+    BASE_URL = "https://api.shyft.to/v1/token"
 
     def __init__(
         self, 
@@ -929,19 +929,82 @@ class AlphaTokenAnalyzer:
         if self.debug:
             print("[TokenAnalyzer] Initialized.")
 
+    async def _get_supply_and_decimals_from_shyft(self, mint: str) -> tuple:
+        """
+        Fallback method to get supply and decimals from Shyft API.
+        Returns (supply, decimals) or (0, 0) if failed.
+        """
+        try:
+            shyft_result = await self.shyft_client.get_token_info(mint)
+            if shyft_result.get("ok"):
+                shyft_data = shyft_result.get("data", {})
+                supply = shyft_data.get("supply", 0)
+                decimals = shyft_data.get("decimals", 0)
+                
+                if supply and decimals:
+                    if self.debug:
+                        print(f"[TokenAnalyzer] ✅ Got supply from Shyft: {supply}, decimals: {decimals}")
+                    return (supply, decimals)
+        except Exception as e:
+            if self.debug:
+                print(f"[TokenAnalyzer] ⚠️ Shyft fallback failed for {mint}: {e}")
+        
+        return (0, 0)
+
+    async def _get_creator_balance_from_shyft(self, mint: str, decimals: int) -> tuple:
+        """
+        Fallback method to get creator balance from Shyft API.
+        Returns (creator_balance_normalized, success_flag).
+        Properly normalizes by decimals to avoid percentage calculation errors.
+        """
+        try:
+            shyft_result = await self.shyft_client.get_token_info(mint)
+            if shyft_result.get("ok"):
+                shyft_data = shyft_result.get("data", {})
+                creator_balance_raw = shyft_data.get("creatorBalance", 0)
+                
+                if creator_balance_raw and decimals:
+                    try:
+                        # Normalize by decimals (same as supply normalization)
+                        creator_balance_normalized = float(creator_balance_raw) / (10 ** int(decimals))
+                        if self.debug:
+                            print(f"[TokenAnalyzer] ✅ Got creator balance from Shyft: {creator_balance_raw} (normalized: {creator_balance_normalized})")
+                        return (creator_balance_normalized, True)
+                    except (ValueError, TypeError, ZeroDivisionError):
+                        pass
+        except Exception as e:
+            if self.debug:
+                print(f"[TokenAnalyzer] ⚠️ Shyft creator balance fallback failed for {mint}: {e}")
+        
+        return (0.0, False)
+
     async def _run_rugcheck_check(self, mint: str) -> Dict[str, Any]:
         """
         Check token security using RugCheck API with comprehensive risk analysis.
         Uses RugCheckClient for rate limiting and retry logic.
-        FIXED: Handle zero supply edge case
+        FIXED: Handle None responses and free tier rate limits with Shyft fallback
         """
         # Delegate to the RugCheckClient which handles rate limiting and retries
         result = await self.rugcheck_client.get_token_report(mint)
         
+        # Handle None or invalid responses
+        if result is None:
+            if self.debug:
+                print(f"[TokenAnalyzer] ⚠️ RugCheck returned None for {mint} (rate limit or service issue)")
+            return {"ok": False, "error": "rugcheck_none_response", "error_text": "RugCheck API returned None"}
+        
         if not result.get("ok"):
+            if self.debug:
+                print(f"[TokenAnalyzer] ⚠️ RugCheck failed for {mint}: {result.get('error')}")
             return result
         
-        data = result["data"]
+        data = result.get("data")
+        
+        # Handle None data
+        if data is None:
+            if self.debug:
+                print(f"[TokenAnalyzer] ⚠️ RugCheck data is None for {mint}")
+            return {"ok": False, "error": "rugcheck_null_data", "error_text": "RugCheck returned null data"}
         
         # Extract key security metrics (rest of the method remains the same)
         probation_result = evaluate_probation_from_rugcheck(data)
@@ -955,7 +1018,7 @@ class AlphaTokenAnalyzer:
         mint_authority = data.get("mintAuthority")
         has_authorities = bool(freeze_authority or mint_authority)
 
-        # --- Handle inconsistent creatorBalance type ---
+        # --- Handle inconsistent creatorBalance type with proper normalization ---
         creator_balance_raw = data.get("creatorBalance")
         creator_balance_pct = 0.0
         if isinstance(creator_balance_raw, dict):
@@ -964,9 +1027,23 @@ class AlphaTokenAnalyzer:
             except (ValueError, TypeError):
                 creator_balance_pct = 0.0
         elif creator_balance_raw is not None:
-             try:
-                creator_balance_pct = float(creator_balance_raw)
-             except (ValueError, TypeError):
+            try:
+                # If it's a raw number, normalize by decimals and supply
+                creator_balance_raw_num = float(creator_balance_raw)
+                
+                # Extract token metadata for normalization
+                token_data = data.get("token", {})
+                decimals = int(token_data.get("decimals", 0)) if token_data.get("decimals") is not None else 0
+                supply = float(token_data.get("supply", 0)) if token_data.get("supply") is not None else 0
+                
+                if decimals > 0 and supply > 0:
+                    # Normalize: raw_amount / (10^decimals) / supply * 100
+                    creator_balance_normalized = creator_balance_raw_num / (10 ** decimals)
+                    creator_balance_pct = (creator_balance_normalized / supply) * 100
+                else:
+                    # Fallback: just use raw number as-is (already percentage)
+                    creator_balance_pct = creator_balance_raw_num
+            except (ValueError, TypeError, ZeroDivisionError):
                 creator_balance_pct = 0.0
                 
         creator_balance = creator_balance_pct
@@ -1184,8 +1261,8 @@ class AlphaTokenAnalyzer:
                 "skip_reason": "rugcheck_api_failed"
             }
         
-        # 3. CHECK RUGGED STATUS
-        if security_report["rugcheck"].get("rugged"):
+        # 3. CHECK RUGGED STATUS (only if rugcheck passed)
+        if security_report["rugcheck_passed"] and security_report["rugcheck"].get("rugged"):
             if self.debug:
                 print(f"[TokenAnalyzer] ⚠️ Token {mint} marked as RUGGED - SKIPPING overlap check")
             return {
@@ -1203,8 +1280,8 @@ class AlphaTokenAnalyzer:
                 "skip_reason": "rugged"
             }
         
-        # 4. CHECK PROBATION STATUS
-        if security_report["probation"]:
+        # 4. CHECK PROBATION STATUS (only if rugcheck passed)
+        if security_report["rugcheck_passed"] and security_report["probation"]:
             if self.debug:
                 print(f"[TokenAnalyzer] ⚠️ Token {mint} in PROBATION - SKIPPING overlap check")
                 print(f"[TokenAnalyzer] Reason: {security_report['probation_reason']}")
@@ -1224,20 +1301,31 @@ class AlphaTokenAnalyzer:
             }
         
         # 5. CHECK MINIMUM SECURITY REQUIREMENTS
-        # *** FIXED: Handle zero supply edge case ***
-        rugcheck_details = security_report.get("rugcheck", {})
+        # *** FIXED: Handle zero supply edge case and null rugcheck_details ***
+        rugcheck_details = security_report.get("rugcheck") or {}
         security_failures = []
         
-        # Check for active authorities (Mint/Freeze)
-        if rugcheck_details.get("has_authorities"):
+        # Check for active authorities (Mint/Freeze) - only if rugcheck_passed
+        if security_report.get("rugcheck_passed") and rugcheck_details.get("has_authorities"):
             security_failures.append("has_active_authorities")
         
-        # *** FIX: Get supply and decimals from raw data safely ***
-        raw_data = security_report.get("rugcheck_raw", {}).get("raw", {})
-        token_data = raw_data.get("token", {})
+        # *** FIX: Get supply and decimals from RugCheck, fallback to Shyft if needed ***
+        raw_data = security_report.get("rugcheck_raw") or {}
+        raw_data = raw_data.get("raw") or {}
+        token_data = raw_data.get("token") or {}
         
         supply = token_data.get("supply", 0)
         decimals = token_data.get("decimals", 0)
+        data_source = "rugcheck"
+        
+        # If RugCheck didn't provide valid supply/decimals, try Shyft
+        if not supply or not decimals:
+            if self.debug:
+                print(f"[TokenAnalyzer] ⚠️ RugCheck missing supply/decimals for {mint}, trying Shyft...")
+            supply, decimals = await self._get_supply_and_decimals_from_shyft(mint)
+            data_source = "shyft"
+            if supply and decimals and self.debug:
+                print(f"[TokenAnalyzer] ✅ Using supply from {data_source}: {supply}, decimals: {decimals}")
         
         # Calculate total supply with zero check
         total_supply = 0
@@ -1245,24 +1333,49 @@ class AlphaTokenAnalyzer:
             try:
                 # Use float for supply to handle large numbers
                 total_supply = float(supply) / (10 ** int(decimals))
+                if self.debug:
+                    print(f"[TokenAnalyzer] 📊 Calculated total_supply from {data_source}: {total_supply}")
             except (ZeroDivisionError, ValueError, TypeError, OverflowError):
                 total_supply = 0
+                if self.debug:
+                    print(f"[TokenAnalyzer] ❌ Error calculating total_supply for {mint}")
         
-        # Check for creator balance percentage (FIXED: safe division)
+        # Check for creator balance percentage (FIXED: normalize creator_balance_raw by decimals)
         creator_balance_raw = 0.0
+        creator_balance_normalized = 0.0
+        
         try:
             creator_balance_raw = float(rugcheck_details.get("creator_balance", 0.0) or 0.0)
         except (ValueError, TypeError):
              creator_balance_raw = 0.0
 
-        if total_supply > 0:
-            creator_balance_pct = (creator_balance_raw / total_supply) * 100
+        # Normalize creator balance by decimals (same way we normalized total_supply)
+        if creator_balance_raw > 0 and decimals:
+            try:
+                creator_balance_normalized = creator_balance_raw / (10 ** int(decimals))
+            except (ZeroDivisionError, ValueError, TypeError, OverflowError):
+                creator_balance_normalized = 0.0
+        
+        # If RugCheck didn't provide valid creator balance, try Shyft
+        if creator_balance_normalized == 0.0 and creator_balance_raw == 0.0:
+            if self.debug:
+                print(f"[TokenAnalyzer] ⚠️ RugCheck missing creator balance for {mint}, trying Shyft...")
+            creator_balance_normalized, shyft_success = await self._get_creator_balance_from_shyft(mint, decimals)
+            if shyft_success and self.debug:
+                print(f"[TokenAnalyzer] ✅ Using creator balance from shyft")
+
+        if total_supply > 0 and creator_balance_normalized > 0:
+            creator_balance_pct = (creator_balance_normalized / total_supply) * 100
+            if self.debug:
+                print(f"[TokenAnalyzer] 👤 Creator balance normalized: {creator_balance_normalized}, percentage: {creator_balance_pct:.2f}% (from {data_source})")
             if creator_balance_pct > MAX_CREATOR_BALANCE_PCT:
                 security_failures.append(f"creator_balance_pct:{creator_balance_pct:.2f}_req_{MAX_CREATOR_BALANCE_PCT}%")
         else:
             # If total_supply is 0, consider it suspicious
             if creator_balance_raw > 0:
-                security_failures.append(f"invalid_supply:creator_has_balance_but_supply_is_zero")
+                security_failures.append(f"invalid_supply:creator_has_balance_but_supply_is_zero_source_{data_source}")
+            if self.debug:
+                print(f"[TokenAnalyzer] ⚠️ Cannot validate creator balance: total_supply=0, data_source={data_source}")
         
         # Check transfer fee (must be low)
         transfer_fee_val = 0.0
