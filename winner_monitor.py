@@ -19,6 +19,9 @@ Tracks high-frequency winner wallets and monitors their latest token purchases.
 - Runs ml_predictor_v2.py on all tokens that pass security/overlap checks.
 - Adds 'ml_prediction' (probability, confidence, risk_tier) to the final
   results file for data confirmation, NOT as a filter.
+- *** REMOVED SHYFT / ADDED HELIUS RPC ***
+- Replaced all Shyft API calls with direct Helius RPC calls (getTokenSupply, etc.)
+- Added fallback to public Solana RPC.
 """
 
 import asyncio
@@ -59,6 +62,7 @@ load_dotenv()
 MORALIS_API_KEYS = [
     k.strip() for k in os.getenv("MORALIS_API_KEY", "").split(",") if k.strip()
 ]
+HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")
 WINNER_POLL_INTERVAL_SECONDS = int(os.getenv("WINNER_POLL_INTERVAL_SECONDS", "300"))
 WINNER_WALLET_COOLDOWN_SECONDS = int(os.getenv("WINNER_WALLET_COOLDOWN_SECONDS", "21600"))
 WINNER_TOP_N_WALLETS = int(os.getenv("WINNER_TOP_N_WALLETS", "70"))
@@ -193,13 +197,9 @@ def prune_old_overlap_entries(data: dict, expiry_hours: int = 24) -> dict:
     if not data:
         return {}
         
-    # --- MODIFIED: Requirement 1 ---
-    # Define both a past cutoff and a future cutoff
     now = datetime.now(timezone.utc)
     cutoff_past = now - timedelta(hours=expiry_hours)
-    # Prune entries with timestamps more than 1 day in the future
     cutoff_future = now + timedelta(days=1)
-    # --- End Modification ---
     
     pruned = {}
 
@@ -219,7 +219,6 @@ def prune_old_overlap_entries(data: dict, expiry_hours: int = 24) -> dict:
                 )
             
             if ts_val is None:
-                # Keep entries without a recognizable timestamp
                 new_entries.append(entry)
                 continue
 
@@ -238,19 +237,13 @@ def prune_old_overlap_entries(data: dict, expiry_hours: int = 24) -> dict:
                     if ts.tzinfo is None:
                         ts = ts.replace(tzinfo=timezone.utc)
                 else:
-                    # Keep unrecognizable timestamp formats
                     new_entries.append(entry)
                     continue
                 
-                # --- MODIFIED: Requirement 1 ---
-                # Keep entry only if it's within the valid time window
-                # (i.e., not expired AND not in the future)
                 if ts and (ts > cutoff_past and ts < cutoff_future):
                     new_entries.append(entry)
-                # --- End Modification ---
                 
             except Exception:
-                # Keep entries with parsing errors
                 new_entries.append(entry)
 
         if new_entries:
@@ -328,102 +321,6 @@ class AsyncRateLimiter:
     async def __aexit__(self, exc_type, exc, tb):
         pass
 
-# --- Environment Config (near the top) ---
-# NOTE: SHYFT_API_KEY is assumed to be loaded via load_dotenv()
-SHYFT_API_KEY = os.getenv("SHYFT_API_KEY") 
-
-# -----------------------------------------------
-# Shyft Client with Retry Logic
-# -----------------------------------------------
-class ShyftClient:
-    """Dedicated Shyft API client with rate limiting and retry logic."""
-    BASE_URL = "https://api.shyft.to/sol/v1/token"  # FIXED: Changed from "https://api.shyft.to/v1/token"
-
-    def __init__(
-        self, 
-        session: aiohttp.ClientSession,
-        api_semaphore: asyncio.Semaphore,
-        max_retries: int = 3,
-        debug: bool = False
-    ):
-        self.session = session
-        self.api_semaphore = api_semaphore 
-        self.max_retries = max_retries
-        self.debug = debug
-        self.headers = {"x-api-key": SHYFT_API_KEY}
-        
-    async def _make_shyft_request(self, url: str) -> Dict[str, Any]:
-        """
-        Helper to make Shyft API requests with specific 429 handling for retry_with_backoff.
-        Acquires semaphore only during the actual request to avoid holding it during backoff sleeps.
-        """
-        if not SHYFT_API_KEY:
-            raise ValueError("SHYFT_API_KEY not found in environment")
-        
-        # FIXED: Use header for API key instead of query parameter
-        async with self.api_semaphore:
-            async with self.session.get(url, headers=self.headers, timeout=15) as resp:
-                if resp.status == 429:
-                    # Raise ClientResponseError to trigger retry logic in retry_with_backoff
-                    raise aiohttp.ClientResponseError(
-                        resp.request_info,
-                        resp.history,
-                        status=429,
-                        message="Shyft Rate Limit",
-                        headers=resp.headers
-                    )
-                if resp.status != 200:
-                    text = await resp.text()
-                    raise RuntimeError(f"Shyft API failed {resp.status}: {text}")
-                
-                data = await resp.json()
-                # Shyft returns 200 even on error sometimes, check the 'success' field
-                if not data.get("success"):
-                    # Don't retry on non-rate-limit 200 errors
-                    raise RuntimeError(f"Shyft API success=False: {data.get('message')}")
-                return data
-
-    async def get_token_info(self, mint: str) -> Dict[str, Any]:
-        """Fetch token info using retry_with_backoff for rate limit handling."""
-        # FIXED: Corrected endpoint path with proper parameter order
-        info_url = f"{self.BASE_URL}/get_info?network=mainnet-beta&token_address={mint}"
-        
-        try:
-            info_data = await retry_with_backoff(
-                self._make_shyft_request, 
-                info_url, 
-                retries=self.max_retries, 
-                base_delay=1.0
-            )
-            return {"ok": True, "data": info_data.get("result", {})}
-        except Exception as e:
-            return {
-                "ok": False,
-                "error": "Shyft Info failed",
-                "error_text": str(e),
-                "status_code": 500
-            }
-
-    async def get_token_holders(self, mint: str) -> Dict[str, Any]:
-        """Fetch token holders using retry_with_backoff for rate limit handling."""
-        # FIXED: Corrected endpoint path with proper parameter order
-        holders_url = f"{self.BASE_URL}/holders?network=mainnet-beta&token_address={mint}&page=1&size=100"
-        
-        try:
-            holders_data = await retry_with_backoff(
-                self._make_shyft_request, 
-                holders_url, 
-                retries=self.max_retries, 
-                base_delay=1.0
-            )
-            return {"ok": True, "data": holders_data.get("result", {})}
-        except Exception as e:
-            return {
-                "ok": False,
-                "error": "Shyft Holders failed",
-                "error_text": str(e),
-                "status_code": 500
-            }
 
 # -----------------------------------------------
 # RugCheck Client with Retry Logic
@@ -912,7 +809,6 @@ class AlphaTokenAnalyzer:
         dune_cache: DuneWinnersCache,
         helius_limiter: AsyncRateLimiter,
         rugcheck_client: RugCheckClient,
-        shyft_client: ShyftClient,
         dex_limiter: AsyncRateLimiter,
         ml_classifier: SolanaTokenPredictor, 
         debug: bool = False
@@ -922,7 +818,6 @@ class AlphaTokenAnalyzer:
         self.dune_cache = dune_cache
         self.helius_limiter = helius_limiter
         self.rugcheck_client = rugcheck_client
-        self.shyft_client = shyft_client 
         self.dex_limiter = dex_limiter
         self.ml_classifier = ml_classifier
         self.debug = debug
@@ -930,60 +825,169 @@ class AlphaTokenAnalyzer:
         if self.debug:
             print("[TokenAnalyzer] Initialized.")
 
-    async def _get_supply_and_decimals_from_shyft(self, mint: str) -> tuple:
+    async def _get_supply_and_decimals_rpc(self, mint: str) -> tuple:
         """
-        Fallback method to get supply and decimals from Shyft API.
+        Fallback method to get supply and decimals from Helius RPC (with public RPC backup).
         Returns (supply, decimals) or (0, 0) if failed.
         """
+        # Endpoints
+        helius_url = f"https://mainnet.helius-rpc.com/?api-key={os.getenv('HELIUS_API_KEY')}"
+        fallback_url = "https://api.mainnet-beta.solana.com"
+        
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTokenSupply",
+            "params": [mint]
+        }
+
+        # Attempt 1: Helius
         try:
-            shyft_result = await self.shyft_client.get_token_info(mint)
-            if shyft_result.get("ok"):
-                shyft_data = shyft_result.get("data", {})
-                supply = shyft_data.get("supply", 0)
-                decimals = shyft_data.get("decimals", 0)
-                
-                if supply and decimals:
-                    if self.debug:
-                        print(f"[TokenAnalyzer] ✅ Got supply from Shyft: {supply}, decimals: {decimals}")
-                    return (supply, decimals)
+            async with self.helius_limiter:
+                async with self.http_session.post(helius_url, json=payload, timeout=5) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        val = data.get("result", {}).get("value", {})
+                        if val:
+                            supply = int(val.get("amount", "0"))
+                            decimals = int(val.get("decimals", 0))
+                            if self.debug:
+                                print(f"[TokenAnalyzer] ✅ Got supply from Helius: {supply}, decimals: {decimals}")
+                            return (supply, decimals)
         except Exception as e:
             if self.debug:
-                print(f"[TokenAnalyzer] ⚠️ Shyft fallback failed for {mint}: {e}")
+                print(f"[TokenAnalyzer] ⚠️ Helius supply fetch failed for {mint}: {e}")
         
+        # Attempt 2: Public RPC (Fallback)
+        try:
+            # We don't use the Helius limiter for public RPC, but we should be gentle.
+            # Assuming low volume of fallbacks.
+            async with self.http_session.post(fallback_url, json=payload, timeout=5) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    val = data.get("result", {}).get("value", {})
+                    if val:
+                        supply = int(val.get("amount", "0"))
+                        decimals = int(val.get("decimals", 0))
+                        if self.debug:
+                            print(f"[TokenAnalyzer] ✅ Got supply from Public RPC: {supply}, decimals: {decimals}")
+                        return (supply, decimals)
+        except Exception as e:
+            if self.debug:
+                print(f"[TokenAnalyzer] ⚠️ Public RPC supply fetch failed for {mint}: {e}")
+
         return (0, 0)
 
-    async def _get_creator_balance_from_shyft(self, mint: str, decimals: int) -> tuple:
+    async def _get_creator_balance_rpc(self, mint: str, decimals: int) -> tuple:
         """
-        Fallback method to get creator balance from Shyft API.
+        Fallback method to get creator balance via RPC.
+        Logic:
+         1. Get Mint Info to find 'mintAuthority' (often the creator/deployer).
+         2. Get Token Accounts for that authority to find their balance of this mint.
         Returns (creator_balance_normalized, success_flag).
-        Properly normalizes by decimals to avoid percentage calculation errors.
         """
-        try:
-            shyft_result = await self.shyft_client.get_token_info(mint)
-            if shyft_result.get("ok"):
-                shyft_data = shyft_result.get("data", {})
-                creator_balance_raw = shyft_data.get("creatorBalance", 0)
-                
-                if creator_balance_raw and decimals:
-                    try:
-                        # Normalize by decimals (same as supply normalization)
-                        creator_balance_normalized = float(creator_balance_raw) / (10 ** int(decimals))
-                        if self.debug:
-                            print(f"[TokenAnalyzer] ✅ Got creator balance from Shyft: {creator_balance_raw} (normalized: {creator_balance_normalized})")
-                        return (creator_balance_normalized, True)
-                    except (ValueError, TypeError, ZeroDivisionError):
-                        pass
-        except Exception as e:
-            if self.debug:
-                print(f"[TokenAnalyzer] ⚠️ Shyft creator balance fallback failed for {mint}: {e}")
+        helius_url = f"https://mainnet.helius-rpc.com/?api-key={os.getenv('HELIUS_API_KEY')}"
+        fallback_url = "https://api.mainnet-beta.solana.com"
         
+        # Step 1: Get Mint Authority
+        mint_authority = None
+        
+        info_payload = {
+            "jsonrpc": "2.0",
+            "id": 1, 
+            "method": "getAccountInfo",
+            "params": [mint, {"encoding": "jsonParsed"}]
+        }
+        
+        # Try Helius for Mint Info
+        try:
+            async with self.helius_limiter:
+                async with self.http_session.post(helius_url, json=info_payload, timeout=5) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        # Navigate: result -> value -> data -> parsed -> info -> mintAuthority
+                        info = data.get("result", {}).get("value", {}).get("data", {}).get("parsed", {}).get("info", {})
+                        mint_authority = info.get("mintAuthority")
+        except Exception:
+            pass # Fallback logic below
+            
+        # Fallback to Public RPC if Helius failed
+        if not mint_authority:
+            try:
+                async with self.http_session.post(fallback_url, json=info_payload, timeout=5) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        info = data.get("result", {}).get("value", {}).get("data", {}).get("parsed", {}).get("info", {})
+                        mint_authority = info.get("mintAuthority")
+            except Exception:
+                pass
+        
+        if not mint_authority:
+            if self.debug:
+                print(f"[TokenAnalyzer] ⚠️ Could not determine mint authority (creator) for {mint}")
+            return (0.0, False)
+            
+        # Step 2: Get Balance for Mint Authority
+        balance_payload = {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "getTokenAccountsByOwner",
+            "params": [
+                mint_authority,
+                {"mint": mint},
+                {"encoding": "jsonParsed"}
+            ]
+        }
+        
+        raw_balance = 0.0
+        success = False
+        
+        # Try Helius for Balance
+        try:
+            async with self.helius_limiter:
+                async with self.http_session.post(helius_url, json=balance_payload, timeout=5) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        accounts = data.get("result", {}).get("value", [])
+                        for acc in accounts:
+                            # Add up balance from all accounts (usually just one)
+                            amt_info = acc.get("account", {}).get("data", {}).get("parsed", {}).get("info", {}).get("tokenAmount", {})
+                            raw_balance += float(amt_info.get("amount", 0))
+                        success = True
+        except Exception:
+             success = False # Fallback below
+
+        # Fallback to Public RPC
+        if not success:
+            try:
+                 async with self.http_session.post(fallback_url, json=balance_payload, timeout=5) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        accounts = data.get("result", {}).get("value", [])
+                        for acc in accounts:
+                            amt_info = acc.get("account", {}).get("data", {}).get("parsed", {}).get("info", {}).get("tokenAmount", {})
+                            raw_balance += float(amt_info.get("amount", 0))
+                        success = True
+            except Exception:
+                pass
+
+        if success:
+            # Normalize
+            if decimals > 0:
+                normalized = raw_balance / (10 ** decimals)
+            else:
+                normalized = raw_balance
+                
+            if self.debug:
+                print(f"[TokenAnalyzer] ✅ RPC Creator Balance ({mint_authority}): {normalized} (raw: {raw_balance})")
+            return (normalized, True)
+            
         return (0.0, False)
 
     async def _run_rugcheck_check(self, mint: str) -> Dict[str, Any]:
         """
         Check token security using RugCheck API with comprehensive risk analysis.
         Uses RugCheckClient for rate limiting and retry logic.
-        FIXED: Handle None responses and free tier rate limits with Shyft fallback
         """
         # Delegate to the RugCheckClient which handles rate limiting and retries
         result = await self.rugcheck_client.get_token_report(mint)
@@ -1007,7 +1011,7 @@ class AlphaTokenAnalyzer:
                 print(f"[TokenAnalyzer] ⚠️ RugCheck data is None for {mint}")
             return {"ok": False, "error": "rugcheck_null_data", "error_text": "RugCheck returned null data"}
         
-        # Extract key security metrics (rest of the method remains the same)
+        # Extract key security metrics
         probation_result = evaluate_probation_from_rugcheck(data)
 
         # --- FIX: Handle data.get() returning None if key exists but value is null ---
@@ -1019,9 +1023,10 @@ class AlphaTokenAnalyzer:
         mint_authority = data.get("mintAuthority")
         has_authorities = bool(freeze_authority or mint_authority)
 
-        # --- Handle inconsistent creatorBalance type with proper normalization ---
+        # --- FIXED: Handle inconsistent creatorBalance type with None default ---
         creator_balance_raw = data.get("creatorBalance")
-        creator_balance_pct = 0.0
+        creator_balance_pct = None  # Changed from 0.0 to None to distinguish "missing" from "zero"
+        
         if isinstance(creator_balance_raw, dict):
             try:
                 creator_balance_pct = float(creator_balance_raw.get('pct', 0.0) or 0.0)
@@ -1046,7 +1051,8 @@ class AlphaTokenAnalyzer:
                     creator_balance_pct = creator_balance_raw_num
             except (ValueError, TypeError, ZeroDivisionError):
                 creator_balance_pct = 0.0
-                
+        
+        # NOTE: If creator_balance_raw was None, creator_balance_pct remains None
         creator_balance = creator_balance_pct
 
         transfer_fee_pct = data.get("transferFee", {}).get("pct", 0)
@@ -1174,26 +1180,12 @@ class AlphaTokenAnalyzer:
             "raw": p0
         }
 
-    # --- FIX 1: _build_ml_input (Issue 1) ---
-    # This method is obsolete. The provided ml_predictor.py expects
-    # only the 'mint' string, as it fetches and engineers its own features.
-    # We will remove this method.
-    #
-    # def _build_ml_input(
-    #     self, 
-    #     overlap_result: Dict[str, Any], 
-    #     security_report: Dict[str, Any],
-    #     dex_data: Optional[Dict[str, Any]]
-    # ) -> Dict[str, Any]:
-    #     """Helper to construct the feature dictionary for ml_predictor_v2."""
-    # ... (REMOVING lines 1127 through 1199) ...
-    #     return feature_dict
-    # --- END FIX 1 ---
-
     async def analyze_token(self, mint: str) -> Dict[str, Any]:
         """
         Comprehensive token analysis.
         FIXED: Handle zero supply edge case in security requirements check
+        FIXED: Only fallback to RPC when creator_balance is None (missing), not 0 (valid zero)
+        FIXED: Properly calculate creator balance percentage from raw amounts
         """
         if self.debug:
             print(f"[TokenAnalyzer] 🔬 Analyzing token: {mint}")
@@ -1310,7 +1302,7 @@ class AlphaTokenAnalyzer:
         if security_report.get("rugcheck_passed") and rugcheck_details.get("has_authorities"):
             security_failures.append("has_active_authorities")
         
-        # *** FIX: Get supply and decimals from RugCheck, fallback to Shyft if needed ***
+        # *** FIX: Get supply and decimals from RugCheck, fallback to RPC if needed ***
         raw_data = security_report.get("rugcheck_raw") or {}
         raw_data = raw_data.get("raw") or {}
         token_data = raw_data.get("token") or {}
@@ -1319,12 +1311,12 @@ class AlphaTokenAnalyzer:
         decimals = token_data.get("decimals", 0)
         data_source = "rugcheck"
         
-        # If RugCheck didn't provide valid supply/decimals, try Shyft
+        # If RugCheck didn't provide valid supply/decimals, try RPC
         if not supply or not decimals:
             if self.debug:
-                print(f"[TokenAnalyzer] ⚠️ RugCheck missing supply/decimals for {mint}, trying Shyft...")
-            supply, decimals = await self._get_supply_and_decimals_from_shyft(mint)
-            data_source = "shyft"
+                print(f"[TokenAnalyzer] ⚠️ RugCheck missing supply/decimals for {mint}, trying RPC...")
+            supply, decimals = await self._get_supply_and_decimals_rpc(mint)
+            data_source = "rpc"
             if supply and decimals and self.debug:
                 print(f"[TokenAnalyzer] ✅ Using supply from {data_source}: {supply}, decimals: {decimals}")
         
@@ -1341,42 +1333,63 @@ class AlphaTokenAnalyzer:
                 if self.debug:
                     print(f"[TokenAnalyzer] ❌ Error calculating total_supply for {mint}")
         
-        # Check for creator balance percentage (FIXED: normalize creator_balance_raw by decimals)
-        creator_balance_raw = 0.0
-        creator_balance_normalized = 0.0
-        
-        try:
-            creator_balance_raw = float(rugcheck_details.get("creator_balance", 0.0) or 0.0)
-        except (ValueError, TypeError):
-             creator_balance_raw = 0.0
+        # --- FIXED: Check for creator balance (handle raw amounts, not percentages) ---
+        creator_balance_raw = rugcheck_details.get("creator_balance")  # This is RAW amount or None
+        creator_balance_pct = None  # The calculated percentage
 
-        # Normalize creator balance by decimals (same way we normalized total_supply)
-        if creator_balance_raw > 0 and decimals:
-            try:
-                creator_balance_normalized = creator_balance_raw / (10 ** int(decimals))
-            except (ZeroDivisionError, ValueError, TypeError, OverflowError):
-                creator_balance_normalized = 0.0
-        
-        # If RugCheck didn't provide valid creator balance, try Shyft
-        if creator_balance_normalized == 0.0 and creator_balance_raw == 0.0:
+        # Only use RPC fallback if RugCheck didn't provide ANY data (None)
+        if creator_balance_raw is None:
             if self.debug:
-                print(f"[TokenAnalyzer] ⚠️ RugCheck missing creator balance for {mint}, trying Shyft...")
-            creator_balance_normalized, shyft_success = await self._get_creator_balance_from_shyft(mint, decimals)
-            if shyft_success and self.debug:
-                print(f"[TokenAnalyzer] ✅ Using creator balance from shyft")
-
-        if total_supply > 0 and creator_balance_normalized > 0:
-            creator_balance_pct = (creator_balance_normalized / total_supply) * 100
-            if self.debug:
-                print(f"[TokenAnalyzer] 👤 Creator balance normalized: {creator_balance_normalized}, percentage: {creator_balance_pct:.2f}% (from {data_source})")
-            if creator_balance_pct > MAX_CREATOR_BALANCE_PCT:
-                security_failures.append(f"creator_balance_pct:{creator_balance_pct:.2f}_req_{MAX_CREATOR_BALANCE_PCT}%")
+                print(f"[TokenAnalyzer] ⚠️ RugCheck missing creator balance for {mint}, trying RPC...")
+            
+            creator_balance_normalized, rpc_success = await self._get_creator_balance_rpc(mint, decimals)
+            
+            if rpc_success and total_supply > 0:
+                creator_balance_pct = (creator_balance_normalized / total_supply) * 100
+                if self.debug:
+                    print(f"[TokenAnalyzer] ✅ Using creator balance from RPC: {creator_balance_normalized:.2f} tokens ({creator_balance_pct:.2f}%)")
+            else:
+                creator_balance_pct = 0.0  # Default to 0 if RPC also fails
+                if self.debug:
+                    print(f"[TokenAnalyzer] ⚠️ RPC fallback failed, defaulting to 0%")
         else:
-            # If total_supply is 0, consider it suspicious
-            if creator_balance_raw > 0:
-                security_failures.append(f"invalid_supply:creator_has_balance_but_supply_is_zero_source_{data_source}")
+            # RugCheck provided a RAW value (could be 0 or positive integer)
+            # We need to calculate the percentage ourselves
+            try:
+                creator_raw_amount = float(creator_balance_raw)
+                
+                if decimals > 0 and total_supply > 0:
+                    # Normalize: raw_amount / (10^decimals) to get actual token count
+                    creator_balance_normalized = creator_raw_amount / (10 ** int(decimals))
+                    # Calculate percentage
+                    creator_balance_pct = (creator_balance_normalized / total_supply) * 100
+                    
+                    if self.debug:
+                        if creator_balance_pct == 0.0:
+                            print(f"[TokenAnalyzer] ✅ RugCheck: creator holds 0 tokens (0.00%)")
+                        else:
+                            print(f"[TokenAnalyzer] 💰 RugCheck: creator holds {creator_balance_normalized:.2f} tokens ({creator_balance_pct:.2f}%)")
+                else:
+                    # Cannot calculate percentage without supply/decimals
+                    creator_balance_pct = 0.0
+                    if self.debug:
+                        print(f"[TokenAnalyzer] ⚠️ Cannot calculate creator %: total_supply={total_supply}, decimals={decimals}")
+            except (ValueError, TypeError, ZeroDivisionError) as e:
+                creator_balance_pct = 0.0
+                if self.debug:
+                    print(f"[TokenAnalyzer] ⚠️ Error calculating creator balance %: {e}")
+
+        # Validate creator balance percentage
+        if creator_balance_pct is None:
+            creator_balance_pct = 0.0  # Safety fallback
+
+        if total_supply > 0 and creator_balance_pct > MAX_CREATOR_BALANCE_PCT:
+            security_failures.append(f"creator_balance_pct:{creator_balance_pct:.2f}_req_{MAX_CREATOR_BALANCE_PCT}%")
+        elif total_supply == 0 and creator_balance_raw is not None and float(creator_balance_raw) > 0:
+            # If total_supply is 0 but creator has balance, this is suspicious
+            security_failures.append(f"invalid_supply:creator_has_balance_but_supply_is_zero_source_{data_source}")
             if self.debug:
-                print(f"[TokenAnalyzer] ⚠️ Cannot validate creator balance: total_supply=0, data_source={data_source}")
+                print(f"[TokenAnalyzer] ⚠️ Suspicious: creator has raw balance {creator_balance_raw} but total_supply=0")
         
         # Check transfer fee (must be low)
         transfer_fee_val = 0.0
@@ -1466,7 +1479,7 @@ class AlphaTokenAnalyzer:
                 "overlap_wallets_sample": [],
                 "security": security_report,
                 "error": f"Holder fetch failed: {e}",
-                "needs_monitoring": True, # Should retry holder fetch
+                "needs_monitoring": True,
                 "skip_reason": "holder_fetch_failed"
             }
 
@@ -1499,7 +1512,7 @@ class AlphaTokenAnalyzer:
                 "overlap_wallets_sample": [],
                 "security": security_report,
                 "error": "No holders found",
-                "needs_monitoring": True, # Keep monitoring in case of delayed data
+                "needs_monitoring": True,
                 "skip_reason": "zero_holders"
             }
 
@@ -1525,7 +1538,7 @@ class AlphaTokenAnalyzer:
                 "overlap_wallets_sample": [],
                 "security": security_report,
                 "error": f"Dune cache load failed: {e}",
-                "needs_monitoring": True, # Should retry later
+                "needs_monitoring": True,
                 "skip_reason": "dune_cache_failed"
             }
 
@@ -1565,7 +1578,7 @@ class AlphaTokenAnalyzer:
             final_needs_monitoring = True
             final_skip_reason = "zero_overlap_after_security_pass"
             if self.debug:
-                 print(f"[TokenAnalyzer] ⚠️ {mint} passed security but ZERO overlap - setting to monitoring.")
+                print(f"[TokenAnalyzer] ⚠️ {mint} passed security but ZERO overlap - setting to monitoring.")
         elif grade in ("NONE", "UNKNOWN"):
             # If overlap exists but doesn't meet grade thresholds, also monitor
             final_needs_monitoring = True
@@ -1574,7 +1587,7 @@ class AlphaTokenAnalyzer:
                 print(f"[TokenAnalyzer] ⚠️ {mint} has overlap ({overlap_count}) but grade is {grade} - setting to monitoring.")
         
         # Only fetch DexScreener data for tokens with valid grades (LOW+)
-        dex_data = None # Default
+        dex_data = None
         if not final_needs_monitoring and grade not in ("NONE", "UNKNOWN"):
             if self.debug:
                 print(f"[TokenAnalyzer] 💎 {mint} PASSED (Grade: {grade}), fetching DexScreener data...")
@@ -1582,15 +1595,13 @@ class AlphaTokenAnalyzer:
                 dex_data_result = await retry_with_backoff(
                     self._run_dexscreener_check, mint, retries=8, base_delay=1.5
                 )
-                dex_data = dex_data_result # Store the whole result dict
+                dex_data = dex_data_result
             except Exception as e:
                 if self.debug:
                     print(f"[TokenAnalyzer] ⚠️ {mint} Dexscreener fetch failed after retries: {e}")
                 dex_data = {"ok": False, "error": str(e)}
         elif self.debug and not final_needs_monitoring:
-            # Token not monitoring but has invalid grade - should not happen with new logic
             print(f"[TokenAnalyzer] ⚠️ {mint} skipping DexScreener (Grade: {grade})")
-        # --- END DEXSCREENER FETCH ---
         
         result = {
             "mint": mint,
@@ -1603,47 +1614,31 @@ class AlphaTokenAnalyzer:
             "grade": grade,
             "overlap_wallets_sample": list(overlap)[:20],
             "security": security_report,
-            "needs_monitoring": final_needs_monitoring, # Only False if overlap > 0
+            "needs_monitoring": final_needs_monitoring,
             "skip_reason": final_skip_reason,
-            "dexscreener": dex_data # Embed Dexscreener data
+            "dexscreener": dex_data
         }
         
-        # --- ML PREDICTION (NEW) ---
-        # Run ML prediction only if the token is NOT being sent to monitoring
-        # (i.e., it passed all security AND has overlap AND has a valid grade)
+        # --- ML PREDICTION ---
         ml_prediction_result = None
 
-        # Only run ML if it passed security, has overlap, AND has a grade.
-        # This matches the final "cleared for upload" logic from the security gate.
         is_cleared_for_upload = (
             not final_needs_monitoring and 
             grade not in ("NONE", "UNKNOWN")
         )
         
-        # --- FIX 2: ML Prediction Block (Issue 2) ---
         if is_cleared_for_upload:
             try:
-                # --- START: MODIFICATION ---
-                # The ml_predictor.predict method expects the 'mint' string,
-                # not a pre-built feature dictionary, as it fetches
-                # and engineers features internally.
-                
-                # The _build_ml_input method is no longer needed or called.
-                
                 if self.debug:
-                    print(f"[TokenAnalyzer] 📞 Calling ML predictor for mint: {mint}")
+                    print(f"[TokenAnalyzer] 🔮 Calling ML predictor for mint: {mint}")
 
-                # Call predict with the 'mint' string
                 ml_prediction_result = self.ml_classifier.predict(
                     mint, 
                     threshold=0.70
                 )
                 
-                # Handle cases where the model returns an error
                 if not ml_prediction_result or ml_prediction_result.get("error"):
                     raise ValueError(f"ML prediction returned an error: {ml_prediction_result.get('error', 'Unknown')}")
-                
-                # --- END: MODIFICATION ---
                 
             except Exception as e:
                 if self.debug:
@@ -1656,23 +1651,18 @@ class AlphaTokenAnalyzer:
                     'error': str(e)
                 }
             
-            # --- START: MODIFICATION (Attach all details) ---
-            # Attach the full prediction results, including key_metrics and warnings
             result["ml_prediction"] = {
                 "probability": ml_prediction_result.get("win_probability"),
                 "confidence": ml_prediction_result.get("confidence"),
                 "risk_tier": ml_prediction_result.get("risk_tier"),
                 "action": ml_prediction_result.get("action"),
                 "error": ml_prediction_result.get("error"),
-                "key_metrics": ml_prediction_result.get("key_metrics"), # Add key_metrics
-                "warnings": ml_prediction_result.get("warnings")       # Add warnings
+                "key_metrics": ml_prediction_result.get("key_metrics"),
+                "warnings": ml_prediction_result.get("warnings")
             }
-            # --- END: MODIFICATION ---
-        # --- END FIX 2 ---
         
         if self.debug and not final_needs_monitoring:
-            # --- FIX 3: Debug Print Statement (Issue 3) ---
-            ml_prob_str = "N/A (Skipped)" # Default if ML wasn't run
+            ml_prob_str = "N/A (Skipped)"
             if "ml_prediction" in result:
                 prob_val = result.get('ml_prediction', {}).get('probability')
                 if prob_val is not None:
@@ -1683,11 +1673,9 @@ class AlphaTokenAnalyzer:
                 else:
                     ml_prob_str = "N/A (None)"
             
-            # Use the same flag from the ML block
             cleared_status = "CLEARED for upload" if is_cleared_for_upload else "NOT CLEARED (No Grade)"
 
             print(f"[TokenAnalyzer] ✅ {mint} -> Grade: {grade}, Overlap: {overlap_count}, ML Prob: {ml_prob_str}, Status: {cleared_status}")
-            # --- END FIX 3 ---
             
         return result
 
@@ -1707,7 +1695,6 @@ class AlphaTokenAnalyzer:
                 err_str = str(res)
                 if "unsupported format string" in err_str:
                      print(f"[TokenAnalyzer] ❌ CRITICAL BATCH ERROR for {mints[i]}: {err_str}")
-                     # You might want to log more details here
                      import traceback
                      traceback.print_exc()
                 else:
@@ -2222,8 +2209,6 @@ async def main():
         raise RuntimeError("No Moralis API keys found in MORALIS_API_KEYS")
         
     async with aiohttp.ClientSession() as http_session:
-        # New: Setup general semaphore for rate-limited APIs, e.g., 10 concurrent requests
-        API_SEMAPHORE = asyncio.Semaphore(1)
         
         debug_mode = True
 
@@ -2274,14 +2259,6 @@ async def main():
             debug=debug_mode
         )
 
-        # Initialize ShyftClient
-        shyft_client = ShyftClient(
-            http_session, 
-            API_SEMAPHORE, # Pass the general semaphore for concurrency control
-            max_retries=3, 
-            debug=debug_mode
-        )
-
         # --- NEW: Initialize ML Classifier ---
         try:
             ml_classifier = SolanaTokenPredictor(model_dir='models')
@@ -2297,9 +2274,8 @@ async def main():
             dune_cache=dune_cache,
             helius_limiter=helius_limiter,
             rugcheck_client=rugcheck_client,
-            shyft_client=shyft_client,
             dex_limiter=dex_limiter,
-            ml_classifier=ml_classifier, # NEW: Inject classifier
+            ml_classifier=ml_classifier, 
             debug=debug_mode
         )
         

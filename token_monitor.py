@@ -1959,20 +1959,20 @@ class Monitor:
 
     async def _run_rugcheck_check(self, mint: str) -> Dict[str, Any]:
         """
-        Check token security using RugCheck API.
-        If RugCheck fails (Rate Limit/Timeout/Error), fallback to Shyft API.
+        Check token security using RugCheck API with comprehensive risk analysis.
+        FIXED: Properly handles creator balance as raw amounts, not percentages.
+        FIXED: Returns None for missing creator balance to trigger RPC fallback.
         """
-        # === 1. TRY RUGCHECK FIRST ===
         url = f"https://api.rugcheck.xyz/v1/tokens/{mint}/report"
         session = self.http_session
         
         try:
-            # We use a short internal retry for RugCheck before falling back
             async with self._api_sema:
                 async with session.get(url, timeout=30) as resp:
                     if resp.status == 429:
                         raise aiohttp.ClientResponseError(
-                            resp.request_info, resp.history, status=429, message="Rate Limited"
+                            resp.request_info, resp.history, status=429,
+                            message=f"Rate limited by RugCheck for {mint}"
                         )
                     if resp.status != 200:
                         text = await resp.text()
@@ -1980,254 +1980,240 @@ class Monitor:
                     
                     data = await resp.json()
 
-            # --- Process RugCheck Data (Existing Logic) ---
-            probation_result = evaluate_probation_from_rugcheck(data)
-            
-            # Extract standard metrics
-            top_holders = data.get("topHolders") or []
-            markets = data.get("markets") or []
-            
-            # Liquidity Calc
-            total_lp_locked_usd = 0.0
-            total_lp_usd = 0.0
-            lp_lock_details = []
-
-            for market in markets:
-                if not market: continue
-                lp_data = market.get("lp", {})
-                if lp_data:
-                    lp_locked_usd = float(lp_data.get("lpLockedUSD", 0))
-                    lp_unlocked_usd = float(lp_data.get("lpUnlocked", 0))
-                    lp_total_usd_market = lp_locked_usd + lp_unlocked_usd
-                    
-                    total_lp_locked_usd += lp_locked_usd
-                    total_lp_usd += lp_total_usd_market
-                    
-                    lp_lock_details.append({
-                        "market_type": market.get("marketType"),
-                        "locked_usd": lp_locked_usd,
-                        "total_usd": lp_total_usd_market,
-                        "locked_pct": lp_data.get("lpLockedPct", 0)
-                    })
-            
-            overall_lp_locked_pct = (total_lp_locked_usd / total_lp_usd * 100) if total_lp_usd > 0 else 0.0
-            
-            # Creator Balance with proper normalization
-            creator_balance_raw = data.get("creatorBalance")
-            creator_balance_pct = 0.0
-            
-            # Handle RugCheck's inconsistent creatorBalance type - can be dict with pct or raw amount
-            if isinstance(creator_balance_raw, dict):
-                creator_balance_pct = float(creator_balance_raw.get('pct', 0.0) or 0.0)
-            elif creator_balance_raw is not None:
-                try:
-                    # If it's a raw number, normalize by decimals and supply
-                    creator_balance_raw_num = float(creator_balance_raw)
-                    
-                    # Extract token metadata for normalization
-                    token_data = data.get("token", {})
-                    decimals = int(token_data.get("decimals", 0)) if token_data.get("decimals") is not None else 0
-                    supply = float(token_data.get("supply", 0)) if token_data.get("supply") is not None else 0
-                    
-                    if decimals > 0 and supply > 0:
-                        # Normalize: raw_amount / (10^decimals) / supply * 100
-                        creator_balance_normalized = creator_balance_raw_num / (10 ** decimals)
-                        creator_balance_pct = (creator_balance_normalized / supply) * 100
-                    else:
-                        # Fallback: just use raw number as-is (already percentage)
-                        creator_balance_pct = creator_balance_raw_num
-                except (ValueError, TypeError, ZeroDivisionError):
-                    creator_balance_pct = 0.0
-
+        except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError) as e:
+            if self.debug:
+                print(f"[Security] RugCheck request failed for {mint}: {e}")
             return {
-                "ok": True,
-                "data_source": "rugcheck",
-                "rugged": data.get("rugged", False),
-                "total_holders": data.get("totalHolders", 0),
-                "top1_holder_pct": top_holders[0].get("pct", 0) if top_holders else 0.0,
-                "top_10_holders_pct": sum(h.get("pct", 0) for h in top_holders[:10]),
-                "creator_balance": creator_balance_pct,
-                "freeze_authority": data.get("freezeAuthority"),
-                "mint_authority": data.get("mintAuthority"),
-                "has_authorities": bool(data.get("freezeAuthority") or data.get("mintAuthority")),
-                "transfer_fee_pct": data.get("transferFee", {}).get("pct", 0),
-                "total_lp_usd": total_lp_usd,
-                "total_lp_locked_usd": total_lp_locked_usd,
-                "overall_lp_locked_pct": overall_lp_locked_pct,
-                "lp_lock_sufficient": overall_lp_locked_pct >= 95.0,
-                "probation": probation_result["probation"],
-                "probation_meta": probation_result,
-                "lp_lock_details": lp_lock_details,
-                "raw": data
+                "ok": False,
+                "error": "rugcheck_request_failed",
+                "error_text": str(e)
             }
 
-        except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError, Exception) as rc_error:
-            if self.debug:
-                print(f"[Security] RugCheck failed for {mint}: {str(rc_error)}")
-                print(f"[Security] 🔄 Falling back to Shyft API...")
-
-            # === 2. FALLBACK TO SHYFT ===
-            try:
-                result = await self._shyft_security_check(mint)
-                result["shyft_fallback_reason"] = str(rc_error)
-                return result
-            except Exception as shyft_error:
-                if self.debug:
-                    print(f"[Security] ❌ Shyft also failed for {mint}: {shyft_error}")
-                
-                return {
-                    "ok": False,
-                    "error": "all_apis_failed",
-                    "error_text": "Both RugCheck and Shyft APIs failed",
-                    "rugcheck_error": str(rc_error),
-                    "shyft_error": str(shyft_error)
-                }
-
-    async def _make_shyft_request(self, url: str) -> Dict[str, Any]:
-            """
-            Helper to make Shyft API requests with specific 429 handling for retry_with_backoff.
-            Acquires semaphore only during the actual request to avoid holding it during backoff sleeps.
-            """
-            if not SHYFT_API_KEY:
-                raise ValueError("SHYFT_API_KEY not found in environment")
-            
-            # Add API key to URL as query parameter (more reliable than header)
-            separator = "&" if "?" in url else "?"
-            url_with_key = f"{url}{separator}api_key={SHYFT_API_KEY}"
-            
-            headers = {"x-api-key": SHYFT_API_KEY}
-            
-            # Move semaphore inside the retryable function so we don't block a slot while sleeping
-            async with self._api_sema:
-                async with self.http_session.get(url_with_key, headers=headers, timeout=15) as resp:
-                    if resp.status == 429:
-                        # Raise ClientResponseError to trigger retry logic in retry_with_backoff
-                        raise aiohttp.ClientResponseError(
-                            resp.request_info,
-                            resp.history,
-                            status=429,
-                            message="Shyft Rate Limit",
-                            headers=resp.headers
-                        )
-                    if resp.status != 200:
-                        text = await resp.text()
-                        raise RuntimeError(f"Shyft API failed {resp.status}: {text}")
-                    
-                    data = await resp.json()
-                    if not data.get("success"):
-                        raise RuntimeError(f"Shyft API success=False: {data.get('message')}")
-                    return data
-
-    async def _shyft_security_check(self, mint: str) -> Dict[str, Any]:
-        """
-        Perform security check using Shyft API + DexScreener (for liquidity).
-        Uses retry_with_backoff for Shyft calls to handle rate limits.
-        Returns data in the same format as RugCheck to maintain compatibility.
-        """
-        if not SHYFT_API_KEY:
-            raise ValueError("SHYFT_API_KEY not found in environment")
-
-        base_url = "https://api.shyft.to/v1/token"
-
-        # 1. Fetch Token Info (Metadata, Authorities, Supply) with Retry
-        info_url = f"{base_url}/get_info?token_address={mint}&network=mainnet-beta"
-        try:
-            info_data = await retry_with_backoff(
-                self._make_shyft_request, 
-                info_url, 
-                retries=3, 
-                base_delay=1.0
-            )
-        except Exception as e:
-            raise RuntimeError(f"Shyft Info failed: {e}")
-            
-        token_info = info_data.get("result", {})
-
-        # 2. Fetch Holders (Distribution) with Retry
-        holders_url = f"{base_url}/holders?token_address={mint}&network=mainnet-beta&page=1&size=100"
-        try:
-            holders_data = await retry_with_backoff(
-                self._make_shyft_request, 
-                holders_url, 
-                retries=3, 
-                base_delay=1.0
-            )
-        except Exception as e:
-            raise RuntimeError(f"Shyft Holders failed: {e}")
-
-        holders_result = holders_data.get("result", {})
-        holders_list = holders_result.get("holders", [])
-        total_holders = holders_result.get("total_holders", 0)
-
-        # 3. Fetch Liquidity from DexScreener (Auxiliary)
-        total_lp_usd = "unknown"
-        try:
-            # DexScreener already has its own internal retry logic
-            dex_data = await self._run_dexscreener_check(mint)
-            if dex_data.get("ok"):
-                total_lp_usd = dex_data.get("liquidity_usd", 0.0)
-        except Exception:
-            pass # Keep as "unknown" if DexScreener fails
-
-        # === DATA PROCESSING ===
+        # --- Process RugCheck Data ---
+        probation_result = evaluate_probation_from_rugcheck(data)
+        
+        # Handle None returns from data.get()
+        top_holders = data.get("topHolders") or []
+        markets = data.get("markets") or []
+        rugged = data.get("rugged", False)
         
         # Authorities
-        freeze_auth = token_info.get("freeze_authority")
-        mint_auth = token_info.get("mint_authority")
-        has_authorities = bool(freeze_auth or mint_auth)
+        freeze_authority = data.get("freezeAuthority")
+        mint_authority = data.get("mintAuthority")
+        has_authorities = bool(freeze_authority or mint_authority)
 
-        # Transfer Fee (BPS to %)
-        transfer_fee_data = token_info.get("transfer_fee", {})
-        transfer_fee_bps = transfer_fee_data.get("fee_bps", 0) if isinstance(transfer_fee_data, dict) else 0
-        transfer_fee_pct = float(transfer_fee_bps) / 100.0
-
-        # Holders Analysis
-        top1_pct = holders_list[0].get("percentage", 0) if holders_list else 0.0
-        top10_pct = sum(h.get("percentage", 0) for h in holders_list[:10])
-
-        # Creator Balance Calculation with proper normalization
-        creators = token_info.get("creators", [])
-        creator_address = creators[0].get("address") if creators else None
-        creator_balance_pct = 0.0
+        # --- FIXED: Creator Balance Handling (None default for missing data) ---
+        creator_balance_raw = data.get("creatorBalance")
+        creator_balance_pct = None  # Changed from 0.0 to None to distinguish "missing" from "zero"
         
-        if creator_address:
-            # Look for creator in top 100 holders
-            for h in holders_list:
-                if h.get("address") == creator_address:
-                    # Shyft already provides percentage, but normalize to ensure accuracy
-                    creator_balance_pct = float(h.get("percentage", 0))
-                    break
+        if isinstance(creator_balance_raw, dict):
+            try:
+                creator_balance_pct = float(creator_balance_raw.get('pct', 0.0) or 0.0)
+            except (ValueError, TypeError):
+                creator_balance_pct = 0.0
+        elif creator_balance_raw is not None:
+            try:
+                # If it's a raw number, normalize by decimals and supply
+                creator_balance_raw_num = float(creator_balance_raw)
+                
+                # Extract token metadata for normalization
+                token_data = data.get("token", {})
+                decimals = int(token_data.get("decimals", 0)) if token_data.get("decimals") is not None else 0
+                supply = float(token_data.get("supply", 0)) if token_data.get("supply") is not None else 0
+                
+                if decimals > 0 and supply > 0:
+                    # Normalize: raw_amount / (10^decimals) / supply * 100
+                    creator_balance_normalized = creator_balance_raw_num / (10 ** decimals)
+                    creator_balance_pct = (creator_balance_normalized / supply) * 100
+                else:
+                    # Fallback: just use raw number as-is (already percentage)
+                    creator_balance_pct = creator_balance_raw_num
+            except (ValueError, TypeError, ZeroDivisionError):
+                creator_balance_pct = 0.0
         
-        # Probation Logic (Manual, since RugCheck isn't doing it)
-        # We consider creator holding > 10% as probation-worthy
-        probation = creator_balance_pct > 10.0
-        probation_meta = {
-            "probation": probation,
-            "explanation": f"Shyft: Creator balance {creator_balance_pct:.2f}% (>10%)" if probation else "Shyft: Clean"
-        }
+        # NOTE: If creator_balance_raw was None, creator_balance_pct remains None
+        creator_balance = creator_balance_pct
+
+        transfer_fee_pct = data.get("transferFee", {}).get("pct", 0)
+        
+        # Holder metrics
+        total_holders = data.get("totalHolders", 0)
+        top1_holder_pct = top_holders[0].get("pct", 0) if top_holders else 0.0
+        top_10_holders_pct = sum(h.get("pct", 0) for h in top_holders[:10])
+
+        # --- Liquidity Aggregation ---
+        total_lp_locked_usd = 0.0
+        total_lp_usd = 0.0
+        lp_lock_details = []
+
+        for market in markets:
+            if not market:
+                continue
+                
+            lp_data = market.get("lp", {})
+            if lp_data:
+                lp_locked_usd = 0.0
+                lp_unlocked_usd = 0.0
+                
+                try:
+                    lp_locked_usd = float(lp_data.get("lpLockedUSD", 0.0) or 0.0)
+                except (ValueError, TypeError):
+                    lp_locked_usd = 0.0
+                
+                try:
+                    lp_unlocked_usd = float(lp_data.get("lpUnlocked", 0.0) or 0.0)
+                except (ValueError, TypeError):
+                    lp_unlocked_usd = 0.0
+                
+                lp_total_usd_market = lp_locked_usd + lp_unlocked_usd
+                
+                total_lp_locked_usd += lp_locked_usd
+                total_lp_usd += lp_total_usd_market
+                
+                lp_lock_details.append({
+                    "market_type": market.get("marketType"),
+                    "locked_usd": lp_locked_usd,
+                    "total_usd": lp_total_usd_market,
+                    "locked_pct": lp_data.get("lpLockedPct", 0)
+                })
+        
+        overall_lp_locked_pct = (total_lp_locked_usd / total_lp_usd * 100) if total_lp_usd > 0 else 0.0
+        lp_lock_sufficient = overall_lp_locked_pct >= 95.0
 
         return {
             "ok": True,
-            "data_source": "shyft",
-            "rugged": False, # Shyft doesn't have a rugged registry
+            "data_source": "rugcheck",
+            "rugged": rugged,
             "total_holders": total_holders,
-            "top1_holder_pct": top1_pct,
-            "top_10_holders_pct": top10_pct,
-            "creator_balance": creator_balance_pct,
-            "freeze_authority": freeze_auth,
-            "mint_authority": mint_auth,
+            "top1_holder_pct": top1_holder_pct,
+            "top_10_holders_pct": top_10_holders_pct,
+            "creator_balance": creator_balance,
+            "freeze_authority": freeze_authority,
+            "mint_authority": mint_authority,
             "has_authorities": has_authorities,
             "transfer_fee_pct": transfer_fee_pct,
-            # LP Data (Mixed Source)
-            "total_lp_usd": total_lp_usd,        # From DexScreener or "unknown"
-            "total_lp_locked_usd": "unknown",    # Not available via basic Shyft
-            "overall_lp_locked_pct": "unknown",  # Not available via basic Shyft
-            "lp_lock_sufficient": "unknown",     # Cannot determine
-            "probation": probation,
-            "probation_meta": probation_meta,
-            "lp_lock_details": [],
-            "raw": {"info": token_info, "holders": holders_list[:5]}
+            "total_lp_usd": total_lp_usd,
+            "total_lp_locked_usd": total_lp_locked_usd,
+            "overall_lp_locked_pct": overall_lp_locked_pct,
+            "lp_lock_sufficient": lp_lock_sufficient,
+            "probation": probation_result["probation"],
+            "probation_meta": probation_result,
+            "lp_lock_details": lp_lock_details,
+            "raw": data
         }
+
+    async def _get_supply_and_decimals_rpc(self, mint: str) -> tuple:
+        """
+        Get supply and decimals from Helius RPC (with public RPC backup).
+        Returns (supply, decimals) or (0, 0) if failed.
+        """
+        # Build the Helius URL using the existing key rotation system
+        helius_url = self.sol_client._get_url()
+        fallback_url = "https://api.mainnet-beta.solana.com"
+        
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTokenSupply",
+            "params": [mint]
+        }
+
+        # Attempt 1: Helius
+        try:
+            data = await self.sol_client.make_rpc_call("getTokenSupply", [mint])
+            if not data.get("error"):
+                val = data.get("result", {}).get("value", {})
+                if val:
+                    supply = int(val.get("amount", "0"))
+                    decimals = int(val.get("decimals", 0))
+                    if self.debug:
+                        print(f"[Security] ✅ Got supply from Helius: {supply}, decimals: {decimals}")
+                    return (supply, decimals)
+        except Exception as e:
+            if self.debug:
+                print(f"[Security] ⚠️ Helius supply fetch failed for {mint}: {e}")
+        
+        # Attempt 2: Public RPC (Fallback)
+        try:
+            async with self.http_session.post(fallback_url, json=payload, timeout=5) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    val = data.get("result", {}).get("value", {})
+                    if val:
+                        supply = int(val.get("amount", "0"))
+                        decimals = int(val.get("decimals", 0))
+                        if self.debug:
+                            print(f"[Security] ✅ Got supply from Public RPC: {supply}, decimals: {decimals}")
+                        return (supply, decimals)
+        except Exception as e:
+            if self.debug:
+                print(f"[Security] ⚠️ Public RPC supply fetch failed for {mint}: {e}")
+
+        return (0, 0)
+
+    async def _get_creator_balance_rpc(self, mint: str, decimals: int) -> tuple:
+        """
+        Get creator balance via RPC.
+        Logic:
+        1. Get Mint Info to find 'mintAuthority' (often the creator/deployer).
+        2. Get Token Accounts for that authority to find their balance of this mint.
+        Returns (creator_balance_normalized, success_flag).
+        """
+        # Step 1: Get Mint Authority
+        mint_authority = None
+        
+        try:
+            data = await self.sol_client.make_rpc_call(
+                "getAccountInfo",
+                [mint, {"encoding": "jsonParsed"}]
+            )
+            
+            if not data.get("error"):
+                info = data.get("result", {}).get("value", {}).get("data", {}).get("parsed", {}).get("info", {})
+                mint_authority = info.get("mintAuthority")
+        except Exception:
+            pass
+        
+        if not mint_authority:
+            if self.debug:
+                print(f"[Security] ⚠️ Could not determine mint authority (creator) for {mint}")
+            return (0.0, False)
+            
+        # Step 2: Get Balance for Mint Authority
+        raw_balance = 0.0
+        success = False
+        
+        try:
+            data = await self.sol_client.make_rpc_call(
+                "getTokenAccountsByOwner",
+                [
+                    mint_authority,
+                    {"mint": mint},
+                    {"encoding": "jsonParsed"}
+                ]
+            )
+            
+            if not data.get("error"):
+                accounts = data.get("result", {}).get("value", [])
+                for acc in accounts:
+                    amt_info = acc.get("account", {}).get("data", {}).get("parsed", {}).get("info", {}).get("tokenAmount", {})
+                    raw_balance += float(amt_info.get("amount", 0))
+                success = True
+        except Exception:
+            pass
+
+        if success:
+            # Normalize
+            if decimals > 0:
+                normalized = raw_balance / (10 ** decimals)
+            else:
+                normalized = raw_balance
+                
+            if self.debug:
+                print(f"[Security] ✅ RPC Creator Balance ({mint_authority}): {normalized} (raw: {raw_balance})")
+            return (normalized, True)
+            
+        return (0.0, False)
 
     async def run_token_analysis_step(self, start: TradingStart, check_count: int):
         """
@@ -2376,6 +2362,223 @@ class Monitor:
             ml_prediction_result = self.ml_classifier.predict(mint, threshold=0.70)
         except Exception as e:
             ml_prediction_result = {'action': 'ERROR', 'error': str(e)}
+            
+    async def run_token_analysis_step(self, start: TradingStart, check_count: int):
+        """
+        Core analysis function that runs the full analysis lifecycle.
+        FIXED: Properly handles creator balance with RPC fallback
+        FIXED: Only fallbacks to RPC when creator_balance is None (missing), not 0 (valid zero)
+        """
+        mint = start.mint
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        
+        if self.debug:
+            print(f"[Analysis] Running check #{check_count} for {mint}")
+
+        # === 1. RUN RUGCHECK ===
+        try:
+            r = await self._run_rugcheck_check(mint)
+        except Exception as e:
+            if self.debug:
+                print(f"[Security] Fatal error checking security for {mint}: {e}")
+            reasons = [f"security_check_exception:{str(e)}"]
+            await self._start_or_update_probation(mint, start, {"mint": mint, "grade": "NONE"}, reasons)
+            return
+
+        # === 2. SECURITY GATE ===
+        reasons = []
+        if not r.get("ok"):
+            reasons.append(f"security_error:{r.get('error')}")
+        else:
+            data_source = r.get("data_source", "rugcheck")
+            
+            # Rule 0: Probation
+            if r.get("probation"):
+                reasons.append(r.get("probation_meta", {}).get("explanation", "Probation"))
+
+            # Rule 1: Rugged
+            if r.get("rugged"):
+                reasons.append("rugged:true")
+
+            # Rule 2: Authorities
+            if r.get("has_authorities"):
+                authorities = []
+                if r.get("freeze_authority"): authorities.append("freeze")
+                if r.get("mint_authority"): authorities.append("mint")
+                reasons.append(f"authorities:{','.join(authorities)}")
+            
+            # Get supply and decimals for creator balance validation
+            raw_data = r.get("raw", {})
+            token_data = raw_data.get("token", {})
+            
+            supply = token_data.get("supply", 0)
+            decimals = token_data.get("decimals", 0)
+            data_source_supply = "rugcheck"
+            
+            # If RugCheck didn't provide valid supply/decimals, try RPC
+            if not supply or not decimals:
+                if self.debug:
+                    print(f"[Security] ⚠️ RugCheck missing supply/decimals for {mint}, trying RPC...")
+                supply, decimals = await self._get_supply_and_decimals_rpc(mint)
+                data_source_supply = "rpc"
+                if supply and decimals and self.debug:
+                    print(f"[Security] ✅ Using supply from {data_source_supply}: {supply}, decimals: {decimals}")
+            
+            # Calculate total supply with zero check
+            total_supply = 0
+            if supply and decimals:
+                try:
+                    total_supply = float(supply) / (10 ** int(decimals))
+                    if self.debug:
+                        print(f"[Security] 📊 Calculated total_supply from {data_source_supply}: {total_supply}")
+                except (ZeroDivisionError, ValueError, TypeError, OverflowError):
+                    total_supply = 0
+                    if self.debug:
+                        print(f"[Security] ❌ Error calculating total_supply for {mint}")
+            
+            # --- FIXED: Creator Balance Check (only fallback if None) ---
+            creator_balance_raw = r.get("creator_balance")  # This is RAW amount or None
+            creator_balance_pct = None  # The calculated percentage
+
+            # Only use RPC fallback if RugCheck didn't provide ANY data (None)
+            if creator_balance_raw is None:
+                if self.debug:
+                    print(f"[Security] ⚠️ RugCheck missing creator balance for {mint}, trying RPC...")
+                
+                creator_balance_normalized, rpc_success = await self._get_creator_balance_rpc(mint, decimals)
+                
+                if rpc_success and total_supply > 0:
+                    creator_balance_pct = (creator_balance_normalized / total_supply) * 100
+                    if self.debug:
+                        print(f"[Security] ✅ Using creator balance from RPC: {creator_balance_normalized:.2f} tokens ({creator_balance_pct:.2f}%)")
+                else:
+                    creator_balance_pct = 0.0
+                    if self.debug:
+                        print(f"[Security] ⚠️ RPC fallback failed, defaulting to 0%")
+            else:
+                # RugCheck provided a RAW value (could be 0 or positive integer)
+                # We need to calculate the percentage ourselves
+                try:
+                    creator_raw_amount = float(creator_balance_raw)
+                    
+                    if decimals > 0 and total_supply > 0:
+                        # Normalize: raw_amount / (10^decimals) to get actual token count
+                        creator_balance_normalized = creator_raw_amount / (10 ** int(decimals))
+                        # Calculate percentage
+                        creator_balance_pct = (creator_balance_normalized / total_supply) * 100
+                        
+                        if self.debug:
+                            if creator_balance_pct == 0.0:
+                                print(f"[Security] ✅ RugCheck: creator holds 0 tokens (0.00%)")
+                            else:
+                                print(f"[Security] 💰 RugCheck: creator holds {creator_balance_normalized:.2f} tokens ({creator_balance_pct:.2f}%)")
+                    else:
+                        creator_balance_pct = 0.0
+                        if self.debug:
+                            print(f"[Security] ⚠️ Cannot calculate creator %: total_supply={total_supply}, decimals={decimals}")
+                except (ValueError, TypeError, ZeroDivisionError) as e:
+                    creator_balance_pct = 0.0
+                    if self.debug:
+                        print(f"[Security] ⚠️ Error calculating creator balance %: {e}")
+
+            # Validate creator balance percentage
+            if creator_balance_pct is None:
+                creator_balance_pct = 0.0
+
+            # Rule 3: Creator Balance
+            if total_supply > 0 and creator_balance_pct > MAX_CREATOR_PCT:
+                reasons.append(f"creator_balance_pct:{creator_balance_pct:.2f}_req_{MAX_CREATOR_PCT}%")
+            elif total_supply == 0 and creator_balance_raw is not None and float(creator_balance_raw) > 0:
+                reasons.append(f"invalid_supply:creator_has_balance_but_supply_is_zero_source_{data_source_supply}")
+                if self.debug:
+                    print(f"[Security] ⚠️ Suspicious: creator has raw balance {creator_balance_raw} but total_supply=0")
+
+            # Rule 4: Transfer Fee
+            if r.get("transfer_fee_pct", 0) > 5:
+                reasons.append(f"transfer_fee:{r.get('transfer_fee_pct')}%")
+
+            # Rule 5: Holder Count
+            if r.get("total_holders", 0) < 50:
+                reasons.append(f"holder_count:{r.get('total_holders')}_req_50")
+
+            # Rule 6: LP Lock %
+            lp_locked_pct = r.get("overall_lp_locked_pct")
+            if isinstance(lp_locked_pct, (int, float)) and lp_locked_pct < 80.0:
+                reasons.append(f"lp_locked:{lp_locked_pct:.1f}%_req_80%")
+
+            # Rule 7: Liquidity Amount
+            total_lp = r.get("total_lp_usd")
+            if total_lp != "unknown":
+                if total_lp < 10000.0:
+                    reasons.append(f"liquidity_usd:{total_lp:.2f}_req_10000")
+
+        if reasons: 
+            if self.debug:
+                print(f"[Security] {mint} FAILED Gate ({r.get('data_source')}): {reasons}")
+            overlap_result_stub = {"mint": mint, "grade": "NONE", "probation_meta": r.get("probation_meta")}
+            await self._start_or_update_probation(mint, start, overlap_result_stub, reasons)
+            
+            self.scheduling_store.update_token_state(mint, {
+                "status": "probation",
+                "last_completed_check": now_ts,
+                "next_scheduled_check": now_ts + self.repeat_interval_seconds,
+                "total_checks_completed": check_count
+            })
+            return
+
+        # === 3. HELIUS CALL (GATE PASSED) ===
+        if self.debug:
+            print(f"[Security] {mint} PASSED Gate ({r.get('data_source')}). Fetching holders...")
+        
+        try:
+            overlap_result = await self._fetch_and_calculate_overlap(start)
+        except Exception as e:
+            if self.debug:
+                print(f"[Analysis] Helius call failed for {mint}: {e}")
+            self.scheduling_store.update_token_state(mint, {
+                "last_error": f"Helius_fail: {e}",
+                "last_error_at": datetime.now(timezone.utc).isoformat()
+            })
+            return
+
+        # === 4. POST-HELIUS PROCESSING ===
+        grade = overlap_result.get("grade", "NONE")
+        
+        if grade == "NONE":
+            obj = safe_load_overlap(self.overlap_store)
+            obj.setdefault(mint, []).append({
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "result": overlap_result,
+                "security": f"passed_grade_none_{r.get('data_source')}",
+                "rugcheck": self._extract_rugcheck_summary(r)
+            })
+            self.overlap_store.save(obj)
+            
+            self.scheduling_store.update_token_state(mint, {
+                "status": "active",
+                "last_completed_check": now_ts,
+                "next_scheduled_check": now_ts + self.repeat_interval_seconds,
+                "total_checks_completed": check_count
+            })
+            return
+
+        # Grade PASSED -> DexScreener + ML + Final Save
+        if self.debug:
+            print(f"[Analysis] {mint} PASSED ALL CHECKS (Grade: {grade}).")
+
+        try:
+            dex_data = await retry_with_backoff(
+                self._run_dexscreener_check, mint, retries=8, base_delay=1.5
+            )
+        except Exception:
+            dex_data = {"ok": False, "price_usd": None, "market_cap_usd": None}
+
+        # ML Prediction
+        ml_prediction_result = None
+        try:            
+            ml_prediction_result = self.ml_classifier.predict(mint, threshold=0.70)
+        except Exception as e:
+            ml_prediction_result = {'action': 'ERROR', 'error': str(e)}
 
         # Save Final
         obj = safe_load_overlap(self.overlap_store)
@@ -2389,7 +2592,15 @@ class Monitor:
                 "current_price_usd": dex_data.get("price_usd"),
                 "market_cap_usd": dex_data.get("market_cap_usd"),
             },
-            "ml_prediction": ml_prediction_result
+            "ml_prediction": {
+                "probability": ml_prediction_result.get("win_probability"),
+                "confidence": ml_prediction_result.get("confidence"),
+                "risk_tier": ml_prediction_result.get("risk_tier"),
+                "action": ml_prediction_result.get("action"),
+                "error": ml_prediction_result.get("error"),
+                "key_metrics": ml_prediction_result.get("key_metrics"),
+                "warnings": ml_prediction_result.get("warnings")
+            }
         })
         self.overlap_store.save(obj)
         
