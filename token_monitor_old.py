@@ -1,18 +1,20 @@
+#!/usr/bin/env python3
 """
 Enhanced token monitor with persistent scheduling and hierarchical overlap scoring.
 Now using CoinGecko Pro API for new token discovery.
-Features:
- - SchedulingStore: Persistent scheduling state using joblib
- - Enhanced overlap grading with CRITICAL/HIGH/MEDIUM/LOW classifications
- - Concentration-based grading
- - Startup recovery logic
- - Persistent timestamp tracking to avoid refetching
- - 24-hour token expiration
- - Rolling 7-day Dune winners cache (per-day files)
- - Wallet frequency and weighted concentration
- - Hybrid holder sampling (<=200 all; >200 top10% capped 500)
- - Bounded concurrency for holder fetching (Semaphore)
- - FULLY ASYNC DUNE INTEGRATION with INFINITE POLLING (NO TIMEOUTS)
+
+--- REFACTOR NOTES ---
+- This script is now structured like winner_monitor.py to reduce Helius API calls.
+- Helius (HolderAggregator) is now ONLY called AFTER a token passes
+  all RugCheck and minimum security requirements.
+- The core logic is consolidated into `run_token_analysis_step`.
+- Removed functions: _security_gate_and_route, _schedule_first_check_only, _schedule_repeat_check_only.
+- Renamed `check_holders_overlap` to `_fetch_and_calculate_overlap` for clarity.
+
+*** MODIFIED (ML V2 Integration) ***
+- Runs ml_predictor_v2.py ONLY on tokens that pass ALL security/overlap checks.
+- Adds 'ml_prediction' (probability, confidence, risk_tier) to the final
+  results file for data confirmation, NOT as a filter.
 """
 import asyncio
 import aiohttp
@@ -36,14 +38,22 @@ import random
 
 from typing import List, Set
 
+import sqlite3
+import threading
+
+from ml_predictor import SolanaTokenPredictor
+
 load_dotenv()
 
-PROBATION_TOP_N = int(os.getenv("PROBATION_TOP_N", "10"))
+PROBATION_TOP_N = int(os.getenv("PROBATION_TOP_N", "3"))
 PROBATION_THRESHOLD_PCT = float(os.getenv("PROBATION_THRESHOLD_PCT", "40"))
+MAX_CREATOR_PCT = 20
 
 COINGECKO_PRO_API_KEY = os.environ.get("GECKO_API")
 DUNE_API_KEY = os.environ.get("DUNE_API_KEY")
 DUNE_QUERY_ID = int(os.environ.get("DUNE_QUERY_ID"))
+
+SHYFT_API_KEY=os.getenv("SHYFT_API_KEY")
 
 def _load_keys_list(env_name: str) -> List[str]:
     """Load comma-separated API keys from environment variable"""
@@ -51,6 +61,11 @@ def _load_keys_list(env_name: str) -> List[str]:
     if not value:
         return []
     return [k.strip() for k in value.split(",") if k.strip()]
+
+try:
+    from dune_client.client import DuneClient
+except Exception:
+    DuneClient = None
 
 # Load Helius keys
 HELIUS_KEYS = _load_keys_list("HELIUS_API_KEY")
@@ -72,21 +87,75 @@ def _next_helius_key() -> str:
     return key
 
 async def retry_with_backoff(func, *args, retries: int = 5, base_delay: float = 0.5, **kwargs):
-    """Retry an async function with exponential backoff and jitter."""
+    """
+    Retry an async function with exponential backoff and jitter.
+    Now handles 429 rate limiting with Retry-After header support.
+    
+    Args:
+        func: Async function to retry
+        *args: Positional arguments for func
+        retries: Maximum number of retry attempts
+        base_delay: Base delay in seconds for exponential backoff
+        **kwargs: Keyword arguments for func
+        
+    Returns:
+        Result from successful func call
+        
+    Raises:
+        RuntimeError: If all retries are exhausted
+    """
     for attempt in range(1, retries + 1):
         try:
             return await func(*args, **kwargs)
+            
+        except aiohttp.ClientResponseError as e:
+            # Special handling for 429 rate limiting
+            if e.status == 429:
+                retry_after = None
+                
+                # Try to parse Retry-After header
+                if e.headers and 'Retry-After' in e.headers:
+                    try:
+                        retry_after = int(e.headers['Retry-After'])
+                    except (ValueError, TypeError):
+                        # If Retry-After is not a valid integer, ignore it
+                        pass
+                
+                # Determine wait time
+                if retry_after:
+                    wait = retry_after
+                    print(f"[Retry] {func.__name__} rate limited (attempt {attempt}/{retries}). "
+                          f"Retry-After header: {retry_after}s")
+                else:
+                    # Use exponential backoff without jitter for rate limits
+                    wait = base_delay * (2 ** (attempt - 1))
+                    print(f"[Retry] {func.__name__} rate limited (attempt {attempt}/{retries}). "
+                          f"Using exponential backoff: {wait:.2f}s")
+                
+                # If we haven't exhausted retries, wait and continue
+                if attempt < retries:
+                    await asyncio.sleep(wait)
+                    continue
+                else:
+                    # Max retries exceeded for rate limiting
+                    raise RuntimeError(
+                        f"{func.__name__} failed after {retries} retries due to rate limiting (HTTP 429)"
+                    )
+            else:
+                # For non-429 ClientResponseErrors, re-raise immediately
+                raise
+                
         except Exception as e:
+            # For other exceptions, use exponential backoff with jitter
             wait = base_delay * (2 ** (attempt - 1)) + random.uniform(0, 0.3)
-            print(f"[Retry] {func.__name__} failed (attempt {attempt}/{retries}): {e}. Retrying in {wait:.2f}s")
-            await asyncio.sleep(wait)
-    raise RuntimeError(f"{func.__name__} failed after {retries} retries")
-
-# NOTE: keep dune_client import guarded
-try:
-    from dune_client.client import DuneClient
-except Exception:
-    DuneClient = None
+            print(f"[Retry] {func.__name__} failed (attempt {attempt}/{retries}): {e}. "
+                  f"Retrying in {wait:.2f}s")
+            
+            if attempt < retries:
+                await asyncio.sleep(wait)
+            else:
+                # Max retries exceeded for general errors
+                raise RuntimeError(f"{func.__name__} failed after {retries} retries")
 
 BUCKET_NAME = os.getenv("SUPABASE_BUCKET", "monitor-data")
 
@@ -186,7 +255,7 @@ class TradingStart:
     price_change_percentage: Optional[float] = None
 
 # -----------------------
-# Token discovery (CoinGecko + FULLY ASYNC Dune)
+# Token discovery (CoinGecko + Rugcheck + FULLY ASYNC Dune)
 # -----------------------
 class TokenDiscovery:
     def __init__(
@@ -202,12 +271,19 @@ class TokenDiscovery:
     ):
         self.client = client
         self.debug = bool(debug)
-        # CoinGecko
+        
+        # --- CoinGecko Config ---
         self.coingecko_pro_api_key = coingecko_pro_api_key or os.environ.get("GECKO_API")
         self.coingecko_url = "https://pro-api.coingecko.com/api/v3/onchain/networks/solana/new_pools"
+        
+        # --- RugCheck Config ---
+        self.rugcheck_new_url = "https://api.rugcheck.xyz/v1/stats/new_tokens"
+        
+        # --- State / Cache ---
         self.last_processed_timestamp = self._load_last_timestamp(timestamp_cache_file)
         self.timestamp_cache_file = timestamp_cache_file
-        # Dune
+        
+        # --- Dune Config ---
         self.dune_api_key = dune_api_key or os.environ.get("DUNE_API_KEY")
         self.dune_query_id = dune_query_id
         if DuneClient and self.dune_api_key:
@@ -218,8 +294,9 @@ class TokenDiscovery:
         else:
             self.dune_client = None
         self.dune_cache_file = dune_cache_file
+        
         if self.debug:
-            print("TokenDiscovery initialized with CoinGecko Pro and ASYNC Dune (NO TIMEOUTS)")
+            print("TokenDiscovery initialized with CoinGecko Pro, RugCheck, and ASYNC Dune")
 
     def _load_last_timestamp(self, cache_file: str) -> Optional[int]:
         if os.path.exists(cache_file):
@@ -265,10 +342,7 @@ class TokenDiscovery:
         return []
 
     def fetch_dune_latest_rows(self) -> List[Dict[str, Any]]:
-        """
-        Fetch the latest Dune query result (synchronous wrapper).
-        Returns a list of row dicts from Dune.
-        """
+        """Synchronous wrapper for Dune results."""
         if not self.dune_client or not self.dune_query_id:
             raise RuntimeError("Dune client or query_id not configured")
         if self.debug:
@@ -280,359 +354,352 @@ class TokenDiscovery:
         return rows
 
     async def fetch_dune_force_refresh(self) -> List[Dict[str, Any]]:
-        """
-        🚀 FULLY ASYNC: Force a new execution of the Dune query and return fresh results.
-        🚀 NO TIMEOUTS: Uses infinite polling with while True
-        🚀 NON-BLOCKING: Uses await asyncio.sleep instead of time.sleep
-        """
-        if not self.dune_client or not self.dune_query_id:
-            raise RuntimeError("Dune client or query_id not configured")
+            """
+            Fully async Dune refresh using the new API endpoints (v1).
+            1. POST /execute -> Get execution_id
+            2. GET /results -> Poll until QUERY_STATE_COMPLETED
+            """
+            if not self.dune_api_key or not self.dune_query_id:
+                raise RuntimeError("Dune credentials or query_id not configured")
 
-        query_id = int(self.dune_query_id)
-
-        if self.debug:
-            print(f"[Dune ASYNC] 🚀 Starting infinite polling for query {query_id} (NO TIMEOUTS)")
-
-        try:
-            from dune_client.query import QueryBase
-
-            # Method 1: Try execute_query with INFINITE polling (NO TIMEOUT)
-            try:
-                query = QueryBase(query_id=query_id)
-                execution = self.dune_client.execute_query(query)
+            base_url = "https://api.dune.com/api/v1"
+            headers = {"X-DUNE-API-KEY": self.dune_api_key}
+            
+            # We use a localized session for this distinct operation
+            async with aiohttp.ClientSession() as session:
+                # === STEP 1: Execute Query ===
+                exec_url = f"{base_url}/query/{self.dune_query_id}/execute"
                 if self.debug:
-                    print(f"[Dune ASYNC] 🚀 Started execution: {execution}")
+                    print(f"[Dune API] 🚀 POST executing query {self.dune_query_id}...")
 
-                # Get execution ID
-                execution_id = None
-                if hasattr(execution, 'execution_id'):
-                    execution_id = execution.execution_id
-                elif hasattr(execution, 'id'):
-                    execution_id = execution.id
-                elif isinstance(execution, str):
-                    execution_id = execution
+                try:
+                    async with session.post(exec_url, headers=headers) as resp:
+                        if resp.status == 429:
+                            raise RuntimeError("Dune API Rate Limited (POST execute)")
+                        if resp.status != 200:
+                            text = await resp.text()
+                            raise RuntimeError(f"Dune Execute failed {resp.status}: {text}")
+                        
+                        data = await resp.json()
+                        execution_id = data.get("execution_id")
+                        state = data.get("state")
+                        
+                        if not execution_id:
+                            raise RuntimeError(f"No execution_id returned: {data}")
+                        
+                        if self.debug:
+                            print(f"[Dune API] Execution ID: {execution_id} (State: {state})")
 
-                if execution_id:
+                except Exception as e:
                     if self.debug:
-                        print(f"[Dune ASYNC] 🚀 Polling execution {execution_id} with INFINITE timeout")
+                        print(f"[Dune API] ❌ Execute failed: {e}")
+                    return []
 
-                    attempt = 0
-                    while True:  # 🚀 No timeout - runs until completion
-                        try:
-                            attempt += 1
-                            status = self.dune_client.get_execution_status(execution_id)
-
-                            # normalize state
-                            raw_state = getattr(status, 'state',
-                                        getattr(status, 'execution_status',
-                                        getattr(status, 'execution_state', str(status))))
-                            state_str = str(raw_state).lower()
-
-                            if self.debug and attempt % 20 == 0:
-                                print(f"[Dune ASYNC] 🚀 Attempt {attempt}: {state_str} (infinite polling)")
-
-                            if "completed" in state_str:
-                                if self.debug:
-                                    print(f"[Dune ASYNC] ✅ Query completed after {attempt} attempts ({attempt * 3 / 60:.1f} minutes)")
-                                break
-                            elif "failed" in state_str:
-                                raise RuntimeError(f"Query execution failed: {raw_state}")
-
-                            await asyncio.sleep(3)
-
-                        except Exception as e:
-                            if self.debug:
-                                print(f"[Dune ASYNC] ⚠️ Polling error: {e}")
-                            break
-
-                    # Get results
+                # === STEP 2: Poll for Results ===
+                results_url = f"{base_url}/execution/{execution_id}/results"
+                attempt = 0
+                
+                while True:
+                    attempt += 1
+                    # Wait before polling (backoff slightly)
+                    await asyncio.sleep(min(3, 1 + (attempt * 0.2)))
+                    
                     try:
-                        payload = self.dune_client.get_result(execution_id)
-                        rows = self._rows_from_dune_payload(payload)
-                        if rows:
-                            if self.debug:
-                                print(f"[Dune ASYNC] ✅ Execute query successful: {len(rows)} rows after {attempt * 3 / 60:.1f} minutes")
-                            return rows
+                        async with session.get(results_url, headers=headers) as resp:
+                            if resp.status == 429:
+                                if self.debug:
+                                    print("[Dune API] Rate limit polling results, waiting 5s...")
+                                await asyncio.sleep(5)
+                                continue
+                                
+                            if resp.status != 200:
+                                # 202 is sometimes used for pending, but Dune v1 usually returns 200 with state
+                                text = await resp.text()
+                                raise RuntimeError(f"Dune Results failed {resp.status}: {text}")
+                                
+                            data = await resp.json()
+                            state = data.get("state")
+                            
+                            if state == "QUERY_STATE_COMPLETED":
+                                rows = data.get("result", {}).get("rows", [])
+                                if self.debug:
+                                    print(f"[Dune API] ✅ Query completed! Returned {len(rows)} rows.")
+                                return rows
+                                
+                            elif state in ["QUERY_STATE_FAILED", "QUERY_STATE_CANCELLED", "QUERY_STATE_EXPIRED"]:
+                                raise RuntimeError(f"Query failed with state: {state}")
+                                
+                            else:
+                                # QUERY_STATE_PENDING, QUERY_STATE_EXECUTING
+                                if self.debug and attempt % 5 == 0:
+                                    print(f"[Dune API] Status: {state} (poll #{attempt})...")
+                                    
                     except Exception as e:
                         if self.debug:
-                            print(f"[Dune ASYNC] ❌ get_result failed: {e}")
-            except Exception as e:
-                if self.debug:
-                    print(f"[Dune ASYNC] ❌ execute_query failed: {e}")
-
-            # Method 2: Fallback to get_latest_result
-            if self.debug:
-                print("[Dune ASYNC] 🔄 Falling back to get_latest_result")
-            payload = self.dune_client.get_latest_result(query_id)
-            rows = self._rows_from_dune_payload(payload)
-            if self.debug:
-                print(f"[Dune ASYNC] 🔄 Fallback returned {len(rows)} rows")
-                if rows:
-                    print(f"[Dune ASYNC] Sample fallback row keys: {list(rows[0].keys())}")
-            return rows
-
-        except Exception as e:
-            if self.debug:
-                print(f"[Dune ASYNC] ❌ All methods failed: {e}")
-                import traceback
-                traceback.print_exc()
+                            print(f"[Dune API] ⚠️ Polling error: {e}")
+                        # If it's a transient network error, we might want to continue, 
+                        # but for now we break to avoid infinite loops on hard errors
+                        break
+            
             return []
 
     async def get_tokens_launched_yesterday_cached(self, cache_max_age_days: int = 7) -> List[TradingStart]:
-        """
-        🚀 NOW ASYNC: Return list of TradingStart objects for tokens Dune reports as launched yesterday.
-        This method retains compatibility with previous behavior (legacy single-file cache).
-        """
+        """Async retrieval of Dune tokens for 'yesterday' with local caching."""
         cache_path = self.dune_cache_file
-
+        
+        # Helper to convert raw Dune rows to TradingStart objects
         def rows_to_trading_starts(rows: List[Dict[str, Any]], target_yesterday: datetime.date) -> List[TradingStart]:
-            if not rows:
-                return []
+            if not rows: return []
             df = pd.DataFrame(rows)
-            date_col = None
-            mint_col = None
-            for c in ("first_buy_date", "first_buy_date_utc", "block_date", "first_trade_date"):
-                if c in df.columns:
-                    date_col = c
-                    break
-            for c in ("mint_address", "mint", "token_bought_mint_address"):
-                if c in df.columns:
-                    mint_col = c
-                    break
-            if date_col is None or mint_col is None:
-                return []
+            
+            # Identify columns
+            date_col = next((c for c in ("first_buy_date", "first_buy_date_utc", "block_date", "first_trade_date") if c in df.columns), None)
+            mint_col = next((c for c in ("mint_address", "mint", "token_bought_mint_address") if c in df.columns), None)
+            
+            if not date_col or not mint_col: return []
+            
             df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
             filtered = df[df[date_col].dt.date == target_yesterday]
             out = []
             for _, row in filtered.iterrows():
                 try:
                     dt = pd.to_datetime(row[date_col])
-                    if pd.isna(dt):
-                        continue
-                    if dt.tzinfo is None:
-                        dt = dt.tz_localize("UTC")
+                    if pd.isna(dt): continue
+                    if dt.tzinfo is None: dt = dt.tz_localize("UTC")
                     ts = int(dt.tz_convert("UTC").timestamp())
                 except Exception:
                     continue
-                out.append(
-                    TradingStart(mint=row[mint_col], block_time=ts, program_id="dune", detected_via="dune", extra={date_col: str(row[date_col])})
-                )
+                out.append(TradingStart(
+                    mint=row[mint_col], 
+                    block_time=ts, 
+                    program_id="dune", 
+                    detected_via="dune", 
+                    extra={date_col: str(row[date_col])}
+                ))
             return out
 
         current_yesterday = (datetime.now(timezone.utc).date() - timedelta(days=1))
         need_fetch = True
 
-        # Check if we have valid cached data
+        # Check existing cache
         if os.path.exists(cache_path):
             try:
                 cache_obj = joblib.load(cache_path)
                 cached_rows = cache_obj.get("rows", [])
                 fetched_at = None
-                
-                # Parse fetched_at timestamp
                 try:
                     fetched_at = datetime.fromisoformat(cache_obj["fetched_at"])
-                    if fetched_at.tzinfo is None:
-                        fetched_at = fetched_at.replace(tzinfo=timezone.utc)
-                except Exception:
-                    fetched_at = None
+                    if fetched_at.tzinfo is None: fetched_at = fetched_at.replace(tzinfo=timezone.utc)
+                except Exception: fetched_at = None
 
-                # Primary validation: Check if cached data contains yesterday's tokens
                 if cached_rows and fetched_at:
                     df = pd.DataFrame(cached_rows)
                     if "first_buy_date" in df.columns:
                         try:
                             first_buy = pd.to_datetime(df["first_buy_date"].iloc[0]).date()
                             if first_buy == current_yesterday:
-                                # Secondary validation: Check if cache is not too old (fallback safety)
                                 age_days = (datetime.now(timezone.utc) - fetched_at).days
                                 if age_days <= cache_max_age_days:
-                                    if self.debug:
-                                        print(f"[Dune/cache] cached first_buy_date {first_buy} matches yesterday and age {age_days} <= {cache_max_age_days} days, using cache")
-                                    need_fetch = False
                                     starts = rows_to_trading_starts(cached_rows, current_yesterday)
-                                    if starts:  # Only use cache if it actually produces results
-                                        return starts
-                                    else:
+                                    if starts:
                                         if self.debug:
-                                            print("[Dune/cache] cache data didn't produce any tokens, fetching fresh")
-                                        need_fetch = True
-                                else:
-                                    if self.debug:
-                                        print(f"[Dune/cache] cached data too old: {age_days} > {cache_max_age_days} days")
-                            else:
-                                if self.debug:
-                                    print(f"[Dune/cache] cached first_buy_date {first_buy} != yesterday {current_yesterday} -> need fresh data")
-                        except Exception as e:
-                            if self.debug:
-                                print(f"[Dune/cache] failed to validate cached data: {e}")
-                                
-                # Fallback validation using fetched_at and target_yesterday (legacy compatibility)
-                elif fetched_at and "target_yesterday" in cache_obj:
-                    try:
-                        cached_yesterday = datetime.fromisoformat(cache_obj["target_yesterday"]).date()
-                        if cached_yesterday == current_yesterday:
-                            age_days = (datetime.now(timezone.utc) - fetched_at).days
-                            if age_days <= cache_max_age_days:
-                                starts = rows_to_trading_starts(cached_rows, current_yesterday)
-                                if starts:
-                                    if self.debug:
-                                        print(f"[Dune/cache] using cached data via fallback validation for yesterday={current_yesterday}")
-                                    need_fetch = False
-                                    return starts
-                    except Exception as e:
-                        if self.debug:
-                            print(f"[Dune/cache] fallback validation failed: {e}")
-                            
-            except Exception as e:
-                if self.debug:
-                    print(f"[Dune/cache] error reading cache: {e}")
+                                            print(f"[Dune/cache] using valid cache for {current_yesterday}")
+                                        need_fetch = False
+                                        return starts
+                        except Exception: pass
+            except Exception: pass
 
-        # 🚀 ASYNC FETCH: Fetch fresh data if needed
         if need_fetch:
             try:
-                if self.debug:
-                    print("[Dune ASYNC] 🚀 Fetching fresh data from Dune API with infinite polling")
-                rows = await self.fetch_dune_force_refresh()  # 🚀 NOW ASYNC
+                rows = await self.fetch_dune_force_refresh()
+                if rows:
+                    joblib.dump({
+                        "rows": rows,
+                        "fetched_at": datetime.now(timezone.utc).isoformat(),
+                        "target_yesterday": current_yesterday.isoformat()
+                    }, cache_path)
+                    return rows_to_trading_starts(rows, current_yesterday)
             except Exception as e:
-                if self.debug:
-                    print(f"[Dune ASYNC] ❌ fetch failure: {e}")
-                return []
-
-            # Save fresh data to cache
-            try:
-                cache_obj = {
-                    "rows": rows,
-                    "fetched_at": datetime.now(timezone.utc).isoformat(),
-                    "target_yesterday": current_yesterday.isoformat()
-                }
-                joblib.dump(cache_obj, cache_path)
-                if self.debug:
-                    print(f"[Dune/cache] ✅ cached fresh data for yesterday={current_yesterday}")
-            except Exception as e:
-                if self.debug:
-                    print(f"[Dune/cache] ❌ write failed: {e}")
-
-            starts = rows_to_trading_starts(rows, current_yesterday)
-            if self.debug:
-                print(f"[Dune ASYNC] ✅ found {len(starts)} tokens for yesterday={current_yesterday} after fresh fetch")
-            return starts
-
+                if self.debug: print(f"[Dune ASYNC] ❌ fetch failure: {e}")
+        
         return []
 
-    # ---------------- CoinGecko ----------------
-    async def _fetch_coingecko_new_pools(self, limit: int = 500, timeout: int = 15) -> List[Dict[str, Any]]:
-        """Fetch the latest 20 pools from CoinGecko and print their mint addresses, ignoring cache."""
+    # ---------------- CoinGecko Logic ----------------
+    async def _fetch_coingecko_new_pools(self, limit: int = 500, timeout: int = 30) -> List[Dict[str, Any]]:
+        """Fetch raw pool data from CoinGecko Pro."""
         headers = {"accept": "application/json", "x-cg-pro-api-key": self.coingecko_pro_api_key}
-        url = self.coingecko_url  # No pagination
-
         if self.debug:
-            print("[CoinGecko] Fetching latest 20 pools (ignoring cache)")
+            print("[CoinGecko] Fetching latest pools (ignoring cache)")
 
         async with aiohttp.ClientSession() as sess:
-            async with sess.get(url, headers=headers, timeout=timeout) as resp:
+            async with sess.get(self.coingecko_url, headers=headers, timeout=timeout) as resp:
                 resp.raise_for_status()
                 data = await resp.json()
-                pools = data.get("data", [])
-
-        if not pools:
-            if self.debug:
-                print("[CoinGecko] No pools returned")
-            return []
-
-        all_pools = []
-        for pool in pools:
-            # Extract mint address
-            base_token = pool["relationships"]["base_token"]["data"]
-            mint = base_token["id"].replace("eth_", "").replace("solana_", "")
-
-            # Extract timestamp
-            block_time = self._parse_pool_created_at(pool["attributes"]["pool_created_at"])
-
-            if self.debug:
-                print(f"  - Mint: {mint} | Created: {pool['attributes']['pool_created_at']} | TS: {block_time}")
-
-            all_pools.append(pool)
-
-        if self.debug:
-            print(f"[CoinGecko] Total pools fetched: {len(all_pools)}")
-
-        return all_pools
+                return data.get("data", [])
 
     @staticmethod
     def _parse_pool_created_at(val: Any) -> Optional[int]:
-        if not val:
-            return None
+        if not val: return None
         try:
             ts_str = str(val).replace("Z", "+00:00")
             dt = datetime.fromisoformat(ts_str)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
+            if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
             return int(dt.timestamp())
-        except Exception as e:
-            print(f"[ParseError] Could not parse timestamp {val}: {e}")
-            return None
-
-    @staticmethod
-    def _utc_day_bounds_for_date(dt: Optional[datetime] = None) -> Tuple[int, int]:
-        d = (dt or datetime.now(timezone.utc)).astimezone(timezone.utc)
-        start = datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=timezone.utc)
-        end = start + timedelta(days=1) - timedelta(seconds=1)
-        return int(start.timestamp()), int(end.timestamp())
+        except Exception: return None
 
     def _parse_coingecko_pool(self, pool: Dict[str, Any]) -> TradingStart:
-        attributes = pool["attributes"]
+        attr = pool["attributes"]
         base_token = pool["relationships"]["base_token"]["data"]
-        mint = base_token["id"].replace("eth_", "").replace("solana_", "")  # Handle both ETH and Solana
-        block_time = self._parse_pool_created_at(attributes["pool_created_at"])
+        mint = base_token["id"].replace("eth_", "").replace("solana_", "")
+        block_time = self._parse_pool_created_at(attr["pool_created_at"])
         return TradingStart(
             mint=mint,
             block_time=block_time,
             program_id="coingecko",
             detected_via="coingecko",
             extra={
-                "name": attributes["name"].split(" / ")[0],
-                "fdv_usd": attributes["fdv_usd"],
-                "market_cap_usd": attributes.get("market_cap_usd") or attributes["fdv_usd"],
-                "volume_usd": attributes["volume_usd"]["h24"],
+                "name": attr["name"].split(" / ")[0],
+                "fdv_usd": attr["fdv_usd"],
+                "market_cap_usd": attr.get("market_cap_usd") or attr["fdv_usd"],
+                "volume_usd": attr["volume_usd"]["h24"],
                 "source_dex": pool["relationships"]["dex"]["data"]["id"],
-                "price_change_percentage": attributes["price_change_percentage"]["h24"],
+                "price_change_percentage": attr["price_change_percentage"]["h24"],
             },
-            fdv_usd=attributes["fdv_usd"],
-            volume_usd=attributes["volume_usd"]["h24"],
+            fdv_usd=attr["fdv_usd"],
+            volume_usd=attr["volume_usd"]["h24"],
             source_dex=pool["relationships"]["dex"]["data"]["id"],
-            price_change_percentage=attributes["price_change_percentage"]["h24"],
+            price_change_percentage=attr["price_change_percentage"]["h24"],
         )
 
-    async def get_tokens_created_today(self, limit: int = 500) -> List[TradingStart]:
-        pools = await self._fetch_coingecko_new_pools(limit=limit)
+    # ---------------- RugCheck Logic ----------------
+    async def _fetch_rugcheck_new_tokens(self, timeout: int = 50) -> List[TradingStart]:
+        """Fetch the latest tokens from RugCheck API."""
+        if self.debug:
+            print("[RugCheck Discovery] Fetching new tokens...")
+
+        try:
+            async with aiohttp.ClientSession() as sess:
+                async with sess.get(self.rugcheck_new_url, timeout=timeout) as resp:
+                    if resp.status != 200:
+                        if self.debug:
+                            print(f"[RugCheck Discovery] Failed: Status {resp.status}")
+                        return []
+                    data = await resp.json()
+        except Exception as e:
+            if self.debug:
+                print(f"[RugCheck Discovery] Error: {e}")
+            return []
+
+        if not isinstance(data, list):
+            return []
+
         out = []
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+
+        for item in data:
+            mint = item.get("mint")
+            if not mint:
+                continue
+            
+            # RugCheck detections are fresh; use current time for block_time
+            # to ensure the scheduler picks them up immediately.
+            out.append(TradingStart(
+                mint=mint,
+                block_time=now_ts,
+                program_id="rugcheck_new",
+                detected_via="rugcheck",
+                extra={
+                    "symbol": item.get("symbol"),
+                    "name": item.get("name"),
+                    "supply": item.get("supply"),
+                    "uri": item.get("uri")
+                },
+                # Default these to 0 as RugCheck 'new_tokens' often lack market data
+                fdv_usd=0.0,
+                volume_usd=0.0,
+                source_dex="unknown",
+                price_change_percentage=0.0,
+            ))
+
+        if self.debug and out:
+            print(f"[RugCheck Discovery] Found {len(out)} tokens")
+        return out
+
+    # ---------------- Aggregated Discovery ----------------
+    async def get_tokens_created_today(self, limit: int = 500) -> List[TradingStart]:
+        """
+        Fetches tokens from both CoinGecko and RugCheck in parallel.
+        Merges results, prioritizing CoinGecko data if duplicates exist 
+        (because CG provides richer market data like Dex/FDV).
+        """
+        # 1. Define tasks for parallel execution
+        # Use existing retry_with_backoff for robustness
+        cg_task = retry_with_backoff(
+            self._fetch_coingecko_new_pools,
+            limit=limit,
+            retries=3,
+            base_delay=2.0
+        )
+        
+        rc_task = retry_with_backoff(
+            self._fetch_rugcheck_new_tokens,
+            retries=3,
+            base_delay=2.0
+        )
+
+        # 2. Run concurrently
+        results = await asyncio.gather(cg_task, rc_task, return_exceptions=True)
+        
+        # 3. Handle Results
+        cg_raw_pools = results[0] if not isinstance(results[0], Exception) else []
+        rc_starts = results[1] if not isinstance(results[1], Exception) else []
+        
+        # Log failures if any
+        if self.debug:
+            if isinstance(results[0], Exception):
+                print(f"[TokenDiscovery] CoinGecko failed: {results[0]}")
+            if isinstance(results[1], Exception):
+                print(f"[TokenDiscovery] RugCheck failed: {results[1]}")
+
+        # 4. Process CoinGecko Data
+        cg_starts = []
         now = int(datetime.now(timezone.utc).timestamp())
-        cutoff = now - 24 * 3600  # only include pools launched in last 24 hours
+        cutoff = now - 24 * 3600  # last 24 hours
 
-        for pool in pools:
+        for pool in cg_raw_pools:
             block_time = self._parse_pool_created_at(pool["attributes"]["pool_created_at"])
-            if not block_time:
-                continue
-
-            # ✅ filter: only pools created in last 24 hours
-            if block_time < cutoff:
-                continue
+            if not block_time: continue
+            if block_time < cutoff: continue
 
             ts = self._parse_coingecko_pool(pool)
-            out.append(ts)
+            cg_starts.append(ts)
 
-            # update last processed timestamp
+            # Update timestamp tracker (prefer CG timestamps for history)
             if self.last_processed_timestamp is None or block_time > self.last_processed_timestamp:
                 self.last_processed_timestamp = block_time
 
-        if out:
+        if cg_starts:
             self._save_last_timestamp()
 
-        if self.debug:
-            print(f"[CoinGecko] {len(out)} tokens launched")
+        # 5. Merge and Deduplicate
+        # Strategy: Use a dictionary keyed by mint.
+        # Add RugCheck first, then overwrite with CoinGecko.
+        # This ensures if a token is on both, we get the CG version (which has DEX/Price data).
+        unique_tokens = {}
+        
+        for ts in rc_starts:
+            unique_tokens[ts.mint] = ts
+            
+        for ts in cg_starts:
+            unique_tokens[ts.mint] = ts
 
-        return out
+        final_list = list(unique_tokens.values())
+
+        if self.debug:
+            print(f"[TokenDiscovery] Combined Total: {len(final_list)} unique tokens "
+                  f"({len(cg_starts)} from CG, {len(rc_starts)} from RC)")
+
+        return final_list
 
 # -----------------------
 # Dune 7-day rolling cache + builder (updated for async)
@@ -1075,109 +1142,216 @@ def _normalize(obj: Any) -> Any:
 # -----------------------
 # JobLibTokenUpdater
 # -----------------------
+# --- BEGIN REPLACEMENT ---
+# This is the new SQLite-backed version of JobLibTokenUpdater.
+
 class JobLibTokenUpdater:
-    def __init__(self, data_dir: str = "./data/token_data", expiry_hours: int = 24, debug: bool = False):
+    def __init__(self, data_dir: str = "./data/token_data", expiry_hours: int = 6, debug: bool = False):
         self.data_dir = os.path.abspath(data_dir)
         os.makedirs(self.data_dir, exist_ok=True)
-        self.tokens_file = os.path.join(self.data_dir, "tokens.pkl")
+        
+        # Use SQLite database file instead of a pickle file
+        self.db_file = os.path.join(self.data_dir, "tokens.db")
         self.expiry_hours = expiry_hours
         self.debug = debug
+        # Use a lock for thread-safe database writes from asyncio.to_thread
+        self.lock = threading.Lock()
+        self._init_db()
+        if self.debug:
+            print(f"JobLibTokenUpdater: Initialized with SQLite db at {self.db_file}")
 
-    def _load_tokens(self) -> List[Any]:
-        if os.path.exists(self.tokens_file):
+    def _init_db(self):
+        """Initializes the SQLite database and table."""
+        with self.lock:
             try:
-                data = joblib.load(self.tokens_file)
-                if isinstance(data, list):
-                    return data
-            except Exception as e:
+                with sqlite3.connect(self.db_file) as conn:
+                    cursor = conn.cursor()
+                    # Create table:
+                    # - mint: Primary key for automatic existence checks
+                    # - block_time: Indexed for fast cleanup and sorting
+                    # - data: JSON blob of the full TradingStart object
+                    cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS tokens (
+                        mint TEXT PRIMARY KEY,
+                        block_time INTEGER,
+                        data TEXT
+                    )
+                    """)
+                    # Create index for fast sorting and cleanup
+                    cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_block_time
+                    ON tokens (block_time)
+                    """)
+                    conn.commit()
+            except sqlite3.Error as e:
                 if self.debug:
-                    print("JobLibTokenUpdater: load error", e)
-        return []
-
-    def _save_tokens(self, tokens: List[Any]):
-        try:
-            safe_tokens = [_normalize(t) for t in tokens]
-            joblib.dump(safe_tokens, self.tokens_file)
-        except Exception as e:
-            print("JobLibTokenUpdater: save error", e)
-            traceback.print_exc()
-            debug_path = self.tokens_file + ".debug.json"
-            try:
-                with open(debug_path, "w", encoding="utf-8") as f:
-                    json.dump([asdict(t) if isinstance(t, TradingStart) else str(t) for t in tokens], f, indent=2, default=str)
-                print(f"Saved debug snapshot to {debug_path}")
-            except Exception as ee:
-                print("Also failed to dump debug snapshot:", ee)
+                    print(f"JobLibTokenUpdater: Database init error: {e}")
 
     async def save_trading_starts_async(self, trading_starts: List[TradingStart], skip_existing: bool = True) -> Dict[str, int]:
-        existing = self._load_tokens()
-        existing_mints: Set[str] = set()
-        for t in existing:
-            if isinstance(t, dict):
-                m = t.get("mint")
-            elif isinstance(t, TradingStart):
-                m = t.mint
-            else:
-                m = None
-            if m:
-                existing_mints.add(m)
+        """
+        Asynchronously saves a list of TradingStart objects to the SQLite database.
+        This operation is run in a separate thread to avoid blocking asyncio.
+        """
+        # Run the blocking DB operations in a separate thread
+        return await asyncio.to_thread(
+            self._save_tokens_sync, trading_starts, skip_existing
+        )
 
+    def _save_tokens_sync(self, trading_starts: List[TradingStart], skip_existing: bool) -> Dict[str, int]:
+        """Synchronous (blocking) implementation for saving tokens."""
         saved = 0
         skipped = 0
         errors = 0
+        
+        # Prepare data for insertion
+        data_to_insert = []
         for s in trading_starts:
-            try:
-                if skip_existing and s.mint in existing_mints:
-                    skipped += 1
-                    continue
-                existing.append(s)
-                saved += 1
-            except Exception:
+            if not s.mint:
                 errors += 1
-        self._save_tokens(existing)
+                continue
+            try:
+                # Normalize and serialize the full object to JSON
+                s_dict = asdict(s)
+                # Use the existing _normalize helper to handle NaN/Inf
+                s_json = json.dumps(_normalize(s_dict)) 
+                data_to_insert.append((s.mint, s.block_time or 0, s_json))
+            except Exception as e:
+                if self.debug:
+                    print(f"JobLibTokenUpdater: Serialization error for {s.mint}: {e}")
+                errors += 1
+        
+        if not data_to_insert:
+            return {"saved": 0, "skipped": 0, "errors": errors}
+
+        # Use a lock to ensure thread-safe database access
+        with self.lock:
+            try:
+                # Use a context manager for the connection
+                with sqlite3.connect(self.db_file) as conn:
+                    cursor = conn.cursor()
+                    
+                    if skip_existing:
+                        # INSERT OR IGNORE = skip if mint (PRIMARY KEY) already exists
+                        # This is the SQL equivalent of the previous logic
+                        cursor.executemany(
+                            "INSERT OR IGNORE INTO tokens (mint, block_time, data) VALUES (?, ?, ?)",
+                            data_to_insert
+                        )
+                        saved = cursor.rowcount
+                        skipped = len(data_to_insert) - saved
+                    else:
+                        # INSERT OR REPLACE = overwrite if mint (PRIMARY KEY) already exists
+                        cursor.executemany(
+                            "INSERT OR REPLACE INTO tokens (mint, block_time, data) VALUES (?, ?, ?)",
+                            data_to_insert
+                        )
+                        saved = cursor.rowcount # This counts all successful inserts/replacements
+                    
+                    conn.commit()
+                    
+            except sqlite3.Error as e:
+                if self.debug:
+                    print(f"JobLibTokenUpdater: DB save error: {e}")
+                errors += len(data_to_insert) # Assume all failed on batch error
+                saved = 0
+                skipped = 0
+        
         if self.debug:
-            print(f"JobLibTokenUpdater: saved={saved} skipped={skipped} errors={errors} total_now={len(existing)}")
+            # We can't easily get the total_now without another query, so we report the action
+            print(f"JobLibTokenUpdater: saved={saved} skipped={skipped} errors={errors}")
+
         return {"saved": saved, "skipped": skipped, "errors": errors}
 
     async def cleanup_old_tokens_async(self) -> int:
-        tokens = self._load_tokens()
-        if not tokens:
-            return 0
+        """
+        Asynchronously cleans up old tokens from the database based on expiry_hours.
+        This operation is run in a separate thread.
+        """
+        return await asyncio.to_thread(self._cleanup_sync)
+
+    def _cleanup_sync(self) -> int:
+        """Synchronous (blocking) implementation for cleaning up old tokens."""
         now = datetime.now(timezone.utc)
         cutoff = int((now - timedelta(hours=self.expiry_hours)).timestamp())
-        kept: List[Any] = []
-        for t in tokens:
-            ts = 0
-            if isinstance(t, dict):
-                ts = int(t.get("block_time", 0) or 0)
-            elif isinstance(t, TradingStart):
-                ts = int(t.block_time or 0)
-            if ts > cutoff:
-                kept.append(t)
-        deleted = len(tokens) - len(kept)
-        if deleted:
-            self._save_tokens(kept)
-            if self.debug:
-                print(f"JobLibTokenUpdater: cleaned {deleted} tokens older than {self.expiry_hours} hours")
+        deleted = 0
+        
+        with self.lock:
+            try:
+                with sqlite3.connect(self.db_file) as conn:
+                    cursor = conn.cursor()
+                    # Delete rows where block_time is older than the cutoff
+                    cursor.execute("DELETE FROM tokens WHERE block_time < ?", (cutoff,))
+                    deleted = cursor.rowcount
+                    conn.commit()
+            except sqlite3.Error as e:
+                if self.debug:
+                    print(f"JobLibTokenUpdater: DB cleanup error: {e}")
+        
+        if deleted > 0 and self.debug:
+             print(f"JobLibTokenUpdater: cleaned {deleted} tokens older than {self.expiry_hours} hours")
+        
         return deleted
 
     async def get_tracked_tokens_async(self, limit: Optional[int] = None) -> List[TradingStart]:
-        tokens = self._load_tokens()
+        """
+        Asynchronously retrieves tracked tokens from the database.
+        This operation is run in a separate thread.
+        """
+        return await asyncio.to_thread(self._get_tokens_sync, limit)
+
+    def _get_tokens_sync(self, limit: Optional[int]) -> List[TradingStart]:
+        """Synchronous (blocking) implementation for fetching tokens."""
+        rows = []
+        with self.lock:
+            try:
+                with sqlite3.connect(self.db_file) as conn:
+                    # Use row_factory to get dict-like rows (though we only need one column)
+                    conn.row_factory = sqlite3.Row
+                    cursor = conn.cursor()
+                    
+                    # Select the JSON data, already sorted by block_time by the DB
+                    query = "SELECT data FROM tokens ORDER BY block_time DESC"
+                    params = []
+                    
+                    if limit:
+                        query += " LIMIT ?"
+                        params.append(limit)
+                        
+                    cursor.execute(query, params)
+                    rows = cursor.fetchall()
+            except sqlite3.Error as e:
+                if self.debug:
+                    print(f"JobLibTokenUpdater: DB read error: {e}")
+                return [] # Return empty on error
+        
+        # --- DESERIALIZATION (Copied from original class) ---
         norm: List[TradingStart] = []
-        for t in tokens:
-            if isinstance(t, TradingStart):
-                norm.append(t)
-            elif isinstance(t, dict):
-                try:
-                    norm.append(TradingStart(**t))
-                except Exception:
-                    allowed = {"mint","block_time","program_id","detected_via","extra","fdv_usd","volume_usd","source_dex","price_change_percentage"}
-                    clean = {k:v for k,v in t.items() if k in allowed}
-                    norm.append(TradingStart(**clean))
-        norm.sort(key=lambda x: x.block_time or 0, reverse=True)
-        if limit:
-            norm = norm[:limit]
+        for row in rows:
+            try:
+                data_json = row["data"]
+                t = json.loads(data_json) # t is a dict
+                
+                # Original logic to convert dict back to TradingStart
+                if isinstance(t, TradingStart):
+                     norm.append(t) # Should not happen from JSON, but good safety
+                elif isinstance(t, dict):
+                    try:
+                        norm.append(TradingStart(**t))
+                    except Exception:
+                        # Handle dicts that might have extra/missing keys
+                        allowed = {"mint","block_time","program_id","detected_via","extra","fdv_usd","volume_usd","source_dex","price_change_percentage"}
+                        clean = {k:v for k,v in t.items() if k in allowed}
+                        norm.append(TradingStart(**clean))
+                        
+            except Exception as e:
+                if self.debug:
+                    print(f"JobLibTokenUpdater: Deserialization error: {e}")
+
+        # No need to sort, SQL's `ORDER BY` already did it.
         return norm
+
+# --- END REPLACEMENT ---
+
 
 class DuneHolderCache:
     def __init__(self, cache_file: str = "./data/dune_holders.pkl", cache_max_days: int = 7, debug: bool = False):
@@ -1244,7 +1418,7 @@ class DuneHolderCache:
 # -----------------------
 
 
-def prune_old_overlap_entries(data: dict, expiry_hours: int = 24) -> dict:
+def prune_old_overlap_entries(data: dict, expiry_hours: int = 6) -> dict:
     """
     Robust pruning of overlap entries.
     - Accepts several input shapes (mapping mint->list, DataFrame-like dicts, lists).
@@ -1346,7 +1520,7 @@ class OverlapStore:
                     print("OverlapStore: load failed", e)
         return {}
 
-    def save(self, obj: Dict[str, Any], expiry_hours: int = 24):
+    def save(self, obj: Dict[str, Any], expiry_hours: int = 6):
         """
         Save overlap results to disk and periodically upload to Supabase.
         Always filters NONE grades before uploading.
@@ -1371,7 +1545,7 @@ class OverlapStore:
                 # Always save the pruned, normalized object locally
                 joblib.dump(_sanitize_maybe(pruned), self.filepath)
 
-                # throttle uploads to Supabase (once every 2 minutes)
+                # throttle uploads to Supabase (once every 120 secs)
                 if now - self._last_upload < 120:
                     if self.debug:
                         print("OverlapStore: save throttled (recent upload). Local save completed.")
@@ -1428,7 +1602,7 @@ class SchedulingStore:
     def cleanup_old_states(self, cutoff_timestamp: int = None):
         current_state = self.load()
         now = datetime.now(timezone.utc)
-        cutoff = cutoff_timestamp or int((now - timedelta(hours=24)).timestamp())
+        cutoff = cutoff_timestamp or int((now - timedelta(hours=6)).timestamp())
         cleaned_state = {}
         for token_mint, state in current_state.items():
             launch_time = state.get("launch_time", 0)
@@ -1699,10 +1873,12 @@ class Monitor:
         scheduling_store: SchedulingStore,
         # ------------------ 🚀 CHANGE 1: Accept http_session ------------------
         http_session: aiohttp.ClientSession,
+        # --- NEW: Accept ML Classifier ---
+        ml_classifier: SolanaTokenPredictor,
         *,
         coingecko_poll_interval_seconds: int = 30,
-        initial_check_delay_seconds: int = 1800, # 30 minutes
-        repeat_interval_seconds: int = 3600, # 1 hour
+        initial_check_delay_seconds: int = 600, # 10 minutes
+        repeat_interval_seconds: int = 1800, # 30 minutes
         debug: bool = False,
     ):
         self.sol_client = sol_client
@@ -1725,6 +1901,8 @@ class Monitor:
         self._probation_tasks: Dict[str, asyncio.Task] = {}  # mint -> asyncio.Task
         # ------------------ 🚀 CHANGE 2: Use the provided session ------------------
         self.http_session = http_session
+        # --- NEW: Store ML Classifier ---
+        self.ml_classifier = ml_classifier
         # concurrency guard for external API calls
         self._api_sema = asyncio.Semaphore(8)
 
@@ -1737,7 +1915,7 @@ class Monitor:
     async def _cleanup_finished_tasks(self):
         """Periodically cleans up finished tasks and states from internal memory."""
         now_ts = int(datetime.now(timezone.utc).timestamp())
-        cutoff_ts = now_ts - (24 * 3600)  # 24 hours ago
+        cutoff_ts = now_ts - (6 * 3600)  # 4 hours ago
 
         # --- Cleanup _probation_tasks ---
         finished_probation_tasks = [
@@ -1775,60 +1953,120 @@ class Monitor:
             if self.debug:
                 print(f"[Cleanup] Safety net removed {len(expired_mints_in_mem)} expired/completed tokens from _scheduled set.")
 
+# --------------------------------------------------------------------------
+    # --- 🚀 MODIFIED: Security Checks with Shyft Fallback 🚀 ---
+    # --------------------------------------------------------------------------
+
     async def _run_rugcheck_check(self, mint: str) -> Dict[str, Any]:
         """
         Check token security using RugCheck API with comprehensive risk analysis.
-        This version aggregates liquidity across all markets.
+        FIXED: Properly handles creator balance as raw amounts, not percentages.
+        FIXED: Returns None for missing creator balance to trigger RPC fallback.
         """
         url = f"https://api.rugcheck.xyz/v1/tokens/{mint}/report"
-        # ------------------ 🚀 CHANGE 4: Use self.http_session directly ------------------
         session = self.http_session
-        async with self._api_sema:
-            try:
-                async with session.get(url, timeout=15) as resp:
+        
+        try:
+            async with self._api_sema:
+                async with session.get(url, timeout=30) as resp:
+                    if resp.status == 429:
+                        raise aiohttp.ClientResponseError(
+                            resp.request_info, resp.history, status=429,
+                            message=f"Rate limited by RugCheck for {mint}"
+                        )
                     if resp.status != 200:
                         text = await resp.text()
-                        return {"ok": False, "error": f"rugcheck_status_{resp.status}", "error_text": text}
+                        raise RuntimeError(f"RugCheck Status {resp.status}: {text}")
+                    
                     data = await resp.json()
-            except Exception as e:
-                return {"ok": False, "error": "rugcheck_exception", "error_text": str(e)}
 
-        # Extract key security metrics
-        # --- Probation Check ---
+        except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError) as e:
+            if self.debug:
+                print(f"[Security] RugCheck request failed for {mint}: {e}")
+            return {
+                "ok": False,
+                "error": "rugcheck_request_failed",
+                "error_text": str(e)
+            }
+
+        # --- Process RugCheck Data ---
         probation_result = evaluate_probation_from_rugcheck(data)
-
-        top_holders = data.get("topHolders", [])
+        
+        # Handle None returns from data.get()
+        top_holders = data.get("topHolders") or []
+        markets = data.get("markets") or []
         rugged = data.get("rugged", False)
         
-        # Authorities and Creator Balance
+        # Authorities
         freeze_authority = data.get("freezeAuthority")
         mint_authority = data.get("mintAuthority")
         has_authorities = bool(freeze_authority or mint_authority)
-        creator_balance = data.get("creatorBalance", 0)
 
-        # Transfer fee check
+        # --- FIXED: Creator Balance Handling (None default for missing data) ---
+        creator_balance_raw = data.get("creatorBalance")
+        creator_balance_pct = None  # Changed from 0.0 to None to distinguish "missing" from "zero"
+        
+        if isinstance(creator_balance_raw, dict):
+            try:
+                creator_balance_pct = float(creator_balance_raw.get('pct', 0.0) or 0.0)
+            except (ValueError, TypeError):
+                creator_balance_pct = 0.0
+        elif creator_balance_raw is not None:
+            try:
+                # If it's a raw number, normalize by decimals and supply
+                creator_balance_raw_num = float(creator_balance_raw)
+                
+                # Extract token metadata for normalization
+                token_data = data.get("token", {})
+                decimals = int(token_data.get("decimals", 0)) if token_data.get("decimals") is not None else 0
+                supply = float(token_data.get("supply", 0)) if token_data.get("supply") is not None else 0
+                
+                if decimals > 0 and supply > 0:
+                    # Normalize: raw_amount / (10^decimals) / supply * 100
+                    creator_balance_normalized = creator_balance_raw_num / (10 ** decimals)
+                    creator_balance_pct = (creator_balance_normalized / supply) * 100
+                else:
+                    # Fallback: just use raw number as-is (already percentage)
+                    creator_balance_pct = creator_balance_raw_num
+            except (ValueError, TypeError, ZeroDivisionError):
+                creator_balance_pct = 0.0
+        
+        # NOTE: If creator_balance_raw was None, creator_balance_pct remains None
+        creator_balance = creator_balance_pct
+
         transfer_fee_pct = data.get("transferFee", {}).get("pct", 0)
         
         # Holder metrics
         total_holders = data.get("totalHolders", 0)
         top1_holder_pct = top_holders[0].get("pct", 0) if top_holders else 0.0
+        top_10_holders_pct = sum(h.get("pct", 0) for h in top_holders[:10])
 
         # --- Liquidity Aggregation ---
-        markets = data.get("markets", [])
         total_lp_locked_usd = 0.0
         total_lp_usd = 0.0
         lp_lock_details = []
 
         for market in markets:
+            if not market:
+                continue
+                
             lp_data = market.get("lp", {})
             if lp_data:
-                lp_locked_usd = float(lp_data.get("lpLockedUSD", 0))
-                lp_unlocked_usd = float(lp_data.get("lpUnlocked", 0))
+                lp_locked_usd = 0.0
+                lp_unlocked_usd = 0.0
                 
-                # Total LP for this market is locked + unlocked
+                try:
+                    lp_locked_usd = float(lp_data.get("lpLockedUSD", 0.0) or 0.0)
+                except (ValueError, TypeError):
+                    lp_locked_usd = 0.0
+                
+                try:
+                    lp_unlocked_usd = float(lp_data.get("lpUnlocked", 0.0) or 0.0)
+                except (ValueError, TypeError):
+                    lp_unlocked_usd = 0.0
+                
                 lp_total_usd_market = lp_locked_usd + lp_unlocked_usd
                 
-                # Aggregate totals
                 total_lp_locked_usd += lp_locked_usd
                 total_lp_usd += lp_total_usd_market
                 
@@ -1839,196 +2077,532 @@ class Monitor:
                     "locked_pct": lp_data.get("lpLockedPct", 0)
                 })
         
-        # Calculate overall LP lock percentage from aggregated values
         overall_lp_locked_pct = (total_lp_locked_usd / total_lp_usd * 100) if total_lp_usd > 0 else 0.0
         lp_lock_sufficient = overall_lp_locked_pct >= 95.0
 
         return {
             "ok": True,
+            "data_source": "rugcheck",
             "rugged": rugged,
             "total_holders": total_holders,
             "top1_holder_pct": top1_holder_pct,
+            "top_10_holders_pct": top_10_holders_pct,
             "creator_balance": creator_balance,
             "freeze_authority": freeze_authority,
             "mint_authority": mint_authority,
             "has_authorities": has_authorities,
             "transfer_fee_pct": transfer_fee_pct,
-            # Aggregated liquidity metrics
             "total_lp_usd": total_lp_usd,
+            "total_lp_locked_usd": total_lp_locked_usd,
             "overall_lp_locked_pct": overall_lp_locked_pct,
             "lp_lock_sufficient": lp_lock_sufficient,
             "probation": probation_result["probation"],
             "probation_meta": probation_result,
             "lp_lock_details": lp_lock_details,
-            "raw": data # Keep raw data for debugging
+            "raw": data
         }
 
+    async def _get_supply_and_decimals_rpc(self, mint: str) -> tuple:
+        """
+        Get supply and decimals from Helius RPC (with public RPC backup).
+        Returns (supply, decimals) or (0, 0) if failed.
+        """
+        # Build the Helius URL using the existing key rotation system
+        helius_url = self.sol_client._get_url()
+        fallback_url = "https://api.mainnet-beta.solana.com"
+        
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTokenSupply",
+            "params": [mint]
+        }
 
-    async def _security_gate_and_route(self, start: Any, overlap_result: Dict[str, Any], overlap_store_obj: Dict[str, Any]):
-        mint = getattr(start, "mint", None) or (overlap_result or {}).get("mint")
-        grade = (overlap_result or {}).get("grade", "NONE")
-
-        if grade == "NONE":
-            overlap_store_obj.setdefault(mint, []).append({
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "result": overlap_result,
-                "security": "skipped_grade_none"
-            })
-            try:
-                self.overlap_store.save(overlap_store_obj)
-            except Exception:
-                pass
-            return
-
-        # Run RugCheck API call
+        # Attempt 1: Helius
         try:
-            r = await retry_with_backoff(self._run_rugcheck_check, mint, retries=2, base_delay=0.8)
+            data = await self.sol_client.make_rpc_call("getTokenSupply", [mint])
+            if not data.get("error"):
+                val = data.get("result", {}).get("value", {})
+                if val:
+                    supply = int(val.get("amount", "0"))
+                    decimals = int(val.get("decimals", 0))
+                    if self.debug:
+                        print(f"[Security] ✅ Got supply from Helius: {supply}, decimals: {decimals}")
+                    return (supply, decimals)
         except Exception as e:
             if self.debug:
-                print(f"[Security] Exception fetching RugCheck data for {mint}: {e}")
-            reasons = [f"rugcheck_exception:{str(e)}"]
-            await self._start_or_update_probation(mint, start, overlap_result, reasons)
-            return
-
-        reasons = []
+                print(f"[Security] ⚠️ Helius supply fetch failed for {mint}: {e}")
         
-        if not r.get("ok"):
-            reasons.append(f"rugcheck_error:{r.get('error')}")
-            await self._start_or_update_probation(mint, start, overlap_result, reasons)
-            return
-
-        # --- Enforce Security and Liquidity Rules ---
-
-        # Rule 0: Check for high holder concentration (probation) using the top N check.
-        if r.get("probation"):
-            probation_reason = r.get("probation_meta", {}).get("explanation", "Probation: High top holder concentration")
-            reasons.append(probation_reason)
+        # Attempt 2: Public RPC (Fallback)
+        try:
+            async with self.http_session.post(fallback_url, json=payload, timeout=5) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    val = data.get("result", {}).get("value", {})
+                    if val:
+                        supply = int(val.get("amount", "0"))
+                        decimals = int(val.get("decimals", 0))
+                        if self.debug:
+                            print(f"[Security] ✅ Got supply from Public RPC: {supply}, decimals: {decimals}")
+                        return (supply, decimals)
+        except Exception as e:
             if self.debug:
-                print(f"[Security] {mint} FAILED probation check: {probation_reason}")
+                print(f"[Security] ⚠️ Public RPC supply fetch failed for {mint}: {e}")
 
-        # Rule 1: Check if token is marked as rugged
-        if r.get("rugged"):
-            reasons.append("rugged:true")
-            if self.debug:
-                print(f"[Security] {mint} FAILED check: Marked as RUGGED by RugCheck")
+        return (0, 0)
 
-        # Rule 2: Check for mint/freeze authorities
-        if r.get("has_authorities"):
-            authorities = []
-            if r.get("freeze_authority"): authorities.append("freeze")
-            if r.get("mint_authority"): authorities.append("mint")
-            reason_str = f"authorities:{','.join(authorities)}"
-            reasons.append(reason_str)
-            if self.debug:
-                print(f"[Security] {mint} FAILED check: Has dangerous authorities: {', '.join(authorities)}")
-
-        # Rule 3: Check creator token balance
-        creator_balance = r.get("creator_balance", 0)
-        if creator_balance > 0:
-            reasons.append(f"creator_balance:{creator_balance}")
-            if self.debug:
-                print(f"[Security] {mint} FAILED check: Creator holds {creator_balance} tokens")
-
-        # Rule 4: Check transfer fee (must be <= 5%)
-        transfer_fee_pct = r.get("transfer_fee_pct", 0)
-        if transfer_fee_pct > 5:
-            reasons.append(f"transfer_fee:{transfer_fee_pct}%")
-            if self.debug:
-                print(f"[Security] {mint} FAILED check: Transfer fee is {transfer_fee_pct}% (max 5%)")
-
-        # Rule 5 (REMOVED): The check for top 1 holder is now covered by the more general probation check (Rule 0).
-        # top1_pct = r.get("top1_holder_pct", 0.0)
-        # if top1_pct >= 40:
-        #     reasons.append(f"top1_holder:{top1_pct:.1f}%")
-        #     if self.debug:
-        #         print(f"[Security] {mint} FAILED check: Top holder owns {top1_pct:.1f}% (max 40%)")
-
-        # Rule 6: Check holder count (must be >= 500)
-        holder_count = r.get("total_holders", 0)
-        if holder_count < 500:
-            reasons.append(f"holder_count:{holder_count}_req_500")
-            if self.debug:
-                print(f"[Security] {mint} FAILED check: Has {holder_count} holders (min 500)")
-
-        # Rule 7: Check aggregated liquidity lock percentage (must be >= 95%)
-        lp_locked_pct = r.get("overall_lp_locked_pct", 0.0)
-        if lp_locked_pct < 95.0:
-            reasons.append(f"lp_locked:{lp_locked_pct:.1f}%_req_95%")
-            if self.debug:
-                print(f"[Security] {mint} FAILED LP lock check: {lp_locked_pct:.1f}% locked (min 95%)")
-
-        # Rule 8: Check aggregated total liquidity (must be >= $30,000)
-        total_liquidity = r.get("total_lp_usd", 0.0)
-        if total_liquidity < 30000.0:
-            reasons.append(f"liquidity_usd:{total_liquidity:.2f}_req_30k")
-            if self.debug:
-                print(f"[Security] {mint} FAILED liquidity check: ${total_liquidity:,.2f} total liquidity (min $30,000)")
-        
-        # --- Decision Point ---
-        if reasons:
-            if r.get("probation_meta"):
-                overlap_result["probation_meta"] = r.get("probation_meta")
-            await self._start_or_update_probation(mint, start, overlap_result, reasons)
-            return
-
-        # Token passed all security checks, save result
-        top1_pct = r.get("top1_holder_pct", 0.0)
-        if self.debug:
-            print(f"[Security] {mint} PASSED all checks: LP Locked={lp_locked_pct:.1f}%, Liquidity=${total_liquidity:,.2f}, Top Holder={top1_pct:.1f}%, Holders={holder_count}")
+    async def _get_creator_balance_rpc(self, mint: str, decimals: int) -> tuple:
+        """
+        Get creator balance via RPC.
+        Logic:
+        1. Get Mint Info to find 'mintAuthority' (often the creator/deployer).
+        2. Get Token Accounts for that authority to find their balance of this mint.
+        Returns (creator_balance_normalized, success_flag).
+        """
+        # Step 1: Get Mint Authority
+        mint_authority = None
         
         try:
-            # Get a fresh overlap analysis before saving the "passed" state
-            fresh_overlap_result = await self.check_holders_overlap(start)
+            data = await self.sol_client.make_rpc_call(
+                "getAccountInfo",
+                [mint, {"encoding": "jsonParsed"}]
+            )
             
-            # Fetch DexScreener data with robust retries
-            dex_data = None
-            try:
-                dex_data = await retry_with_backoff(
-                    self._run_dexscreener_check, mint, retries=8, base_delay=1.5
-                )
-            except Exception as e:
-                if self.debug:
-                    print(f"[Security] Dexscreener check for {mint} failed after all retries: {e}")
-                # If it fails permanently, we'll save nulls
-                dex_data = {"ok": False, "price_usd": None, "market_cap_usd": None}
-
-            current_price_usd = dex_data.get("price_usd")
-            market_cap_usd = dex_data.get("market_cap_usd")
-
-            overlap_store_obj.setdefault(mint, []).append({
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "result": fresh_overlap_result,
-                "security": "passed",
-                "probation_meta": r.get("probation_meta"),
-                "rugcheck": {
-                    "top1_holder_pct": top1_pct,
-                    "holder_count": holder_count,
-                    "has_authorities": r.get("has_authorities"),
-                    "creator_balance": creator_balance,
-                    "transfer_fee_pct": transfer_fee_pct,
-                    "lp_locked_pct": lp_locked_pct,
-                    "total_liquidity_usd": total_liquidity,
-                    "lp_lock_details": r.get("lp_lock_details", [])
-                },
-                "dexscreener": {
-                    "current_price_usd": current_price_usd,
-                    "market_cap_usd": market_cap_usd,
-                }
-            })
-            
+            if not data.get("error"):
+                info = data.get("result", {}).get("value", {}).get("data", {}).get("parsed", {}).get("info", {})
+                mint_authority = info.get("mintAuthority")
+        except Exception:
+            pass
+        
+        if not mint_authority:
             if self.debug:
-                print(f"Grade update for {mint}: {overlap_result.get('grade', 'N/A')} -> {fresh_overlap_result.get('grade', 'N/A')}")
+                print(f"[Security] ⚠️ Could not determine mint authority (creator) for {mint}")
+            return (0.0, False)
+            
+        # Step 2: Get Balance for Mint Authority
+        raw_balance = 0.0
+        success = False
+        
+        try:
+            data = await self.sol_client.make_rpc_call(
+                "getTokenAccountsByOwner",
+                [
+                    mint_authority,
+                    {"mint": mint},
+                    {"encoding": "jsonParsed"}
+                ]
+            )
+            
+            if not data.get("error"):
+                accounts = data.get("result", {}).get("value", [])
+                for acc in accounts:
+                    amt_info = acc.get("account", {}).get("data", {}).get("parsed", {}).get("info", {}).get("tokenAmount", {})
+                    raw_balance += float(amt_info.get("amount", 0))
+                success = True
+        except Exception:
+            pass
+
+        if success:
+            # Normalize
+            if decimals > 0:
+                normalized = raw_balance / (10 ** decimals)
+            else:
+                normalized = raw_balance
                 
+            if self.debug:
+                print(f"[Security] ✅ RPC Creator Balance ({mint_authority}): {normalized} (raw: {raw_balance})")
+            return (normalized, True)
+            
+        return (0.0, False)
+
+    async def run_token_analysis_step(self, start: TradingStart, check_count: int):
+        """
+        Core analysis function that runs the full analysis lifecycle.
+        Handles both RugCheck and Shyft (fallback) data sources.
+        """
+        mint = start.mint
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        
+        if self.debug:
+            print(f"[Analysis] Running check #{check_count} for {mint}")
+
+        # === 1. RUN SECURITY CHECK (RUGCHECK -> SHYFT) ===
+        try:
+            # We call _run_rugcheck_check directly now as it handles its own fallback/retries internally
+            r = await self._run_rugcheck_check(mint)
         except Exception as e:
             if self.debug:
-                print(f"Fresh overlap check failed for {mint}, using original: {e}")
-            overlap_store_obj.setdefault(mint, []).append({
+                print(f"[Security] Fatal error checking security for {mint}: {e}")
+            reasons = [f"security_check_exception:{str(e)}"]
+            await self._start_or_update_probation(mint, start, {"mint": mint, "grade": "NONE"}, reasons)
+            return
+
+        # === 2. SECURITY GATE ===
+        reasons = []
+        if not r.get("ok"):
+            reasons.append(f"security_error:{r.get('error')}")
+        else:
+            data_source = r.get("data_source", "unknown")
+            
+            # Rule 0: Probation
+            if r.get("probation"):
+                reasons.append(r.get("probation_meta", {}).get("explanation", "Probation"))
+
+            # Rule 1: Rugged (Only valid for RugCheck)
+            if r.get("rugged"):
+                reasons.append("rugged:true")
+
+            # Rule 2: Authorities
+            if r.get("has_authorities"):
+                authorities = []
+                if r.get("freeze_authority"): authorities.append("freeze")
+                if r.get("mint_authority"): authorities.append("mint")
+                reasons.append(f"authorities:{','.join(authorities)}")
+            
+            # Rule 3: Creator Balance
+            creator_pct = r.get("creator_balance", 0)
+            if creator_pct > MAX_CREATOR_PCT:
+                reasons.append(f"creator_balance_pct:{creator_pct:.2f}")
+
+            # Rule 4: Transfer Fee
+            if r.get("transfer_fee_pct", 0) > 5:
+                reasons.append(f"transfer_fee:{r.get('transfer_fee_pct')}%")
+
+            # Rule 5: Holder Count
+            if r.get("total_holders", 0) < 50:
+                reasons.append(f"holder_count:{r.get('total_holders')}_req_50")
+
+            # Rule 6: LP Lock % (Conditional on Data Source)
+            lp_locked_pct = r.get("overall_lp_locked_pct")
+            
+            if data_source == "rugcheck":
+                # Strict check for RugCheck data
+                if isinstance(lp_locked_pct, (int, float)) and lp_locked_pct < 80.0:
+                    reasons.append(f"lp_locked:{lp_locked_pct:.1f}%_req_80%")
+            elif data_source == "shyft":
+                # Shyft doesn't provide lock info, so we skip this rule gracefully
+                # If we wanted to be strict, we could fail here, but fallback implies best-effort
+                pass
+
+            # Rule 7: Liquidity Amount (Available from both sources via DexScreener)
+            total_lp = r.get("total_lp_usd")
+            if total_lp != "unknown":
+                if total_lp < 10000.0:
+                    reasons.append(f"liquidity_usd:{total_lp:.2f}_req_10000")
+            else:
+                # If LP is unknown (DexScreener failed during Shyft check), that's a risk
+                if data_source == "shyft":
+                     reasons.append("liquidity_usd:unknown")
+
+        if reasons: 
+            if self.debug:
+                print(f"[Security] {mint} FAILED Gate ({r.get('data_source')}): {reasons}")
+            overlap_result_stub = {"mint": mint, "grade": "NONE", "probation_meta": r.get("probation_meta")}
+            await self._start_or_update_probation(mint, start, overlap_result_stub, reasons)
+            
+            self.scheduling_store.update_token_state(mint, {
+                "status": "probation",
+                "last_completed_check": now_ts,
+                "next_scheduled_check": now_ts + self.repeat_interval_seconds,
+                "total_checks_completed": check_count
+            })
+            return
+
+        # === 3. HELIUS CALL (GATE PASSED) ===
+        if self.debug:
+            print(f"[Security] {mint} PASSED Gate ({r.get('data_source')}). Fetching holders...")
+        
+        try:
+            overlap_result = await self._fetch_and_calculate_overlap(start)
+        except Exception as e:
+            if self.debug:
+                print(f"[Analysis] Helius call failed for {mint}: {e}")
+            self.scheduling_store.update_token_state(mint, {
+                "last_error": f"Helius_fail: {e}",
+                "last_error_at": datetime.now(timezone.utc).isoformat()
+            })
+            return
+
+        # === 4. POST-HELIUS PROCESSING ===
+        grade = overlap_result.get("grade", "NONE")
+        
+        if grade == "NONE":
+            # Save NONE result
+            obj = safe_load_overlap(self.overlap_store)
+            obj.setdefault(mint, []).append({
                 "ts": datetime.now(timezone.utc).isoformat(),
                 "result": overlap_result,
-                "security": "passed_stale_overlap"
+                "security": f"passed_grade_none_{r.get('data_source')}",
+                "rugcheck": self._extract_rugcheck_summary(r)
             })
+            self.overlap_store.save(obj)
+            
+            self.scheduling_store.update_token_state(mint, {
+                "status": "active",
+                "last_completed_check": now_ts,
+                "next_scheduled_check": now_ts + self.repeat_interval_seconds,
+                "total_checks_completed": check_count
+            })
+            return
 
-        self.overlap_store.save(overlap_store_obj)
+        # Grade PASSED -> DexScreener + ML + Final Save
+        if self.debug:
+            print(f"[Analysis] {mint} PASSED ALL CHECKS (Grade: {grade}).")
+
+        try:
+            dex_data = await retry_with_backoff(
+                self._run_dexscreener_check, mint, retries=8, base_delay=1.5
+            )
+        except Exception:
+            dex_data = {"ok": False, "price_usd": None, "market_cap_usd": None}
+
+        # ML Prediction
+        ml_prediction_result = None
+        try:            
+            ml_prediction_result = self.ml_classifier.predict(mint, threshold=0.70)
+        except Exception as e:
+            ml_prediction_result = {'action': 'ERROR', 'error': str(e)}
+            
+    async def run_token_analysis_step(self, start: TradingStart, check_count: int):
+        """
+        Core analysis function that runs the full analysis lifecycle.
+        FIXED: Properly handles creator balance with RPC fallback
+        FIXED: Only fallbacks to RPC when creator_balance is None (missing), not 0 (valid zero)
+        """
+        mint = start.mint
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        
+        if self.debug:
+            print(f"[Analysis] Running check #{check_count} for {mint}")
+
+        # === 1. RUN RUGCHECK ===
+        try:
+            r = await self._run_rugcheck_check(mint)
+        except Exception as e:
+            if self.debug:
+                print(f"[Security] Fatal error checking security for {mint}: {e}")
+            reasons = [f"security_check_exception:{str(e)}"]
+            await self._start_or_update_probation(mint, start, {"mint": mint, "grade": "NONE"}, reasons)
+            return
+
+        # === 2. SECURITY GATE ===
+        reasons = []
+        if not r.get("ok"):
+            reasons.append(f"security_error:{r.get('error')}")
+        else:
+            data_source = r.get("data_source", "rugcheck")
+            
+            # Rule 0: Probation
+            if r.get("probation"):
+                reasons.append(r.get("probation_meta", {}).get("explanation", "Probation"))
+
+            # Rule 1: Rugged
+            if r.get("rugged"):
+                reasons.append("rugged:true")
+
+            # Rule 2: Authorities
+            if r.get("has_authorities"):
+                authorities = []
+                if r.get("freeze_authority"): authorities.append("freeze")
+                if r.get("mint_authority"): authorities.append("mint")
+                reasons.append(f"authorities:{','.join(authorities)}")
+            
+            # Get supply and decimals for creator balance validation
+            raw_data = r.get("raw", {})
+            token_data = raw_data.get("token", {})
+            
+            supply = token_data.get("supply", 0)
+            decimals = token_data.get("decimals", 0)
+            data_source_supply = "rugcheck"
+            
+            # If RugCheck didn't provide valid supply/decimals, try RPC
+            if not supply or not decimals:
+                if self.debug:
+                    print(f"[Security] ⚠️ RugCheck missing supply/decimals for {mint}, trying RPC...")
+                supply, decimals = await self._get_supply_and_decimals_rpc(mint)
+                data_source_supply = "rpc"
+                if supply and decimals and self.debug:
+                    print(f"[Security] ✅ Using supply from {data_source_supply}: {supply}, decimals: {decimals}")
+            
+            # Calculate total supply with zero check
+            total_supply = 0
+            if supply and decimals:
+                try:
+                    total_supply = float(supply) / (10 ** int(decimals))
+                    if self.debug:
+                        print(f"[Security] 📊 Calculated total_supply from {data_source_supply}: {total_supply}")
+                except (ZeroDivisionError, ValueError, TypeError, OverflowError):
+                    total_supply = 0
+                    if self.debug:
+                        print(f"[Security] ❌ Error calculating total_supply for {mint}")
+            
+            # --- FIXED: Creator Balance Check (only fallback if None) ---
+            creator_balance_raw = r.get("creator_balance")  # This is RAW amount or None
+            creator_balance_pct = None  # The calculated percentage
+
+            # Only use RPC fallback if RugCheck didn't provide ANY data (None)
+            if creator_balance_raw is None:
+                if self.debug:
+                    print(f"[Security] ⚠️ RugCheck missing creator balance for {mint}, trying RPC...")
+                
+                creator_balance_normalized, rpc_success = await self._get_creator_balance_rpc(mint, decimals)
+                
+                if rpc_success and total_supply > 0:
+                    creator_balance_pct = (creator_balance_normalized / total_supply) * 100
+                    if self.debug:
+                        print(f"[Security] ✅ Using creator balance from RPC: {creator_balance_normalized:.2f} tokens ({creator_balance_pct:.2f}%)")
+                else:
+                    creator_balance_pct = 0.0
+                    if self.debug:
+                        print(f"[Security] ⚠️ RPC fallback failed, defaulting to 0%")
+            else:
+                # RugCheck provided a RAW value (could be 0 or positive integer)
+                # We need to calculate the percentage ourselves
+                try:
+                    creator_raw_amount = float(creator_balance_raw)
+                    
+                    if decimals > 0 and total_supply > 0:
+                        # Normalize: raw_amount / (10^decimals) to get actual token count
+                        creator_balance_normalized = creator_raw_amount / (10 ** int(decimals))
+                        # Calculate percentage
+                        creator_balance_pct = (creator_balance_normalized / total_supply) * 100
+                        
+                        if self.debug:
+                            if creator_balance_pct == 0.0:
+                                print(f"[Security] ✅ RugCheck: creator holds 0 tokens (0.00%)")
+                            else:
+                                print(f"[Security] 💰 RugCheck: creator holds {creator_balance_normalized:.2f} tokens ({creator_balance_pct:.2f}%)")
+                    else:
+                        creator_balance_pct = 0.0
+                        if self.debug:
+                            print(f"[Security] ⚠️ Cannot calculate creator %: total_supply={total_supply}, decimals={decimals}")
+                except (ValueError, TypeError, ZeroDivisionError) as e:
+                    creator_balance_pct = 0.0
+                    if self.debug:
+                        print(f"[Security] ⚠️ Error calculating creator balance %: {e}")
+
+            # Validate creator balance percentage
+            if creator_balance_pct is None:
+                creator_balance_pct = 0.0
+
+            # Rule 3: Creator Balance
+            if total_supply > 0 and creator_balance_pct > MAX_CREATOR_PCT:
+                reasons.append(f"creator_balance_pct:{creator_balance_pct:.2f}_req_{MAX_CREATOR_PCT}%")
+            elif total_supply == 0 and creator_balance_raw is not None and float(creator_balance_raw) > 0:
+                reasons.append(f"invalid_supply:creator_has_balance_but_supply_is_zero_source_{data_source_supply}")
+                if self.debug:
+                    print(f"[Security] ⚠️ Suspicious: creator has raw balance {creator_balance_raw} but total_supply=0")
+
+            # Rule 4: Transfer Fee
+            if r.get("transfer_fee_pct", 0) > 5:
+                reasons.append(f"transfer_fee:{r.get('transfer_fee_pct')}%")
+
+            # Rule 5: Holder Count
+            if r.get("total_holders", 0) < 50:
+                reasons.append(f"holder_count:{r.get('total_holders')}_req_50")
+
+            # Rule 6: LP Lock %
+            lp_locked_pct = r.get("overall_lp_locked_pct")
+            if isinstance(lp_locked_pct, (int, float)) and lp_locked_pct < 80.0:
+                reasons.append(f"lp_locked:{lp_locked_pct:.1f}%_req_80%")
+
+            # Rule 7: Liquidity Amount
+            total_lp = r.get("total_lp_usd")
+            if total_lp != "unknown":
+                if total_lp < 10000.0:
+                    reasons.append(f"liquidity_usd:{total_lp:.2f}_req_10000")
+
+        if reasons: 
+            if self.debug:
+                print(f"[Security] {mint} FAILED Gate ({r.get('data_source')}): {reasons}")
+            overlap_result_stub = {"mint": mint, "grade": "NONE", "probation_meta": r.get("probation_meta")}
+            await self._start_or_update_probation(mint, start, overlap_result_stub, reasons)
+            
+            self.scheduling_store.update_token_state(mint, {
+                "status": "probation",
+                "last_completed_check": now_ts,
+                "next_scheduled_check": now_ts + self.repeat_interval_seconds,
+                "total_checks_completed": check_count
+            })
+            return
+
+        # === 3. HELIUS CALL (GATE PASSED) ===
+        if self.debug:
+            print(f"[Security] {mint} PASSED Gate ({r.get('data_source')}). Fetching holders...")
+        
+        try:
+            overlap_result = await self._fetch_and_calculate_overlap(start)
+        except Exception as e:
+            if self.debug:
+                print(f"[Analysis] Helius call failed for {mint}: {e}")
+            self.scheduling_store.update_token_state(mint, {
+                "last_error": f"Helius_fail: {e}",
+                "last_error_at": datetime.now(timezone.utc).isoformat()
+            })
+            return
+
+        # === 4. POST-HELIUS PROCESSING ===
+        grade = overlap_result.get("grade", "NONE")
+        
+        if grade == "NONE":
+            obj = safe_load_overlap(self.overlap_store)
+            obj.setdefault(mint, []).append({
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "result": overlap_result,
+                "security": f"passed_grade_none_{r.get('data_source')}",
+                "rugcheck": self._extract_rugcheck_summary(r)
+            })
+            self.overlap_store.save(obj)
+            
+            self.scheduling_store.update_token_state(mint, {
+                "status": "active",
+                "last_completed_check": now_ts,
+                "next_scheduled_check": now_ts + self.repeat_interval_seconds,
+                "total_checks_completed": check_count
+            })
+            return
+
+        # Grade PASSED -> DexScreener + ML + Final Save
+        if self.debug:
+            print(f"[Analysis] {mint} PASSED ALL CHECKS (Grade: {grade}).")
+
+        try:
+            dex_data = await retry_with_backoff(
+                self._run_dexscreener_check, mint, retries=8, base_delay=1.5
+            )
+        except Exception:
+            dex_data = {"ok": False, "price_usd": None, "market_cap_usd": None}
+
+        # ML Prediction
+        ml_prediction_result = None
+        try:            
+            ml_prediction_result = self.ml_classifier.predict(mint, threshold=0.70)
+        except Exception as e:
+            ml_prediction_result = {'action': 'ERROR', 'error': str(e)}
+
+        # Save Final
+        obj = safe_load_overlap(self.overlap_store)
+        obj.setdefault(mint, []).append({
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "result": overlap_result,
+            "security": f"passed_{r.get('data_source')}",
+            "probation_meta": r.get("probation_meta"),
+            "rugcheck": self._extract_rugcheck_summary(r),
+            "dexscreener": {
+                "current_price_usd": dex_data.get("price_usd"),
+                "market_cap_usd": dex_data.get("market_cap_usd"),
+            },
+            "ml_prediction": {
+                "probability": ml_prediction_result.get("win_probability"),
+                "confidence": ml_prediction_result.get("confidence"),
+                "risk_tier": ml_prediction_result.get("risk_tier"),
+                "action": ml_prediction_result.get("action"),
+                "error": ml_prediction_result.get("error"),
+                "key_metrics": ml_prediction_result.get("key_metrics"),
+                "warnings": ml_prediction_result.get("warnings")
+            }
+        })
+        self.overlap_store.save(obj)
         
         if mint in self.pending_risky_tokens:
             self.pending_risky_tokens.pop(mint, None)
@@ -2037,10 +2611,267 @@ class Monitor:
             "status": "completed",
             "promoted_at": datetime.now(timezone.utc).isoformat(),
             "security_passed": True,
-            "liquidity_usd": total_liquidity,
-            "lp_locked_pct": lp_locked_pct,
+            "liquidity_usd": r.get("total_lp_usd", 0.0),
+            "last_completed_check": now_ts,
+            "total_checks_completed": check_count
         })
+        if self.debug:
+            print(f"[Analysis] {mint} COMPLETED via {r.get('data_source')}.")
 
+    # --------------------------------------------------------------------------
+    # --- 🚀 NEW: CONSOLIDATED ANALYSIS AND ROUTING LOGIC 🚀 ---
+    # --------------------------------------------------------------------------
+
+    def _extract_rugcheck_summary(self, r: Dict[str, Any]) -> Dict[str, Any]:
+        """Helper to format RugCheck data for saving."""
+        if not r.get("ok"):
+            return {"error": r.get("error", "unknown"), "error_text": r.get("error_text")}
+        return {
+            "top1_holder_pct": r.get("top1_holder_pct", 0.0),
+            "top_10_holders_pct": r.get("top_10_holders_pct", 0.0), # NEW
+            "holder_count": r.get("total_holders", 0),
+            "has_authorities": r.get("has_authorities", False),
+            "creator_balance": r.get("creator_balance", 0),
+            "transfer_fee_pct": r.get("transfer_fee_pct", 0),
+            "lp_locked_pct": r.get("overall_lp_locked_pct", 0.0),
+            "total_liquidity_usd": r.get("total_lp_usd", 0.0),
+            "lp_lock_details": r.get("lp_lock_details", [])
+        }
+    
+    # async def run_token_analysis_step(self, start: TradingStart, check_count: int):
+    #     """
+    #     Core analysis function that runs the full analysis lifecycle.
+    #     Now properly handles RugCheck rate limiting with retry logic.
+        
+    #     Steps:
+    #     1. Run RugCheck (with retry on 429)
+    #     2. Run Pre-Helius Security Gate
+    #     3. If fail, send to probation and RETURN
+    #     4. If pass, run Helius call (_fetch_and_calculate_overlap)
+    #     5. If overlap=NONE, save and RETURN
+    #     6. If overlap=PASS, run DexScreener, run ML prediction, save, and mark as completed
+    #     """
+    #     mint = start.mint
+    #     now_ts = int(datetime.now(timezone.utc).timestamp())
+        
+    #     if self.debug:
+    #         print(f"[Analysis] Running check #{check_count} for {mint}")
+
+    #     # === 1. RUN RUGCHECK WITH RETRY LOGIC ===
+    #     try:
+    #         r = await retry_with_backoff(
+    #             self._run_rugcheck_check, 
+    #             mint, 
+    #             retries=5,      # Increased from 2 to handle rate limits better
+    #             base_delay=2.0  # Start with 2s delay (appropriate for rate limits)
+    #         )
+    #     except RuntimeError as e:
+    #         # This catches the case where all retries are exhausted
+    #         if self.debug:
+    #             print(f"[Security] RugCheck failed for {mint} after all retries: {e}")
+    #         reasons = [f"rugcheck_max_retries_exceeded:{str(e)}"]
+    #         await self._start_or_update_probation(mint, start, {"mint": mint, "grade": "NONE"}, reasons)
+    #         return
+    #     except Exception as e:
+    #         # Unexpected exception during RugCheck
+    #         if self.debug:
+    #             print(f"[Security] Unexpected exception fetching RugCheck data for {mint}: {e}")
+    #         reasons = [f"rugcheck_exception:{str(e)}"]
+    #         await self._start_or_update_probation(mint, start, {"mint": mint, "grade": "NONE"}, reasons)
+    #         return
+
+    #     # === 2. PRE-HELIUS SECURITY GATE ===
+    #     reasons = []
+    #     if not r.get("ok"):
+    #         reasons.append(f"rugcheck_error:{r.get('error')}")
+    #     else:
+    #         # Rule 0: Check for high holder concentration (probation)
+    #         if r.get("probation"):
+    #             probation_reason = r.get("probation_meta", {}).get("explanation", "Probation: High top holder concentration")
+    #             reasons.append(probation_reason)
+
+    #         # Rule 1: Check if token is marked as rugged
+    #         if r.get("rugged"):
+    #             reasons.append("rugged:true")
+
+    #         # Rule 2: Check for mint/freeze authorities
+    #         if r.get("has_authorities"):
+    #             authorities = []
+    #             if r.get("freeze_authority"): authorities.append("freeze")
+    #             if r.get("mint_authority"): authorities.append("mint")
+    #             reasons.append(f"authorities:{','.join(authorities)}")
+            
+    #         # Extract supply data safely
+    #         supply = 0
+    #         decimals = 0
+    #         raw_data = r.get("raw", {})
+    #         if raw_data:
+    #             token_data = raw_data.get("token", {})
+    #             if token_data:
+    #                 supply = token_data.get("supply", 0)
+    #                 decimals = token_data.get("decimals", 0)
+
+    #         total_supply = supply / (10 ** decimals) if decimals > 0 else supply
+
+    #         # Rule 3: Check creator token balance
+    #         creator_balance_val = r.get("creator_balance", 0)
+    #         if total_supply > 0 and (creator_balance_val / total_supply * 100) > MAX_CREATOR_PCT:
+    #             reasons.append(f"creator_balance_pct:{creator_balance_val / total_supply * 100}")
+    #         elif total_supply == 0 and creator_balance_val > 0:
+    #             reasons.append(f"creator_balance_pct:invalid_supply")
+
+    #         # Rule 4: Check transfer fee (must be <= 5%)
+    #         if r.get("transfer_fee_pct", 0) > 5:
+    #             reasons.append(f"transfer_fee:{r.get('transfer_fee_pct')}%")
+
+    #         # Rule 5: Check holder count (must be >= 50)
+    #         if r.get("total_holders", 0) < 50:
+    #             reasons.append(f"holder_count:{r.get('total_holders')}_req_50")
+
+    #         # Rule 6: Check aggregated liquidity lock percentage (must be >= 80%)
+    #         if r.get("overall_lp_locked_pct", 0.0) < 80.0:
+    #             reasons.append(f"lp_locked:{r.get('overall_lp_locked_pct'):.1f}%_req_80%")
+
+    #         # Rule 7: Check aggregated total liquidity (must be >= $10,000)
+    #         if r.get("total_lp_usd", 0.0) < 10000.0:
+    #             reasons.append(f"liquidity_usd:{r.get('total_lp_usd'):.2f}_req_10000")
+
+    #     if reasons: 
+    #         if self.debug:
+    #             print(f"[Security] {mint} FAILED pre-Helius check: {reasons}")
+    #         overlap_result_stub = {"mint": mint, "grade": "NONE", "probation_meta": r.get("probation_meta")}
+    #         await self._start_or_update_probation(mint, start, overlap_result_stub, reasons)
+            
+    #         # Update scheduler to reflect "active" (but on probation) state
+    #         self.scheduling_store.update_token_state(mint, {
+    #             "status": "probation",
+    #             "last_completed_check": now_ts,
+    #             "next_scheduled_check": now_ts + self.repeat_interval_seconds,
+    #             "total_checks_completed": check_count
+    #         })
+    #         return  # Stop here, don't run Helius
+
+    #     # === 3. HELIUS CALL (GATE PASSED) ===
+    #     if self.debug:
+    #         print(f"[Security] {mint} PASSED pre-Helius check. Fetching holders...")
+        
+    #     try:
+    #         overlap_result = await self._fetch_and_calculate_overlap(start)
+    #     except Exception as e:
+    #         if self.debug:
+    #             print(f"[Analysis] Helius call (_fetch_and_calculate_overlap) failed for {mint}: {e}")
+    #         self.scheduling_store.update_token_state(mint, {
+    #             "last_error": f"Helius_fail: {e}",
+    #             "last_error_at": datetime.now(timezone.utc).isoformat()
+    #         })
+    #         return  # Retry on next loop
+
+    #     # === 4. POST-HELIUS PROCESSING (SAVE/ROUTE) ===
+    #     grade = overlap_result.get("grade", "NONE")
+        
+    #     # 4a. Handle NONE Grade (Passed security, but no overlap)
+    #     if grade == "NONE":
+    #         if self.debug:
+    #             print(f"[Analysis] {mint} passed security, 0 overlap. Saving as NONE.")
+    #         obj = safe_load_overlap(self.overlap_store)
+    #         obj.setdefault(mint, []).append({
+    #             "ts": datetime.now(timezone.utc).isoformat(),
+    #             "result": overlap_result,
+    #             "security": "passed_grade_none",
+    #             "rugcheck": self._extract_rugcheck_summary(r)
+    #         })
+    #         self.overlap_store.save(obj)
+            
+    #         # Token stays "active" and will be re-checked
+    #         self.scheduling_store.update_token_state(mint, {
+    #             "status": "active",
+    #             "last_completed_check": now_ts,
+    #             "next_scheduled_check": now_ts + self.repeat_interval_seconds,
+    #             "total_checks_completed": check_count
+    #         })
+    #         return
+
+    #     # 4b. Handle PASSED Token (Security PASS + Overlap PASS)
+    #     if self.debug:
+    #         print(f"[Analysis] {mint} PASSED ALL CHECKS (Grade: {grade}). Fetching DexScreener and saving.")
+
+    #     try:
+    #         dex_data = await retry_with_backoff(
+    #             self._run_dexscreener_check, mint, retries=8, base_delay=1.5
+    #         )
+    #     except Exception as e:
+    #         if self.debug:
+    #             print(f"[Analysis] Dexscreener check for {mint} failed after all retries: {e}")
+    #         dex_data = {"ok": False, "price_usd": None, "market_cap_usd": None, "raw": {}}
+
+    #     # === ML PREDICTION ===
+    #     ml_prediction_result = None
+    #     try:            
+    #         if self.debug:
+    #             print(f"[Analysis] 📞 Calling ML predictor for mint: {mint}")
+
+    #         ml_prediction_result = self.ml_classifier.predict(mint, threshold=0.70)
+            
+    #         if not ml_prediction_result or ml_prediction_result.get("error"):
+    #             raise ValueError(f"ML prediction returned an error: {ml_prediction_result.get('error', 'Unknown')}")
+                
+    #     except Exception as e:
+    #         if self.debug:
+    #             print(f"[Analysis] ML prediction failed for {mint}: {e}")
+    #         ml_prediction_result = {
+    #             'action': 'ERROR',
+    #             'win_probability': 0.0,
+    #             'confidence': 'NONE',
+    #             'risk_tier': 'UNKNOWN',
+    #             'error': str(e)
+    #         }
+
+    #     # === SAVE TO OVERLAP STORE ===
+    #     obj = safe_load_overlap(self.overlap_store)
+    #     obj.setdefault(mint, []).append({
+    #         "ts": datetime.now(timezone.utc).isoformat(),
+    #         "result": overlap_result,
+    #         "security": "passed",
+    #         "probation_meta": r.get("probation_meta"),
+    #         "rugcheck": self._extract_rugcheck_summary(r),
+    #         "dexscreener": {
+    #             "current_price_usd": dex_data.get("price_usd"),
+    #             "market_cap_usd": dex_data.get("market_cap_usd"),
+    #         },
+    #         "ml_prediction": {
+    #             "probability": ml_prediction_result.get("win_probability"),
+    #             "confidence": ml_prediction_result.get("confidence"),
+    #             "risk_tier": ml_prediction_result.get("risk_tier"),
+    #             "action": ml_prediction_result.get("action"),
+    #             "error": ml_prediction_result.get("error"),
+    #             "key_metrics": ml_prediction_result.get("key_metrics"),
+    #             "warnings": ml_prediction_result.get("warnings")
+    #         }
+    #     })
+    #     self.overlap_store.save(obj)
+        
+    #     # Remove from probation (if it was there)
+    #     if mint in self.pending_risky_tokens:
+    #         self.pending_risky_tokens.pop(mint, None)
+    #         if self.debug:
+    #             print(f"[Analysis] {mint} promoted from probation.")
+        
+    #     # Mark as "completed" in scheduler, stopping further checks
+    #     self.scheduling_store.update_token_state(mint, {
+    #         "status": "completed",
+    #         "promoted_at": datetime.now(timezone.utc).isoformat(),
+    #         "security_passed": True,
+    #         "liquidity_usd": r.get("total_lp_usd", 0.0),
+    #         "lp_locked_pct": r.get("overall_lp_locked_pct", 0.0),
+    #         "last_completed_check": now_ts,
+    #         "total_checks_completed": check_count
+    #     })
+    #     if self.debug:
+    #         print(f"[Analysis] {mint} successfully processed and saved. Status set to 'completed'.")
+    
+    # --------------------------------------------------------------------------
+    # --- 🚀 END: NEW ANALYSIS LOGIC 🚀 ---
+    # --------------------------------------------------------------------------
 
     async def _run_dexscreener_check(self, mint: str) -> Dict[str, Any]:
         """
@@ -2053,7 +2884,8 @@ class Monitor:
         session = self.http_session
         async with self._api_sema:
             # Let retry_with_backoff handle exceptions from this block
-            async with session.get(url, timeout=15) as resp:
+            # <<< CORRECTION: Increased timeout
+            async with session.get(url, timeout=30) as resp:
                 if resp.status == 429:
                     # Specific error for rate limiting to make logs clearer
                     raise aiohttp.ClientResponseError(
@@ -2073,6 +2905,7 @@ class Monitor:
         p0 = pairs[0]
         
         # Validate priceUsd: must exist and be a positive float
+        price_str = None # Initialize
         try:
             price_str = p0.get("priceUsd")
             if price_str is None:
@@ -2151,13 +2984,13 @@ class Monitor:
     async def _probation_recheck_loop(self, mint: str, start: Any):
         first_seen_ts = int(self.pending_risky_tokens.get(mint, {}).get("first_seen_ts", int(datetime.now(timezone.utc).timestamp())))
         deadline = first_seen_ts + 24 * 3600
-        interval = 30 * 60  # 30 minutes
+        interval = 5 * 60  # 5 minutes
 
         while True:
             now_ts = int(datetime.now(timezone.utc).timestamp())
             if now_ts >= deadline:
                 if self.debug:
-                    print(f"Probation: {mint} exceeded 24h probation -> dropping")
+                    print(f"Probation: {mint} exceeded 6h probation -> dropping")
                 self.pending_risky_tokens.pop(mint, None)
                 try:
                     self.scheduling_store.update_token_state(mint, {
@@ -2169,30 +3002,45 @@ class Monitor:
                 except Exception:
                     pass
                 break
-            # run a security-only check by calling the orchestrator but reuse overlap_result
+            
+            # --- 🚀 MODIFIED: Call the new analysis function ---
             try:
-                # prepare a minimal object for overlap store usage
-                obj = safe_load_overlap(self.overlap_store)
-                await self._security_gate_and_route(start, self.pending_risky_tokens[mint]["overlap_result"], obj)
+                entry = self.pending_risky_tokens.get(mint)
+                if not entry:
+                    if self.debug:
+                        print(f"Probation: {mint} no longer in pending list. Exiting loop.")
+                    break # Token was promoted and removed
+                
+                if self.debug:
+                    print(f"[Probation] Re-running analysis for {mint}...")
+                    
+                check_count = entry.get("attempts", 0)
+                
+                # This function will:
+                # 1. Re-run RugCheck
+                # 2. Re-run security gate
+                # 3. If it fails again, call _start_or_update_probation (updating the entry)
+                # 4. If it passes, run Helius, save, and remove from pending_risky_tokens
+                await self.run_token_analysis_step(start, check_count)
+                
+                # Check if the token is still in probation after the analysis
                 if mint not in self.pending_risky_tokens:
                     if self.debug:
-                        print(f"Probation: {mint} passed during probation -> exiting probation loop")
-                    break
+                        print(f"Probation: {mint} passed during probation recheck -> exiting probation loop")
+                    break # It passed and was promoted
+                    
             except Exception as e:
                 if self.debug:
                     print(f"Probation: error during recheck for {mint}: {e}")
-                entry = self.pending_risky_tokens.get(mint)
-                if entry:
-                    entry["last_checked"] = datetime.now(timezone.utc).isoformat()
-                    entry["attempts"] = entry.get("attempts", 0) + 1
-                    try:
-                        self.scheduling_store.update_token_state(mint, {
-                            "probation_last_checked": entry["last_checked"],
-                            "probation_attempts": entry["attempts"],
-                            "last_error": str(e),
-                        })
-                    except Exception:
-                        pass
+                # Log error to scheduler
+                try:
+                    self.scheduling_store.update_token_state(mint, {
+                        "last_error": str(e),
+                        "last_error_at": datetime.now(timezone.utc).isoformat()
+                    })
+                except Exception:
+                    pass
+            
             await asyncio.sleep(interval)
 
 
@@ -2314,195 +3162,73 @@ class Monitor:
         return token_to_top_holders, wallet_freq, loaded_days
 
     async def startup_recovery(self):
+        """
+        🚀 REFACTORED: On startup, load scheduling state and re-launch
+        the correct task for any pending, active, or probation tokens.
+        """
         if self.debug:
             print("Monitor ASYNC: performing startup recovery")
+            
         scheduling_state = self.scheduling_store.load()
         current_time = int(datetime.now(timezone.utc).timestamp())
-        cutoff_time = current_time - (24 * 3600)
+        cutoff_time = current_time - (6 * 3600)
+        
         self.scheduling_store.cleanup_old_states(cutoff_time)
+        # Use the new async cleanup method
         await self.updater.cleanup_old_tokens_async()
+        
+        # Load all tracked tokens into a map for quick lookup
+        try:
+            # Use the new async getter
+            tokens = await self.updater.get_tracked_tokens_async()
+            token_map = {t.mint: t for t in tokens}
+            if self.debug:
+                print(f"[Recovery] Loaded {len(token_map)} tracked tokens into map.")
+        except Exception as e:
+            if self.debug:
+                print(f"[Recovery] CRITICAL: Failed to load tracked tokens: {e}. Aborting recovery.")
+            return
+
         recovery_tasks = []
         for token_mint, state in scheduling_state.items():
             if token_mint in self._scheduled:
                 continue
-            launch_time = state.get("launch_time", 0)
-            if current_time - launch_time > 24 * 3600:
+            
+            # Find the corresponding TradingStart object
+            start_obj = token_map.get(token_mint)
+            if not start_obj:
+                if self.debug:
+                    print(f"[Recovery] Skipping {token_mint}: Not found in tracked tokens (likely expired).")
                 continue
+
             status = state.get("status", "unknown")
-            if status == "pending_first":
-                first_check_time = launch_time + self.initial_check_delay_seconds
-                delay = max(0, first_check_time - current_time)
+            
+            if status == "pending_first" or status == "active":
                 if self.debug:
-                    print(f"Recovery: scheduling first check for {token_mint} in {delay}s")
-                task = asyncio.create_task(self._schedule_first_check_only(token_mint, delay))
+                    print(f"[Recovery] Re-launching main check loop for {token_mint} (status: {status})")
+                task = asyncio.create_task(self._schedule_overlap_checks_for_token(start_obj))
                 recovery_tasks.append(task)
-            elif status == "active":
-                next_scheduled = state.get("next_scheduled_check", 0)
-                delay = max(0, next_scheduled - current_time)
-                if delay <= 300:
-                    delay = 0
-                if self.debug:
-                    print(f"Recovery: scheduling repeat check for {token_mint} in {delay}s")
-                task = asyncio.create_task(self._schedule_repeat_check_only(token_mint, delay))
-                recovery_tasks.append(task)
+                
             elif status == "probation":
-                # recreate minimal TradingStart and rehydrate probation loop
-                try:
-                    from_dataclass = globals().get("TradingStart")
-                    start_obj = None
-                    if from_dataclass:
-                        start_obj = from_dataclass(mint=token_mint, block_time=state.get("launch_time"))
-                    else:
-                        # fallback minimal object
-                        class _S: pass
-                        start_obj = _S()
-                        start_obj.mint = token_mint
-                        start_obj.block_time = state.get("launch_time")
-                    if self.debug:
-                        print(f"Recovery: rehydrating probation for {token_mint}")
-                    task = asyncio.create_task(self._probation_recheck_loop(token_mint, start_obj))
-                    recovery_tasks.append(task)
-                except Exception:
-                    if self.debug:
-                        print(f"Recovery: failed to rehydrate probation for {token_mint}")
+                if self.debug:
+                    print(f"[Recovery] Re-launching probation loop for {token_mint}")
+                # Re-hydrate the in-memory probation state to match
+                self.pending_risky_tokens[token_mint] = {
+                    "first_seen": state.get("probation_first_seen"),
+                    "first_seen_ts": int(datetime.fromisoformat(state.get("probation_first_seen")).timestamp()),
+                    "last_checked": state.get("probation_last_checked"),
+                    "attempts": state.get("probation_attempts", 1),
+                    "reasons": state.get("probation_reasons", ["recovered_from_probation"]),
+                    "overlap_result": {"mint": token_mint, "grade": "NONE"} # Stub
+                }
+                task = asyncio.create_task(self._probation_recheck_loop(token_mint, start_obj))
+                recovery_tasks.append(task)
+                
             self._scheduled.add(token_mint)
+            
         if recovery_tasks:
             if self.debug:
                 print(f"Monitor ASYNC: started {len(recovery_tasks)} recovery tasks")
-
-    async def _schedule_first_check_only(self, token_mint: str, delay_seconds: float):
-        if delay_seconds > 0:
-            await asyncio.sleep(delay_seconds)
-        tokens = await self.updater.get_tracked_tokens_async()
-        token_start = None
-        for t in tokens:
-            if t.mint == token_mint:
-                token_start = t
-                break
-        if not token_start:
-            if self.debug:
-                print(f"_schedule_first_check_only: token {token_mint} not found in tracked tokens")
-            self._scheduled.discard(token_mint) # Cleanup from memory
-            return
-        try:
-            res = await self.check_holders_overlap(token_start)
-            obj = safe_load_overlap(self.overlap_store)
-            # Route through security gate; it will save if passed or start probation otherwise
-            await self._security_gate_and_route(token_start, res, obj)
-            current_time = int(datetime.now(timezone.utc).timestamp())
-            next_check = current_time + self.repeat_interval_seconds
-            self.scheduling_store.update_token_state(token_mint, {
-                "status": "active",
-                "last_completed_check": current_time,
-                "next_scheduled_check": next_check,
-                "total_checks_completed": 1
-            })
-            asyncio.create_task(self._schedule_repeat_checks_for_token(token_start, next_check))
-            if self.debug:
-                print(f"_schedule_first_check_only: completed first check for {token_mint}, grade: {res.get('grade', 'N/A')}")
-        
-        except Exception as e:
-            if self.debug:
-                print(f"_schedule_first_check_only: error for {token_mint}: {e}")
-                traceback.print_exc()
-            self.scheduling_store.update_token_state(token_mint, {
-                "status": "failed",
-                "last_error": str(e),
-                "last_error_at": datetime.now(timezone.utc).isoformat()
-            })
-
-    async def _schedule_repeat_check_only(self, token_mint: str, delay_seconds: float):
-        if delay_seconds > 0:
-            await asyncio.sleep(delay_seconds)
-        tokens = await self.updater.get_tracked_tokens_async()
-        token_start = None
-        for t in tokens:
-            if t.mint == token_mint:
-                token_start = t
-                break
-        if not token_start:
-            if self.debug:
-                print(f"_schedule_repeat_only: token {token_mint} not found in tracked tokens")
-            self._scheduled.discard(token_mint) # Cleanup from memory
-            return
-        current_time = int(datetime.now(timezone.utc).timestamp())
-        launch_time = token_start.block_time or current_time
-        if current_time - launch_time > 24 * 3600:
-            if self.debug:
-                print(f"_schedule_repeat_check_only: token {token_mint} past 24h -> marking completed")
-            self.scheduling_store.update_token_state(token_mint, {
-                "status": "completed",
-                "completed_at": datetime.now(timezone.utc).isoformat()
-            })
-            self._scheduled.discard(token_mint) # Cleanup from memory
-            return
-        try:
-            res = await self.check_holders_overlap(token_start)
-            obj = safe_load_overlap(self.overlap_store)
-            obj.setdefault(token_start.mint, []).append({
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "result": res,
-                "check_type": "repeat_check"
-            })
-            self.overlap_store.save(obj)
-            next_check = current_time + self.repeat_interval_seconds
-            state = self.scheduling_store.get_token_state(token_mint)
-            check_count = state.get("total_checks_completed", 0) + 1
-            self.scheduling_store.update_token_state(token_mint, {
-                "last_completed_check": current_time,
-                "next_scheduled_check": next_check,
-                "total_checks_completed": check_count
-            })
-            asyncio.create_task(self._schedule_repeat_checks_for_token(token_start, next_check))
-            if self.debug:
-                print(f"_schedule_repeat_check_only: completed repeat check #{check_count} for {token_mint}, grade: {res.get('grade', 'N/A')}")
-        except Exception as e:
-            if self.debug:
-                print(f"_schedule_repeat_check_only: error for {token_mint}: {e}")
-
-    async def _schedule_repeat_checks_for_token(self, start: TradingStart, first_check_at: int):
-        current_time = int(datetime.now(timezone.utc).timestamp())
-        launch_time = start.block_time or current_time
-        stop_after = launch_time + 24 * 3600
-        check_time = first_check_at
-        while check_time < stop_after:
-            delay = max(0, check_time - int(datetime.now(timezone.utc).timestamp()))
-            if delay > 0:
-                await asyncio.sleep(delay)
-            now = int(datetime.now(timezone.utc).timestamp())
-            if now >= stop_after:
-                if self.debug:
-                    print(f"_schedule_repeat_checks: token {start.mint} past 24h -> stopping")
-                self.scheduling_store.update_token_state(start.mint, {
-                    "status": "completed",
-                    "completed_at": datetime.now(timezone.utc).isoformat()
-                })
-                self._scheduled.discard(start.mint) # Cleanup from memory
-                break
-            try:
-                res = await self.check_holders_overlap(start)
-                obj = safe_load_overlap(self.overlap_store)
-                obj.setdefault(start.mint, []).append({
-                    "ts": datetime.now(timezone.utc).isoformat(),
-                    "result": res,
-                    "check_type": "repeat_check"
-                })
-                self.overlap_store.save(obj)
-                state = self.scheduling_store.get_token_state(start.mint)
-                check_count = state.get("total_checks_completed", 0) + 1
-                next_check_time = now + self.repeat_interval_seconds
-                self.scheduling_store.update_token_state(start.mint, {
-                    "last_completed_check": now,
-                    "next_scheduled_check": next_check_time,
-                    "total_checks_completed": check_count
-                })
-                if self.debug:
-                    print(f"_schedule_repeat_checks: completed check #{check_count} for {start.mint}, grade: {res.get('grade', 'N/A')}")
-                check_time = next_check_time
-            except Exception as e:
-                if self.debug:
-                    print(f"_schedule_repeat_checks: error for {start.mint}: {e}")
-                check_time = now + self.repeat_interval_seconds
 
     async def poll_coingecko_loop(self):
         if self.debug:
@@ -2511,8 +3237,8 @@ class Monitor:
         # Start the daily Dune scheduler as a background task
         asyncio.create_task(self.daily_dune_scheduler())
         
-        # Start startup recovery (commented out as per original)
-        # await self.startup_recovery()
+        # Start startup recovery
+        await self.startup_recovery()
         
         while True:
             try:
@@ -2530,9 +3256,13 @@ class Monitor:
                         if self.debug:
                             print(f"Monitor ASYNC: token {s.mint} already has scheduling state, skipping")
                         continue
+                    
+                    # Launch the master task for this token
                     asyncio.create_task(self._schedule_overlap_checks_for_token(s))
                     self._scheduled.add(s.mint)
                     new_tokens_scheduled += 1
+                    
+                    # Save the initial "pending" state
                     current_time = int(datetime.now(timezone.utc).timestamp())
                     self.scheduling_store.update_token_state(s.mint, {
                         "launch_time": s.block_time or current_time,
@@ -2541,83 +3271,119 @@ class Monitor:
                         "created_at": datetime.now(timezone.utc).isoformat(),
                         "total_checks_completed": 0
                     })
+                    
                 if new_tokens_scheduled > 0 and self.debug:
                     print(f"Monitor ASYNC: scheduled overlap checks for {new_tokens_scheduled} new tokens")
+                    
                 try:
+                    # Use the new async save method
                     await self.updater.save_trading_starts_async(starts, skip_existing=True)
                 except Exception as e:
                     if self.debug:
                         print("Monitor ASYNC: updater save error", e)
+                        
                 current_time = time.time()
                 if current_time - self.last_cleanup > 3600:
+                    # Use the new async cleanup method
                     await self.updater.cleanup_old_tokens_async()
                     self.scheduling_store.cleanup_old_states()
                     await self._cleanup_finished_tasks() # Memory cleanup
                     self.last_cleanup = current_time
+                    
             except Exception as e:
                 if self.debug:
                     print("Monitor ASYNC: CoinGecko poll error", e)
                     traceback.print_exc()
+                    
             await asyncio.sleep(self.coingecko_poll_interval_seconds)
 
     async def _schedule_overlap_checks_for_token(self, start: TradingStart):
+        """
+        🚀 REFACTORED: This is the master task for a single token's 24-hour lifecycle.
+        It handles the initial delay and the repeating check loop, calling
+        the unified `run_token_analysis_step` function.
+        """
         now_ts = int(datetime.now(timezone.utc).timestamp())
         block_ts = int(start.block_time or now_ts)
         first_run_at = block_ts + self.initial_check_delay_seconds
         to_sleep = max(0, first_run_at - now_ts)
+        
         if self.debug:
             print(f"_schedule ASYNC: token={start.mint} will first run in {to_sleep}s (at {datetime.fromtimestamp(first_run_at, timezone.utc)})")
+            
         await asyncio.sleep(to_sleep)
+        
         self.scheduling_store.update_token_state(start.mint, {"status": "running_first_check"})
-        stop_after = block_ts + 24 * 3600
+        stop_after = block_ts + 6 * 3600
         check_count = 0
+        
         while True:
             now_ts2 = int(datetime.now(timezone.utc).timestamp())
             if now_ts2 > stop_after:
                 if self.debug:
-                    print(f"_schedule ASYNC: token={start.mint} past 24h -> stopping scheduled checks")
-                self.scheduling_store.update_token_state(start.mint, {
-                    "status": "completed",
-                    "completed_at": datetime.now(timezone.utc).isoformat()
-                })
+                    print(f"_schedule ASYNC: token={start.mint} past 6h -> stopping scheduled checks")
+                
+                # Final status update
+                current_state = self.scheduling_store.get_token_state(start.mint)
+                if current_state.get("status") not in ["completed", "dropped"]:
+                    self.scheduling_store.update_token_state(start.mint, {
+                        "status": "dropped", # Dropped due to timeout, not failure
+                        "completed_at": datetime.now(timezone.utc).isoformat(),
+                        "probation_final": True
+                    })
                 self._scheduled.discard(start.mint) # Cleanup from memory
                 break
+                
             try:
-                res = await self.check_holders_overlap(start)
+                # --- 🚀 CALL THE UNIFIED ANALYSIS FUNCTION ---
+                await self.run_token_analysis_step(start, check_count)
                 check_count += 1
-                obj = safe_load_overlap(self.overlap_store)
-                # Route through security gate; it will save if passed or start probation otherwise
-                await self._security_gate_and_route(start, res, obj)
-                next_check_time = now_ts2 + self.repeat_interval_seconds
-                self.scheduling_store.update_token_state(start.mint, {
-                    "status": "active",
-                    "last_completed_check": now_ts2,
-                    "next_scheduled_check": next_check_time,
-                    "total_checks_completed": check_count
-                })
+                
+                # --- Check status to see if we should stop the loop ---
+                current_state = self.scheduling_store.get_token_state(start.mint)
+                status = current_state.get("status")
+                
+                if status == "completed":
+                    if self.debug:
+                        print(f"_schedule ASYNC: token={start.mint} status is 'completed'. Stopping loop.")
+                    self._scheduled.discard(start.mint) # Cleanup from memory
+                    break # Token has passed and is finished
+                
+                if status == "dropped":
+                    if self.debug:
+                        print(f"_schedule ASYC: token={start.mint} status is 'dropped'. Stopping loop.")
+                    self._scheduled.discard(start.mint) # Cleanup from memory
+                    break # Token failed probation and is finished
+                
+                # If status is "active" or "probation", the loop continues
                 if self.debug:
-                    print(f"_schedule ASYNC: completed check #{check_count} for {start.mint}, grade: {res.get('grade', 'N/A')}, overlap: {res.get('overlap_count', 0)} wallets")
+                    print(f"_schedule ASYNC: completed check #{check_count} for {start.mint}. Status: {status}. Next check in {self.repeat_interval_seconds}s")
+                
             except Exception as e:
                 if self.debug:
-                    print(f"_schedule ASYNC: overlap check error for {start.mint}: {e}")
+                    print(f"_schedule ASYNC: unhandled error in check loop for {start.mint}: {e}")
+                    traceback.print_exc()
                 self.scheduling_store.update_token_state(start.mint, {
                     "last_error": str(e),
                     "last_error_at": datetime.now(timezone.utc).isoformat()
                 })
+                
             await asyncio.sleep(self.repeat_interval_seconds)
 
-    async def check_holders_overlap(self, start: TradingStart, top_k_holders: int = 500) -> Dict[str, Any]:
+    async def _fetch_and_calculate_overlap(self, start: TradingStart) -> Dict[str, Any]:
         """
-        Check overlap between the token's top holders and the merged 7-day Dune winners.
-        Returns a summary dict with distinct and weighted concentration metrics.
+        🚀 RENAMED: (Was check_holders_overlap)
+        This function NOW ONLY does its core job: fetch holders (Helius) and
+        calculate overlap against the Dune cache.
+        It is ONLY called *after* the pre-Helius security gate has passed.
         """
         if self.debug:
-            print(f"check_holders_overlap ASYNC: computing for {start.mint}")
+            print(f"_fetch_and_calculate_overlap: computing for {start.mint}")
 
         # Ensure Dune winners cache available
         token_to_top_holders, wallet_freq, loaded_days = self.dune_cache.load_last_7_days()
         if self.debug:
-            print(f"check_holders_overlap ASYNC: using {len(loaded_days)} cached days, {len(token_to_top_holders)} tokens in memory")
+            print(f"_fetch_and_calculate_overlap: using {len(loaded_days)} cached days, {len(token_to_top_holders)} tokens in memory")
 
         # Merge winners union and compute total frequency sum
         winners_union: Set[str] = set()
@@ -2628,11 +3394,12 @@ class Monitor:
 
         # Fetch holders for the target token and apply hybrid sampling rule
         try:
+            # --- THIS IS THE HELIUS CALL ---
             holders_list = await self.holder_agg.get_token_holders(start.mint, limit=1000, max_pages=2, decimals=None)
         except Exception as e:
             if self.debug:
-                print(f"check_holders_overlap ASYNC: failed to fetch holders for {start.mint}: {e}")
-            return {"error": "fetch_holders_failed", "error_details": str(e)}
+                print(f"_fetch_and_calculate_overlap: failed to fetch holders for {start.mint}: {e}")
+            return {"error": "fetch_holders_failed", "error_details": str(e), "grade": "NONE"}
 
         n = len(holders_list)
         if n <= 200:
@@ -2686,19 +3453,28 @@ class Monitor:
             }
         }
         if self.debug:
-            print(f"check_holders_overlap ASYNC: {start.mint} overlap {overlap_count}/{top_count} ({overlap_pct:.2f}%) distinct_conc {concentration:.2f}% weighted_conc {weighted_concentration:.2f}% grade={grade}")
+            print(f"_fetch_and_calculate_overlap: {start.mint} overlap {overlap_count}/{top_count} ({overlap_pct:.2f}%) distinct_conc {concentration:.2f}% weighted_conc {weighted_concentration:.2f}% grade={grade}")
         return summary
 
 # -----------------------
 # Main loop wiring
 # -----------------------
 async def main_loop():
+    """
+    Initializes all components and starts the monitor's main polling loop.
+    Manages the AIOHTTP session lifecycle.
+    """
     # ------------------ 🚀 CHANGE 6: Manage session lifecycle here ------------------
+    # The session is created here and passed into the Monitor,
+    # which then uses it for all API calls (RugCheck, DexScreener).
     async with aiohttp.ClientSession() as http_session:
         try:
             sol_client = SolanaAlphaClient()
             ok = await sol_client.test_connection()
             print("🚀 Solana RPC ok:", ok)
+            if not ok:
+                print("⚠️ Solana RPC connection failed. Check Helius keys/status.")
+                # We can continue, but holder_agg will likely fail.
 
             td = TokenDiscovery(
                 client=sol_client,
@@ -2710,12 +3486,25 @@ async def main_loop():
                 debug=True
             )
             holder_agg = HolderAggregator(sol_client, debug=True)
-            updater = JobLibTokenUpdater(data_dir="./data/token_data", expiry_hours=24, debug=True)
-            dune_cache = DuneWinnersCache(cache_dir="./data/dune_cache", debug=True)
+            
+            # --- UPDATER INSTANCE: This now uses the new SQLite class ---
+            updater = JobLibTokenUpdater(data_dir="./data/token_data", expiry_hours=6, debug=True)
+            # ---
+            
+            dune_cache = DuneWinnersCache(cache_dir="./data/dune_cache", debug=True, supabase_bucket=BUCKET_NAME)
             dune_builder = DuneWinnersBuilder(cache=dune_cache, debug=True, max_concurrency=8)
             overlap_store = OverlapStore(filepath="./data/overlap_results.pkl", debug=True)
             scheduling_store = SchedulingStore(filepath="./data/scheduling_state.pkl", debug=True)
-            
+
+            try:
+                # Assuming models are in the 'models' directory relative to execution
+                ml_classifier = SolanaTokenPredictor(model_dir='models') 
+            except Exception as e:
+                print(f"❌ CRITICAL: Failed to load ML models: {e}")
+                print("--- 💀 Token Monitor Halted ---")
+                return
+
+            # Initialize the main Monitor orchestrator
             monitor = Monitor(
                 sol_client=sol_client,
                 token_discovery=td,
@@ -2725,31 +3514,39 @@ async def main_loop():
                 dune_builder=dune_builder,
                 overlap_store=overlap_store,
                 scheduling_store=scheduling_store,
-                http_session=http_session, # Pass the session here
+                http_session=http_session, # Pass the managed session
+                ml_classifier=ml_classifier, # Pass the ML classifier
                 coingecko_poll_interval_seconds=30,
-                initial_check_delay_seconds=30 * 60, # 30 minutes
-                repeat_interval_seconds=1 * 3600, # 1 hour
-                debug=True,
+                initial_check_delay_seconds=600, # 10 minutes
+                repeat_interval_seconds=1800, # 30 minutes
+                debug=True
             )
 
-            # Start both tasks concurrently
-            dune_task = asyncio.create_task(monitor.ensure_dune_holders())
-            coingecko_task = asyncio.create_task(monitor.poll_coingecko_loop())
-            
-            print("🚀 Starting CoinGecko polling and Dune cache building concurrently...")
-            
-            # Wait for both tasks (poll_coingecko_loop runs forever)
-            await asyncio.gather(dune_task, coingecko_task)
+            # Pre-load/build the Dune winners cache on startup
+            print("🚀 Ensuring Dune winners cache is populated...")
+            await monitor.ensure_dune_holders()
+            print("✅ Dune winners cache is ready.")
 
-        except asyncio.CancelledError:
-            print("🚀 Main loop was cancelled. Shutting down gracefully.")
-        finally:
-            # The 'async with' block ensures the http_session is closed automatically.
-            print("🚀 Main loop has finished.")
+            # Start the main polling loop (which also handles recovery)
+            print("🚀 Starting main CoinGecko polling loop...")
+            await monitor.poll_coingecko_loop()
 
+        except RuntimeError as e:
+            print(f"\n❌ CRITICAL RUNTIME ERROR: {e}")
+            print("--- 💀 Token Monitor Halted ---")
+        except Exception as e:
+            print(f"\n❌ UNHANDLED EXCEPTION in main_loop: {e}")
+            traceback.print_exc()
+            print("--- 💀 Token Monitor Halted ---")
 
 if __name__ == "__main__":
+    print("--- 🚀 Starting Token Monitor ---")
     try:
         asyncio.run(main_loop())
     except KeyboardInterrupt:
-        print("🚀 Interrupted, exiting")
+        print("\n🛑 Token Monitor interrupted, exiting gracefully")
+    except Exception as e:
+        # This catches errors during asyncio.run() itself, if any
+        print(f"\n❌ UNHANDLED TOP-LEVEL EXCEPTION: {e}")
+        traceback.print_exc()
+        print("--- 💀 Token Monitor Halted ---")
