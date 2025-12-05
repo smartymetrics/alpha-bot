@@ -15,6 +15,11 @@ from sklearn.metrics import (
     classification_report, confusion_matrix, roc_auc_score,
     precision_recall_curve, average_precision_score, roc_curve
 )
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.ensemble import RandomForestClassifier, IsolationForest
+from sklearn.linear_model import LogisticRegression
+from sklearn.neural_network import MLPClassifier
+
 import xgboost as xgb
 import lightgbm as lgb
 from catboost import CatBoostClassifier
@@ -27,7 +32,7 @@ os.makedirs('models', exist_ok=True)
 os.makedirs('outputs', exist_ok=True)
 
 print("="*80)
-print("🚀 IMPROVED SOLANA MEMECOIN CLASSIFIER - PRODUCTION READY")
+print("🚀 IMPROVED SOLANA MEMECOIN CLASSIFIER - 6-MODEL ENSEMBLE + ANOMALY DETECTION")
 print("="*80)
 
 # ============================================================================
@@ -147,6 +152,36 @@ df['off_peak_day'] = (df['is_weekend_utc'] | df['is_public_holiday_any']).astype
 print("✅ Feature engineering complete!")
 
 # ============================================================================
+# ANOMALY DETECTION (ISOLATION FOREST)
+# ============================================================================
+
+print("\n" + "="*80)
+print("👻 ANOMALY DETECTION (ISOLATION FOREST)")
+print("="*80)
+
+# Features to use for anomaly detection
+anomaly_features = [
+    'log_liquidity', 'log_volume', 'price_change_h24_pct', 
+    'top_10_holders_pct', 'creator_balance_pct'
+]
+
+# Fill NaNs for anomaly detection
+X_anomaly = df[anomaly_features].fillna(0)
+
+# Train Isolation Forest
+iso_forest = IsolationForest(contamination=0.1, random_state=42)
+iso_forest.fit(X_anomaly)
+
+# Generate anomaly scores (lower is more anomalous)
+# We invert it so higher = more anomalous/rare
+df['anomaly_score'] = -iso_forest.score_samples(X_anomaly)
+df['is_anomaly'] = iso_forest.predict(X_anomaly)
+df['is_anomaly'] = (df['is_anomaly'] == -1).astype(int)
+
+print(f"✅ Anomaly detection complete. Found {df['is_anomaly'].sum()} anomalies.")
+print(f"   Mean anomaly score: {df['anomaly_score'].mean():.4f}")
+
+# ============================================================================
 # REDUCED FEATURE LIST (Remove Overlapping Features)
 # ============================================================================
 
@@ -200,6 +235,10 @@ DERIVED_FEATURES = [
     # Time patterns
     'peak_hours',
     'off_peak_day',
+    
+    # Anomaly
+    'anomaly_score',
+    'is_anomaly'
 ]
 
 ALL_FEATURES = CORE_FEATURES + DERIVED_FEATURES
@@ -341,107 +380,117 @@ for i, (feat, score) in enumerate(feature_scores[:best_k], 1):
     print(f"  {selected} {is_insider}{is_derived} {i:2d}. {feat:45s} | F-score: {score_str}")
 
 # ============================================================================
-# TRAIN ENSEMBLE MODELS (TUNED HYPERPARAMETERS)
+# TRAIN ENSEMBLE MODELS (TUNED & CALIBRATED)
 # ============================================================================
 
 print("\n" + "="*80)
-print("🚀 TRAINING ENSEMBLE MODELS (TUNED)")
+print("🚀 TRAINING 6-MODEL ENSEMBLE (CALIBRATED)")
 print("="*80)
 
 scale_pos_weight = (y_train == 0).sum() / (y_train == 1).sum()
 print(f"Class weight ratio: {scale_pos_weight:.2f}")
 
-# === XGBoost (Reduced Overfitting) ===
-print("\n🟦 Training XGBoost...")
-xgb_model = xgb.XGBClassifier(
-    max_depth=3,               # Reduced from 4
-    learning_rate=0.05,        # Increased from 0.03
-    n_estimators=50,           # Reduced from 100
-    min_child_weight=20,       # Increased from 10
-    subsample=0.7,             # Reduced from 0.8
-    colsample_bytree=0.7,      # Reduced from 0.8
-    reg_alpha=2.0,             # Increased from 1.0
-    reg_lambda=10.0,           # Increased from 5.0
+# 1. XGBoost (Calibrated)
+print("\n🟦 Training XGBoost (Calibrated)...")
+xgb_base = xgb.XGBClassifier(
+    max_depth=4,               # Increased depth slightly
+    learning_rate=0.05,
+    n_estimators=100,          # Increased estimators
+    min_child_weight=10,       # Reduced to allow more specific splits
+    subsample=0.8,
+    colsample_bytree=0.8,
+    reg_alpha=0.5,             # Reduced regularization
+    reg_lambda=1.0,            # Reduced regularization
     scale_pos_weight=scale_pos_weight,
     random_state=42,
     eval_metric='auc'
 )
-
-xgb_model.fit(X_train_selected, y_train, verbose=False)
-
-xgb_train_pred = xgb_model.predict(X_train_selected)
-xgb_test_pred = xgb_model.predict(X_test_selected)
+xgb_model = CalibratedClassifierCV(xgb_base, method='isotonic', cv=3)
+xgb_model.fit(X_train_selected, y_train)
 xgb_test_proba = xgb_model.predict_proba(X_test_selected)[:, 1]
+print(f"  Test AUC: {roc_auc_score(y_test, xgb_test_proba):.4f}")
 
-xgb_train_acc = (xgb_train_pred == y_train).mean()
-xgb_test_acc = (xgb_test_pred == y_test).mean()
-xgb_test_auc = roc_auc_score(y_test, xgb_test_proba)
-
-print(f"  Training Accuracy: {xgb_train_acc:.4f}")
-print(f"  Test Accuracy:     {xgb_test_acc:.4f}")
-print(f"  Test AUC:          {xgb_test_auc:.4f}")
-print(f"  Overfit Gap:       {xgb_train_acc - xgb_test_acc:.4f}")
-
-# === LightGBM (Reduced Overfitting) ===
-print("\n🟩 Training LightGBM...")
-lgb_model = lgb.LGBMClassifier(
-    num_leaves=10,             # Reduced from 15
-    max_depth=3,               # Reduced from 4
-    learning_rate=0.05,        # Increased from 0.03
-    n_estimators=50,           # Reduced from 100
-    min_child_samples=20,      # Increased from 15
-    min_split_gain=0.03,       # Increased from 0.02
-    subsample=0.7,             # Reduced from 0.8
-    colsample_bytree=0.7,      # Reduced from 0.8
-    reg_alpha=2.0,             # Increased from 1.0
-    reg_lambda=10.0,           # Increased from 5.0
+# 2. LightGBM (Calibrated)
+print("\n🟩 Training LightGBM (Calibrated)...")
+lgb_base = lgb.LGBMClassifier(
+    num_leaves=20,             # Increased
+    max_depth=5,               # Increased
+    learning_rate=0.05,
+    n_estimators=100,
+    min_child_samples=15,      # Reduced
+    reg_alpha=0.5,             # Reduced
+    reg_lambda=1.0,            # Reduced
     class_weight='balanced',
     random_state=42,
     verbose=-1
 )
-
+lgb_model = CalibratedClassifierCV(lgb_base, method='isotonic', cv=3)
 lgb_model.fit(X_train_selected, y_train)
-
-lgb_train_pred = lgb_model.predict(X_train_selected)
-lgb_test_pred = lgb_model.predict(X_test_selected)
 lgb_test_proba = lgb_model.predict_proba(X_test_selected)[:, 1]
+print(f"  Test AUC: {roc_auc_score(y_test, lgb_test_proba):.4f}")
 
-lgb_train_acc = (lgb_train_pred == y_train).mean()
-lgb_test_acc = (lgb_test_pred == y_test).mean()
-lgb_test_auc = roc_auc_score(y_test, lgb_test_proba)
-
-print(f"  Training Accuracy: {lgb_train_acc:.4f}")
-print(f"  Test Accuracy:     {lgb_test_acc:.4f}")
-print(f"  Test AUC:          {lgb_test_auc:.4f}")
-print(f"  Overfit Gap:       {lgb_train_acc - lgb_test_acc:.4f}")
-
-# === CatBoost (Reduced Overfitting) ===
-print("\n🟨 Training CatBoost...")
-cat_model = CatBoostClassifier(
-    iterations=50,             # Reduced from 100
-    depth=3,                   # Reduced from 4
-    learning_rate=0.05,        # Increased from 0.03
-    l2_leaf_reg=20,            # Increased from 15
-    min_data_in_leaf=20,       # Increased from 15
+# 3. CatBoost (Calibrated)
+print("\n🟨 Training CatBoost (Calibrated)...")
+cat_base = CatBoostClassifier(
+    iterations=100,
+    depth=5,                   # Increased
+    learning_rate=0.05,
+    l2_leaf_reg=5,             # Reduced significantly (was 20)
     auto_class_weights='Balanced',
     random_state=42,
     verbose=False
 )
-
+cat_model = CalibratedClassifierCV(cat_base, method='isotonic', cv=3)
 cat_model.fit(X_train_selected, y_train)
-
-cat_train_pred = cat_model.predict(X_train_selected)
-cat_test_pred = cat_model.predict(X_test_selected)
 cat_test_proba = cat_model.predict_proba(X_test_selected)[:, 1]
+print(f"  Test AUC: {roc_auc_score(y_test, cat_test_proba):.4f}")
 
-cat_train_acc = (cat_train_pred == y_train).mean()
-cat_test_acc = (cat_test_pred == y_test).mean()
-cat_test_auc = roc_auc_score(y_test, cat_test_proba)
+# 4. Random Forest (New)
+print("\n🌲 Training Random Forest (New)...")
+rf_model = RandomForestClassifier(
+    n_estimators=200,
+    max_depth=8,
+    min_samples_leaf=5,
+    class_weight='balanced',
+    random_state=42
+)
+rf_model.fit(X_train_selected, y_train)
+rf_test_proba = rf_model.predict_proba(X_test_selected)[:, 1]
+print(f"  Test AUC: {roc_auc_score(y_test, rf_test_proba):.4f}")
 
-print(f"  Training Accuracy: {cat_train_acc:.4f}")
-print(f"  Test Accuracy:     {cat_test_acc:.4f}")
-print(f"  Test AUC:          {cat_test_auc:.4f}")
-print(f"  Overfit Gap:       {cat_train_acc - cat_test_acc:.4f}")
+# 5. Logistic Regression (New - Baseline)
+print("\n📐 Training Logistic Regression (New)...")
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train_selected)
+X_test_scaled = scaler.transform(X_test_selected)
+
+lr_model = LogisticRegression(
+    C=0.1, 
+    class_weight='balanced', 
+    random_state=42
+)
+lr_model.fit(X_train_scaled, y_train)
+lr_test_proba = lr_model.predict_proba(X_test_scaled)[:, 1]
+print(f"  Test AUC: {roc_auc_score(y_test, lr_test_proba):.4f}")
+
+# 6. MLP Neural Network (New)
+print("\n🧠 Training MLP Neural Network (New)...")
+mlp_model = MLPClassifier(
+    hidden_layer_sizes=(64, 32),
+    activation='relu',
+    solver='adam',
+    alpha=0.001,
+    batch_size=32,
+    learning_rate='adaptive',
+    learning_rate_init=0.001,
+    max_iter=500,
+    early_stopping=True,
+    validation_fraction=0.1,
+    random_state=42
+)
+mlp_model.fit(X_train_scaled, y_train)
+mlp_test_proba = mlp_model.predict_proba(X_test_scaled)[:, 1]
+print(f"  Test AUC: {roc_auc_score(y_test, mlp_test_proba):.4f}")
 
 # ============================================================================
 # ENSEMBLE TESTING
@@ -451,11 +500,12 @@ print("\n" + "="*80)
 print("🎯 ENSEMBLE TESTING")
 print("="*80)
 
+# Define weights for 6 models
 ensemble_configs = [
-    ("CatBoost 70% + LightGBM 30%", [0.7, 0.3, 0.0]),
-    ("CatBoost 60% + LightGBM 30% + XGBoost 10%", [0.6, 0.3, 0.1]),
-    ("Equal Weight", [0.33, 0.33, 0.34]),
-    ("CatBoost 50% + LightGBM 50%", [0.5, 0.5, 0.0]),
+    ("Balanced 6-Model", [0.16, 0.16, 0.16, 0.16, 0.16, 0.20]),
+    ("Boosters + RF + MLP", [0.2, 0.2, 0.2, 0.2, 0.0, 0.2]),
+    ("RF + MLP Heavy", [0.1, 0.1, 0.1, 0.35, 0.0, 0.35]),
+    ("Tree Heavy (No Linear/NN)", [0.25, 0.25, 0.25, 0.25, 0.0, 0.0]),
 ]
 
 best_ensemble_name = None
@@ -464,17 +514,17 @@ best_ensemble_weights = None
 
 for name, weights in ensemble_configs:
     ensemble_proba = (
-        weights[0] * cat_test_proba +
+        weights[0] * xgb_test_proba +
         weights[1] * lgb_test_proba +
-        weights[2] * xgb_test_proba
+        weights[2] * cat_test_proba +
+        weights[3] * rf_test_proba +
+        weights[4] * lr_test_proba +
+        weights[5] * mlp_test_proba
     )
-    ensemble_pred = (ensemble_proba >= 0.5).astype(int)
-    ensemble_acc = (ensemble_pred == y_test).mean()
-    ensemble_auc = roc_auc_score(y_test, ensemble_proba)
     
+    ensemble_auc = roc_auc_score(y_test, ensemble_proba)
     print(f"\n{name}:")
-    print(f"  Accuracy: {ensemble_acc:.4f}")
-    print(f"  AUC:      {ensemble_auc:.4f}")
+    print(f"  AUC: {ensemble_auc:.4f}")
     
     if ensemble_auc > best_ensemble_auc:
         best_ensemble_auc = ensemble_auc
@@ -485,66 +535,6 @@ print(f"\n✅ Best Ensemble: {best_ensemble_name}")
 print(f"   Test AUC: {best_ensemble_auc:.4f}")
 
 # ============================================================================
-# CROSS-VALIDATION
-# ============================================================================
-
-print("\n" + "="*80)
-print("📊 5-FOLD CROSS-VALIDATION")
-print("="*80)
-
-skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-cv_scores = {'xgb': [], 'lgb': [], 'cat': [], 'ensemble': []}
-
-for fold, (train_idx, val_idx) in enumerate(skf.split(X_train_selected, y_train), 1):
-    # XGBoost
-    fold_xgb = xgb.XGBClassifier(
-        max_depth=3, learning_rate=0.05, n_estimators=50,
-        min_child_weight=20, subsample=0.7, colsample_bytree=0.7,
-        reg_alpha=2.0, reg_lambda=10.0,
-        scale_pos_weight=scale_pos_weight, random_state=42
-    )
-    fold_xgb.fit(X_train_selected[train_idx], y_train.iloc[train_idx], verbose=False)
-    xgb_proba = fold_xgb.predict_proba(X_train_selected[val_idx])[:, 1]
-    cv_scores['xgb'].append(roc_auc_score(y_train.iloc[val_idx], xgb_proba))
-    
-    # LightGBM
-    fold_lgb = lgb.LGBMClassifier(
-        num_leaves=10, max_depth=3, learning_rate=0.05, n_estimators=50,
-        min_child_samples=20, reg_alpha=2.0, reg_lambda=10.0,
-        class_weight='balanced', random_state=42, verbose=-1
-    )
-    fold_lgb.fit(X_train_selected[train_idx], y_train.iloc[train_idx])
-    lgb_proba = fold_lgb.predict_proba(X_train_selected[val_idx])[:, 1]
-    cv_scores['lgb'].append(roc_auc_score(y_train.iloc[val_idx], lgb_proba))
-    
-    # CatBoost
-    fold_cat = CatBoostClassifier(
-        iterations=50, depth=3, learning_rate=0.05, l2_leaf_reg=20,
-        auto_class_weights='Balanced', random_state=42, verbose=False
-    )
-    fold_cat.fit(X_train_selected[train_idx], y_train.iloc[train_idx])
-    cat_proba = fold_cat.predict_proba(X_train_selected[val_idx])[:, 1]
-    cv_scores['cat'].append(roc_auc_score(y_train.iloc[val_idx], cat_proba))
-    
-    # Ensemble
-    ensemble_proba = (
-        best_ensemble_weights[0] * cat_proba +
-        best_ensemble_weights[1] * lgb_proba +
-        best_ensemble_weights[2] * xgb_proba
-    )
-    cv_scores['ensemble'].append(roc_auc_score(y_train.iloc[val_idx], ensemble_proba))
-    
-    print(f"Fold {fold} | XGB: {cv_scores['xgb'][-1]:.3f} | "
-          f"LGB: {cv_scores['lgb'][-1]:.3f} | CAT: {cv_scores['cat'][-1]:.3f} | "
-          f"ENS: {cv_scores['ensemble'][-1]:.3f}")
-
-print(f"\n📊 CV AUC (mean ± std):")
-print(f"  XGBoost:  {np.mean(cv_scores['xgb']):.3f} ± {np.std(cv_scores['xgb']):.3f}")
-print(f"  LightGBM: {np.mean(cv_scores['lgb']):.3f} ± {np.std(cv_scores['lgb']):.3f}")
-print(f"  CatBoost: {np.mean(cv_scores['cat']):.3f} ± {np.std(cv_scores['cat']):.3f}")
-print(f"  Ensemble: {np.mean(cv_scores['ensemble']):.3f} ± {np.std(cv_scores['ensemble']):.3f}")
-
-# ============================================================================
 # SAVE MODELS
 # ============================================================================
 
@@ -552,44 +542,40 @@ print("\n" + "="*80)
 print("💾 SAVING MODELS")
 print("="*80)
 
+# Save all 6 models + extras
 joblib.dump(xgb_model, 'models/xgboost_model.pkl')
 joblib.dump(lgb_model, 'models/lightgbm_model.pkl')
 joblib.dump(cat_model, 'models/catboost_model.pkl')
+joblib.dump(rf_model, 'models/rf_model.pkl')
+joblib.dump(lr_model, 'models/lr_model.pkl')
+joblib.dump(mlp_model, 'models/mlp_model.pkl')
+joblib.dump(iso_forest, 'models/isolation_forest.pkl')
+joblib.dump(scaler, 'models/scaler.pkl')
 joblib.dump(selector_f, 'models/feature_selector.pkl')
+
 print("✅ Models saved")
 
 metadata = {
-    'model_version': '2.0_improved',
-    'model_type': 'Ensemble',
+    'model_version': '4.0_neural_anomaly',
+    'model_type': '6-Model Ensemble',
     'ensemble_weights': {
-        'catboost': float(best_ensemble_weights[0]),
+        'xgboost': float(best_ensemble_weights[0]),
         'lightgbm': float(best_ensemble_weights[1]),
-        'xgboost': float(best_ensemble_weights[2])
+        'catboost': float(best_ensemble_weights[2]),
+        'random_forest': float(best_ensemble_weights[3]),
+        'logistic_regression': float(best_ensemble_weights[4]),
+        'mlp_neural_network': float(best_ensemble_weights[5])
     },
     'trained_at': datetime.now().isoformat(),
-    'training_samples': len(train_df),
-    'test_samples': len(test_df),
-    'num_features_selected': best_k,
-    'selected_features': selected_features,
-    'all_features': ALL_FEATURES,
-    'improvements': [
-        'Fixed negative token ages',
-        'Removed correlated features (corr > 0.90)',
-        'Implemented temporal train/test split',
-        'Tuned hyperparameters to reduce overfitting'
-    ],
     'performance': {
         'test_auc': float(best_ensemble_auc),
-        'cv_auc_mean': float(np.mean(cv_scores['ensemble'])),
-        'cv_auc_std': float(np.std(cv_scores['ensemble'])),
     },
-    'feature_scores': {
-        feat: float(score) if not np.isnan(score) else 0.0
-        for feat, score in zip(ALL_FEATURES, f_scores)
-    },
-    'feature_importance': {
-        selected_features[i]: float(cat_model.feature_importances_[i])
-        for i in range(len(selected_features))
+    'selected_features': selected_features,
+    'all_features': ALL_FEATURES,
+    'anomaly_detection': {
+        'model': 'IsolationForest',
+        'contamination': 0.1,
+        'features': anomaly_features
     }
 }
 
@@ -606,17 +592,18 @@ print("🎯 THRESHOLD OPTIMIZATION")
 print("="*80)
 
 final_proba = (
-    best_ensemble_weights[0] * cat_test_proba +
+    best_ensemble_weights[0] * xgb_test_proba +
     best_ensemble_weights[1] * lgb_test_proba +
-    best_ensemble_weights[2] * xgb_test_proba
+    best_ensemble_weights[2] * cat_test_proba +
+    best_ensemble_weights[3] * rf_test_proba +
+    best_ensemble_weights[4] * lr_test_proba +
+    best_ensemble_weights[5] * mlp_test_proba
 )
 
 print(f"\n{'Threshold':<12} {'Accuracy':<10} {'Precision':<12} {'Recall':<10} {'F1-Score':<10}")
 print("-" * 54)
 
-thresholds = [0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80]
-best_threshold = 0.5
-best_f1 = 0
+thresholds = [0.50, 0.60, 0.70, 0.75, 0.80, 0.85, 0.90]
 
 for thresh in thresholds:
     pred = (final_proba >= thresh).astype(int)
@@ -631,94 +618,5 @@ for thresh in thresholds:
     f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
     
     print(f"{thresh:<12.2f} {acc:<10.3f} {precision:<12.3f} {recall:<10.3f} {f1:<10.3f}")
-    
-    if f1 > best_f1:
-        best_f1 = f1
-        best_threshold = thresh
-
-print(f"\n✅ Optimal threshold for balanced F1: {best_threshold:.2f}")
-print(f"   Recommended for BUY signals: 0.70+ (high precision)")
-print(f"   Recommended for AVOID signals: <0.40 (high recall for losses)")
-
-# ============================================================================
-# DETAILED EVALUATION
-# ============================================================================
-
-print("\n" + "="*80)
-print("📋 DETAILED EVALUATION")
-
-final_pred = (final_proba >= 0.5).astype(int)
-
-print("\nClassification Report (threshold=0.5):")
-print(classification_report(y_test, final_pred, target_names=['Loss', 'Win'], digits=3))
-
-cm = confusion_matrix(y_test, final_pred)
-print("\nConfusion Matrix:")
-print(f"              Predicted")
-print(f"              Loss  Win")
-print(f"Actual Loss    {cm[0,0]:3d}  {cm[0,1]:3d}")
-print(f"       Win     {cm[1,0]:3d}  {cm[1,1]:3d}")
-
-# ============================================================================
-# FEATURE IMPORTANCE ANALYSIS
-# ============================================================================
-
-print("\n" + "="*80)
-print("📊 FEATURE IMPORTANCE ANALYSIS")
-print("="*80)
-
-print("\n🏆 Top 20 Most Important Features (CatBoost):")
-importances = cat_model.feature_importances_
-feature_importance = list(zip(selected_features, importances))
-feature_importance.sort(key=lambda x: x[1], reverse=True)
-
-for i, (feat, imp) in enumerate(feature_importance[:20], 1):
-    # Mark special feature types
-    marker = ""
-    if 'insider' in feat.lower():
-        marker = "🔴"
-    elif feat in CORE_FEATURES:
-        marker = "⭐"
-    elif feat in DERIVED_FEATURES:
-        marker = "🆕"
-    
-    print(f"  {marker} {i:2d}. {feat:45s} | {imp:8.4f}")
-
-# Check if insider features made the cut
-insider_features_selected = [f for f in selected_features if 'insider' in f.lower()]
-print(f"\n🔴 Insider features selected: {len(insider_features_selected)}")
-for feat in insider_features_selected:
-    imp = dict(feature_importance).get(feat, 0)
-    print(f"   • {feat}: {imp:.4f}")
-
-# ============================================================================
-# SUMMARY
-# ============================================================================
-
-print("\n" + "="*80)
-print("✅ TRAINING COMPLETE - FOCUSED MODEL")
-print("="*80)
-
-print(f"\n🎯 Model Configuration:")
-print(f"   • Total features: {len(ALL_FEATURES)}")
-print(f"   • Features selected: {best_k}")
-print(f"   • Training samples: {len(train_df)}")
-print(f"   • Test samples: {len(test_df)}")
-
-print(f"\n📈 Performance:")
-print(f"   • Test AUC: {best_ensemble_auc:.4f}")
-print(f"   • CV AUC: {np.mean(cv_scores['ensemble']):.4f} ± {np.std(cv_scores['ensemble']):.4f}")
-print(f"   • Best Ensemble: {best_ensemble_name}")
-
-print(f"\n🎯 Key Features:")
-print(f"   • 🔴 Insider supply %: {'insider_supply_pct' in selected_features}")
-print(f"   • ⭐ Core features: {sum(1 for f in selected_features if f in CORE_FEATURES)}/{len(CORE_FEATURES)}")
-print(f"   • 🆕 Derived features: {sum(1 for f in selected_features if f in DERIVED_FEATURES)}/{len(DERIVED_FEATURES)}")
-
-print(f"\n💡 Next Steps:")
-print(f"   1. Create production inference script")
-print(f"   2. Test with live DexScreener + Rugcheck API data")
-print(f"   3. Use threshold ≥0.70 for BUY signals")
-print(f"   4. Monitor individual model agreement")
 
 print("\n" + "="*80)

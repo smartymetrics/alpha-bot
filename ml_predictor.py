@@ -13,6 +13,7 @@ import time
 import random
 from typing import Dict, Optional
 import logging
+from sklearn.ensemble import RandomForestClassifier, IsolationForest
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -26,6 +27,8 @@ class SolanaTokenPredictor:
         self.xgb_model = joblib.load(f'{model_dir}/xgboost_model.pkl')
         self.lgb_model = joblib.load(f'{model_dir}/lightgbm_model.pkl')
         self.cat_model = joblib.load(f'{model_dir}/catboost_model.pkl')
+        self.rf_model = joblib.load(f'{model_dir}/rf_model.pkl')
+        self.iso_forest = joblib.load(f'{model_dir}/isolation_forest.pkl')
         
         with open(f'{model_dir}/model_metadata.json', 'r') as f:
             self.metadata = json.load(f)
@@ -401,6 +404,21 @@ class SolanaTokenPredictor:
             'volume_quality': volume / (1 + abs(price_change)) if price_change != 0 else volume,
         })
         
+        # === ANOMALY DETECTION ===
+        # Prepare features for isolation forest (must match training)
+        anomaly_input = pd.DataFrame([{
+            'log_liquidity': features.get('log_liquidity', 0),
+            'log_volume': features.get('log_volume', 0),
+            'price_change_h24_pct': features.get('price_change_h24_pct', 0),
+            'top_10_holders_pct': features.get('top_10_holders_pct', 0),
+            'creator_balance_pct': features.get('creator_balance_pct', 0)
+        }])
+        
+        # Calculate anomaly score (higher is more anomalous)
+        # Note: score_samples returns negative values, we negated it in training
+        features['anomaly_score'] = -self.iso_forest.score_samples(anomaly_input)[0]
+        features['is_anomaly'] = int(self.iso_forest.predict(anomaly_input)[0] == -1)
+        
         return features
     
     def predict(self, mint: str, threshold: float = 0.70) -> Dict:
@@ -458,12 +476,14 @@ class SolanaTokenPredictor:
         xgb_proba = self.xgb_model.predict_proba(X_selected_df)[0, 1]
         lgb_proba = self.lgb_model.predict_proba(X_selected_df)[0, 1]
         cat_proba = self.cat_model.predict_proba(X_selected_df)[0, 1]
+        rf_proba = self.rf_model.predict_proba(X_selected_df)[0, 1]
         
         # Ensemble prediction
         ensemble_proba = (
-            self.ensemble_weights['catboost'] * cat_proba +
-            self.ensemble_weights['lightgbm'] * lgb_proba +
-            self.ensemble_weights['xgboost'] * xgb_proba
+            self.ensemble_weights.get('catboost', 0.25) * cat_proba +
+            self.ensemble_weights.get('lightgbm', 0.25) * lgb_proba +
+            self.ensemble_weights.get('xgboost', 0.25) * xgb_proba +
+            self.ensemble_weights.get('random_forest', 0.25) * rf_proba
         )
         
         # Decision logic
@@ -485,7 +505,7 @@ class SolanaTokenPredictor:
             risk_tier = "VERY HIGH RISK"
         
         # Model agreement score
-        model_predictions = [xgb_proba, lgb_proba, cat_proba]
+        model_predictions = [xgb_proba, lgb_proba, cat_proba, rf_proba]
         agreement = 1 - (np.std(model_predictions) / np.mean(model_predictions)) if np.mean(model_predictions) > 0 else 0
         
         return {
@@ -498,7 +518,8 @@ class SolanaTokenPredictor:
             'individual_predictions': {
                 'xgboost': float(xgb_proba),
                 'lightgbm': float(lgb_proba),
-                'catboost': float(cat_proba)
+                'catboost': float(cat_proba),
+                'random_forest': float(rf_proba)
             },
             'key_metrics': {
                 'token_age_hours': float(features.get('token_age_hours', 0)),
