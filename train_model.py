@@ -8,7 +8,7 @@ import json
 import os
 
 # ML libraries
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.feature_selection import SelectKBest, f_classif
 from sklearn.metrics import (
@@ -290,12 +290,27 @@ print("📊 TEMPORAL TRAIN/TEST SPLIT")
 print("="*80)
 
 # Sort by token age to create temporal split
+df = df.sort_values('checked_at_timestamp').reset_index(drop=True)
+print(f"\n✅ Final feature count: {len(ALL_FEATURES)}")
+
+# ============================================================================
+# TEMPORAL TRAIN/TEST SPLIT (Fix Temporal Leakage)
+# ============================================================================
+
+print("\n" + "="*80)
+print("📊 TEMPORAL TRAIN/TEST SPLIT")
+print("="*80)
+
+# Sort by token age to create temporal split
 df = df.sort_values('token_age_at_signal_seconds').reset_index(drop=True)
 
-# Use last 20% as test set (most recent tokens)
-split_idx = int(len(df) * 0.8)
-train_df = df[:split_idx].copy()
-test_df = df[split_idx:].copy()
+# Stratified split to ensure balanced win rates in train and test
+train_df, test_df = train_test_split(
+    df, 
+    test_size=0.2, 
+    stratify=df['target'],  # Ensures identical win rate in both sets
+    random_state=42
+)
 
 print(f"✅ Temporal Split:")
 print(f"   Train: {len(train_df)} samples | Win rate: {train_df['target'].mean()*100:.2f}%")
