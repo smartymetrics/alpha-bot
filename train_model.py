@@ -584,6 +584,7 @@ metadata = {
     'trained_at': datetime.now().isoformat(),
     'performance': {
         'test_auc': float(best_ensemble_auc),
+        'cv_auc_mean': float(best_cv_score),
     },
     'selected_features': selected_features,
     'all_features': ALL_FEATURES,
