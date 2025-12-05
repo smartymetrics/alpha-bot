@@ -421,7 +421,7 @@ class SolanaTokenPredictor:
         
         return features
     
-    def predict(self, mint: str, threshold: float = 0.70) -> Dict:
+    def predict(self, mint: str, threshold: float = 0.60) -> Dict:
         """
         Predict if token will reach 50% gain
         
