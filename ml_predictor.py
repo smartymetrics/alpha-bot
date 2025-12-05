@@ -579,7 +579,7 @@ if __name__ == "__main__":
         print(f"No mint provided, using example: {mint_address}")
     
     # Get prediction
-    result = predictor.predict(mint_address, threshold=0.70)
+    result = predictor.predict(mint_address, threshold=0.60)
     
     if 'error' in result:
         print(f"\n❌ Error: {result['error']}")
