@@ -2008,8 +2008,18 @@ class Monitor:
                 if self.debug:
                     print(f"[Security] ⚠️ Exception getting creator balance RPC for {mint}: {e}")
         else:
+            # Immutable mint - try to find creator from creation transaction
             if self.debug:
-                print(f"[Security] ℹ️ Skipping creator balance check - no mint authority found for {mint}")
+                print(f"[Security] ℹ️ Immutable mint detected for {mint} - attempting to find creator from creation tx...")
+            
+            creator = await self._get_creator_from_creation_tx(mint)
+            if creator:
+                creator_balance_pct, success = await self._get_creator_balance_for_immutable_mint(
+                    mint, creator, decimals, supply
+                )
+            else:
+                if self.debug:
+                    print(f"[Security] ⚠️ Could not find creator for immutable mint {mint}")
 
         # 4. Get Liquidity (Optional: Quick DexScreener check just for the Fallback)
         # We do this because RugCheck usually gives us this, and we need it for the gate.
@@ -2230,7 +2240,128 @@ class Monitor:
 
         return (0, 0)
 
-    async def _get_creator_balance_rpc(self, mint: str, decimals: int) -> tuple:
+    async def _get_creator_from_creation_tx(self, mint: str) -> str:
+        """
+        Extract creator address from token creation transaction.
+        When mint authority is None (immutable), we can still find the creator
+        by looking at who initiated the token creation transaction.
+        
+        Logic:
+        1. Get first signature (token creation tx) via getSignaturesForAddress
+        2. Parse transaction to find who paid for it (likely the creator)
+        3. Return creator address
+        """
+        try:
+            # Get the first (oldest) transaction - this should be token creation
+            sig_data = await self.sol_client.make_rpc_call(
+                "getSignaturesForAddress",
+                [mint, {"limit": 1}]  # Get only the first signature
+            )
+            
+            sigs = sig_data.get("result", [])
+            if not sigs:
+                if self.debug:
+                    print(f"[Security] ℹ️ No signatures found for {mint}")
+                return None
+            
+            sig = sigs[0].get("signature")
+            if not sig:
+                return None
+            
+            # Parse the transaction (with version support for Solana versioned transactions)
+            tx_data = await self.sol_client.make_rpc_call(
+                "getTransaction",
+                [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]
+            )
+            
+            if tx_data.get("error"):
+                if self.debug:
+                    print(f"[Security] ⚠️ Could not fetch creation tx for {mint}: {tx_data.get('error')}")
+                return None
+            
+            tx = tx_data.get("result", {})
+            if not tx:
+                # Retry with explicit version 0 support
+                if self.debug:
+                    print(f"[Security] ℹ️ Retrying getTransaction with explicit version support for {mint}...")
+                tx_data = await self.sol_client.make_rpc_call(
+                    "getTransaction",
+                    [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]
+                )
+                if tx_data.get("error"):
+                    if self.debug:
+                        print(f"[Security] ⚠️ Retry also failed for {mint}: {tx_data.get('error')}")
+                    return None
+                tx = tx_data.get("result", {})
+                if not tx:
+                    return None
+            
+            # Get the fee payer (first signer) - usually the creator
+            message = tx.get("transaction", {}).get("message", {})
+            account_keys = message.get("accountKeys", [])
+            
+            if account_keys:
+                creator = account_keys[0].get("pubkey") if isinstance(account_keys[0], dict) else str(account_keys[0])
+                if self.debug:
+                    print(f"[Security] ✅ Found creator from creation tx: {creator[:8] if creator else 'None'}...")
+                return creator
+            
+            return None
+            
+        except Exception as e:
+            if self.debug:
+                print(f"[Security] ⚠️ Failed to extract creator from creation tx for {mint}: {e}")
+            return None
+
+    async def _get_creator_balance_for_immutable_mint(self, mint: str, creator: str, decimals: int, supply: int) -> tuple:
+        """
+        Get creator balance when mint is immutable (no mint authority).
+        Uses the extracted creator address to find their token accounts.
+        
+        Returns (creator_balance_normalized, success_flag).
+        """
+        if not creator:
+            return (0.0, False)
+        
+        try:
+            data = await self.sol_client.make_rpc_call(
+                "getTokenAccountsByOwner",
+                [
+                    creator,
+                    {"mint": mint},
+                    {"encoding": "jsonParsed"}
+                ]
+            )
+            
+            if data.get("error"):
+                if self.debug:
+                    print(f"[Security] ⚠️ Failed to get token accounts for creator {creator[:8]}... on {mint}")
+                return (0.0, False)
+            
+            accounts = data.get("result", {}).get("value", [])
+            raw_balance = 0.0
+            
+            for acc in accounts:
+                amt_info = acc.get("account", {}).get("data", {}).get("parsed", {}).get("info", {}).get("tokenAmount", {})
+                raw_balance += float(amt_info.get("amount", 0))
+            
+            if raw_balance > 0:
+                # Normalize by decimals
+                normalized = raw_balance / (10 ** decimals) if decimals > 0 else raw_balance
+                creator_pct = (normalized / (supply / (10 ** decimals))) * 100 if supply > 0 and decimals > 0 else 0.0
+                
+                if self.debug:
+                    print(f"[Security] ✅ Immutable mint creator balance: {creator_pct:.2f}% (raw: {raw_balance})")
+                return (creator_pct, True)
+            else:
+                if self.debug:
+                    print(f"[Security] ℹ️ Creator {creator[:8]}... has 0 balance in {mint}")
+                return (0.0, True)
+            
+        except Exception as e:
+            if self.debug:
+                print(f"[Security] ⚠️ Exception getting immutable mint creator balance for {mint}: {e}")
+            return (0.0, False)
         """
         Get creator balance via RPC.
         Logic:
