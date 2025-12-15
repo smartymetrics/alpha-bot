@@ -399,6 +399,10 @@ f_scores = selector_f.scores_
 f_selected_mask = selector_f.get_support()
 selected_features = [ALL_FEATURES[i] for i in range(len(ALL_FEATURES)) if f_selected_mask[i]]
 
+# Convert back to DataFrame with feature names to avoid sklearn warnings
+X_train_selected = pd.DataFrame(X_train_selected, columns=selected_features, index=X_train.index)
+X_test_selected = pd.DataFrame(X_test_selected, columns=selected_features, index=X_test.index)
+
 print(f"\n Top {best_k} Selected Features:")
 feature_scores = list(zip(ALL_FEATURES, f_scores))
 feature_scores.sort(key=lambda x: x[1] if not np.isnan(x[1]) else -1, reverse=True)

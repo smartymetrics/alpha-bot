@@ -1966,6 +1966,12 @@ class Monitor:
             mint_authority = parsed.get("mintAuthority")
             freeze_authority = parsed.get("freezeAuthority")
             decimals = int(parsed.get("decimals", 0))
+            
+            if self.debug:
+                if not mint_authority and not freeze_authority:
+                    print(f"[Security] ℹ️ No authorities found for {mint} (immutable mint)")
+                else:
+                    print(f"[Security] ✅ Got authorities for {mint}: mint_auth={mint_authority[:8] if mint_authority else 'None'}..., freeze_auth={freeze_authority[:8] if freeze_authority else 'None'}...")
         except Exception as e:
             if self.debug:
                 print(f"[Security] ⚠️ RPC Authority check failed: {e}")
@@ -1976,8 +1982,11 @@ class Monitor:
             s_data = await self.sol_client.make_rpc_call("getTokenSupply", [mint])
             amount_str = s_data.get("result", {}).get("value", {}).get("amount", "0")
             supply = int(amount_str)
-        except Exception:
-            pass
+            if self.debug:
+                print(f"[Security] ✅ Got supply for {mint}: {supply}")
+        except Exception as e:
+            if self.debug:
+                print(f"[Security] ⚠️ Failed to get supply for {mint}: {e}")
 
         # 3. Get Creator Balance (We assume Mint Authority == Creator for new tokens)
         creator_balance_pct = 0.0
@@ -1991,8 +2000,16 @@ class Monitor:
                     total_supply_normalized = supply / (10 ** decimals) if decimals > 0 else supply
                     creator_balance_pct = (normalized / total_supply_normalized) * 100
                     creator_balance_raw = normalized # Store for record
-            except Exception:
-                pass
+                    if self.debug:
+                        print(f"[Security] ✅ Creator balance for {mint}: {creator_balance_pct:.2f}%")
+                elif self.debug and not success:
+                    print(f"[Security] ⚠️ Failed to get creator balance for {mint} from RPC")
+            except Exception as e:
+                if self.debug:
+                    print(f"[Security] ⚠️ Exception getting creator balance RPC for {mint}: {e}")
+        else:
+            if self.debug:
+                print(f"[Security] ℹ️ Skipping creator balance check - no mint authority found for {mint}")
 
         # 4. Get Liquidity (Optional: Quick DexScreener check just for the Fallback)
         # We do this because RugCheck usually gives us this, and we need it for the gate.
@@ -2001,8 +2018,11 @@ class Monitor:
             dex_data = await self._run_dexscreener_check(mint)
             if dex_data.get("ok"):
                 total_lp_usd = dex_data.get("liquidity_usd", 0.0)
-        except Exception:
-            pass
+                if self.debug:
+                    print(f"[Security] ✅ Got liquidity for {mint}: ${total_lp_usd:.2f}")
+        except Exception as e:
+            if self.debug:
+                print(f"[Security] ⚠️ Failed to get liquidity for {mint}: {e}")
 
         return {
             "ok": True,
