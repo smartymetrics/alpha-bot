@@ -1820,7 +1820,8 @@ class WinnerMonitor:
                 "ts": datetime.now(timezone.utc).isoformat(),
                 "result": overlap_result, # This now contains 'ml_prediction'
                 "check_type": check_type,
-                "security": "passed"  # This is the "passed" status checked by Requirement 2
+                "security": "passed",  # This is the "passed" status checked by Requirement 2
+                "ML_PASSED": overlap_result.get("ML_PASSED", False)
             }
             
             current_store_state.setdefault(mint, []).append(entry)
