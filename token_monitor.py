@@ -47,6 +47,7 @@ load_dotenv()
 
 PROBATION_TOP_N = int(os.getenv("PROBATION_TOP_N", "3"))
 PROBATION_THRESHOLD_PCT = float(os.getenv("PROBATION_THRESHOLD_PCT", "40"))
+ML_PREDICTION_THRESHOLD = float(os.getenv("ML_PREDICTION_THRESHOLD", "0.70"))
 MAX_CREATOR_PCT = 20
 
 COINGECKO_PRO_API_KEY = os.environ.get("GECKO_API")
@@ -2572,9 +2573,18 @@ class Monitor:
         # ML Prediction
         ml_prediction_result = None
         try:            
-            ml_prediction_result = self.ml_classifier.predict(mint, threshold=0.70)
+            ml_prediction_result = self.ml_classifier.predict(mint, threshold=ML_PREDICTION_THRESHOLD)
         except Exception as e:
             ml_prediction_result = {'action': 'ERROR', 'error': str(e)}
+        
+        # Calculate ML_PASSED based on probability vs threshold
+        ml_probability = ml_prediction_result.get("win_probability")
+        ml_passed = False
+        if ml_probability is not None:
+            try:
+                ml_passed = float(ml_probability) >= ML_PREDICTION_THRESHOLD
+            except (ValueError, TypeError):
+                ml_passed = False
 
         # Save Final
         obj = safe_load_overlap(self.overlap_store)
@@ -2596,7 +2606,8 @@ class Monitor:
                 "error": ml_prediction_result.get("error"),
                 "key_metrics": ml_prediction_result.get("key_metrics"),
                 "warnings": ml_prediction_result.get("warnings")
-            }
+            },
+            "ML_PASSED": ml_passed
         })
         self.overlap_store.save(obj)
         

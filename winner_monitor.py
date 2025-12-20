@@ -71,6 +71,7 @@ SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "monitor-data")
 # --- Probation Config ---
 PROBATION_TOP_N = int(os.getenv("PROBATION_TOP_N", "3"))
 PROBATION_THRESHOLD_PCT = float(os.getenv("PROBATION_THRESHOLD_PCT", "40"))
+ML_PREDICTION_THRESHOLD = float(os.getenv("ML_PREDICTION_THRESHOLD", "0.70"))
 
 # --- Monitoring Window Config ---
 TOKEN_MONITORING_WINDOW_HOURS = int(os.getenv("TOKEN_MONITORING_WINDOW_HOURS", "6"))
@@ -1634,7 +1635,7 @@ class AlphaTokenAnalyzer:
 
                 ml_prediction_result = self.ml_classifier.predict(
                     mint, 
-                    threshold=0.70
+                    threshold=ML_PREDICTION_THRESHOLD
                 )
                 
                 if not ml_prediction_result or ml_prediction_result.get("error"):
@@ -1651,6 +1652,15 @@ class AlphaTokenAnalyzer:
                     'error': str(e)
                 }
             
+            # Calculate ML_PASSED based on probability vs threshold
+            ml_probability = ml_prediction_result.get("win_probability")
+            ml_passed = False
+            if ml_probability is not None:
+                try:
+                    ml_passed = float(ml_probability) >= ML_PREDICTION_THRESHOLD
+                except (ValueError, TypeError):
+                    ml_passed = False
+            
             result["ml_prediction"] = {
                 "probability": ml_prediction_result.get("win_probability"),
                 "confidence": ml_prediction_result.get("confidence"),
@@ -1660,6 +1670,7 @@ class AlphaTokenAnalyzer:
                 "key_metrics": ml_prediction_result.get("key_metrics"),
                 "warnings": ml_prediction_result.get("warnings")
             }
+            result["ML_PASSED"] = ml_passed
         
         if self.debug and not final_needs_monitoring:
             ml_prob_str = "N/A (Skipped)"
