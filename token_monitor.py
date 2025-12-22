@@ -47,7 +47,8 @@ load_dotenv()
 
 PROBATION_TOP_N = int(os.getenv("PROBATION_TOP_N", "3"))
 PROBATION_THRESHOLD_PCT = float(os.getenv("PROBATION_THRESHOLD_PCT", "40"))
-ML_PREDICTION_THRESHOLD = float(os.getenv("ML_PREDICTION_THRESHOLD", "0.70"))
+ML_PREDICTION_THRESHOLD = float(os.getenv("ML_PREDICTION_THRESHOLD", "0.50"))
+ML_ACTION_THRESHOLD = float(os.getenv("ML_ACTION_THRESHOLD", "0.70"))
 MAX_CREATOR_PCT = 20
 
 COINGECKO_PRO_API_KEY = os.environ.get("GECKO_API")
@@ -2573,7 +2574,11 @@ class Monitor:
         # ML Prediction
         ml_prediction_result = None
         try:            
-            ml_prediction_result = self.ml_classifier.predict(mint, threshold=ML_PREDICTION_THRESHOLD)
+            ml_prediction_result = self.ml_classifier.predict(
+                mint, 
+                threshold=ML_PREDICTION_THRESHOLD,
+                action_threshold=ML_ACTION_THRESHOLD
+            )
         except Exception as e:
             ml_prediction_result = {'action': 'ERROR', 'error': str(e)}
         

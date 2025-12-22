@@ -71,7 +71,8 @@ SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "monitor-data")
 # --- Probation Config ---
 PROBATION_TOP_N = int(os.getenv("PROBATION_TOP_N", "3"))
 PROBATION_THRESHOLD_PCT = float(os.getenv("PROBATION_THRESHOLD_PCT", "40"))
-ML_PREDICTION_THRESHOLD = float(os.getenv("ML_PREDICTION_THRESHOLD", "0.70"))
+ML_PREDICTION_THRESHOLD = float(os.getenv("ML_PREDICTION_THRESHOLD", "0.50"))
+ML_ACTION_THRESHOLD = float(os.getenv("ML_ACTION_THRESHOLD", "0.70"))
 
 # --- Monitoring Window Config ---
 TOKEN_MONITORING_WINDOW_HOURS = int(os.getenv("TOKEN_MONITORING_WINDOW_HOURS", "6"))
@@ -1636,7 +1637,8 @@ class AlphaTokenAnalyzer:
 
                 ml_prediction_result = self.ml_classifier.predict(
                     mint, 
-                    threshold=ML_PREDICTION_THRESHOLD
+                    threshold=ML_PREDICTION_THRESHOLD,
+                    action_threshold=ML_ACTION_THRESHOLD
                 )
                 
                 if not ml_prediction_result or ml_prediction_result.get("error"):

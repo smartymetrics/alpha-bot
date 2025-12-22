@@ -421,13 +421,14 @@ class SolanaTokenPredictor:
         
         return features
     
-    def predict(self, mint: str, threshold: float = 0.60) -> Dict:
+    def predict(self, mint: str, threshold: float = 0.50, action_threshold: float = 0.70) -> Dict:
         """
         Predict if token will reach 50% gain
         
         Args:
             mint: Token mint address
-            threshold: Probability threshold for BUY signal (default 0.70)
+            threshold: Probability threshold for filtering/upload (default 0.50)
+            action_threshold: Probability threshold for BUY/CONSIDER actions (default 0.70)
         
         Returns:
             dict with prediction, probability, and recommendation
@@ -486,8 +487,8 @@ class SolanaTokenPredictor:
             self.ensemble_weights.get('random_forest', 0.25) * rf_proba
         )
         
-        # Decision logic
-        if ensemble_proba >= threshold:
+        # Decision logic (using action_threshold, not filtering threshold)
+        if ensemble_proba >= action_threshold:
             action = "BUY"
             confidence = "HIGH"
             risk_tier = "LOW RISK"
