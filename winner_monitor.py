@@ -1622,6 +1622,7 @@ class AlphaTokenAnalyzer:
         
         # --- ML PREDICTION ---
         ml_prediction_result = None
+        ml_passed = False
 
         is_cleared_for_upload = (
             not final_needs_monitoring and 
@@ -1654,7 +1655,6 @@ class AlphaTokenAnalyzer:
             
             # Calculate ML_PASSED based on probability vs threshold
             ml_probability = ml_prediction_result.get("win_probability")
-            ml_passed = False
             if ml_probability is not None:
                 try:
                     ml_passed = float(ml_probability) >= ML_PREDICTION_THRESHOLD
@@ -1670,7 +1670,9 @@ class AlphaTokenAnalyzer:
                 "key_metrics": ml_prediction_result.get("key_metrics"),
                 "warnings": ml_prediction_result.get("warnings")
             }
-            result["ML_PASSED"] = ml_passed
+        
+        # Set ML_PASSED in result for all tokens (cleared or not)
+        result["ML_PASSED"] = ml_passed
         
         if self.debug and not final_needs_monitoring:
             ml_prob_str = "N/A (Skipped)"

@@ -2586,6 +2586,9 @@ class Monitor:
             except (ValueError, TypeError):
                 ml_passed = False
 
+        # Add ML_PASSED to overlap_result
+        overlap_result["ML_PASSED"] = ml_passed
+
         # Save Final
         obj = safe_load_overlap(self.overlap_store)
         obj.setdefault(mint, []).append({
