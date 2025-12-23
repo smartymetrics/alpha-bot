@@ -2,33 +2,38 @@
   "model_version": "4.0_neural_anomaly",
   "model_type": "6-Model Ensemble",
   "ensemble_weights": {
-    "xgboost": 0.2,
-    "lightgbm": 0.2,
-    "catboost": 0.2,
-    "random_forest": 0.4,
+    "xgboost": 0.33,
+    "lightgbm": 0.33,
+    "catboost": 0.33,
+    "random_forest": 0.0,
     "logistic_regression": 0.0,
     "mlp_neural_network": 0.0
   },
-  "trained_at": "2025-12-22T21:34:54.698973",
+  "trained_at": "2025-12-23T09:08:54.349226",
   "performance": {
-    "test_auc": 0.6514652014652015,
-    "cv_auc_mean": 0.5974950722106724
+    "test_auc": 0.6559981579553303,
+    "cv_auc_mean": 0.587614254309846
   },
   "selected_features": [
+    "price_change_h24_pct",
+    "fdv_to_liquidity_ratio",
     "top_10_holders_pct",
     "total_lp_locked_usd",
+    "is_lp_locked_95_plus",
     "total_insider_networks",
     "total_insider_token_amount",
+    "time_of_day_utc",
     "token_age_at_signal_seconds",
     "log_liquidity",
     "log_volume",
     "log_fdv",
+    "log_lp_locked",
     "liquidity_depth_pct",
     "whale_dominated",
     "volume_quality",
     "peak_hours",
     "anomaly_score",
-    "is_anomaly",
+    "creator_sold_out",
     "is_high_volume"
   ],
   "all_features": [

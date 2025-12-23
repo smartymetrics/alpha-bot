@@ -1,5 +1,5 @@
 {
-  "timestamp": "2025-12-23T08:01:29.486335",
+  "timestamp": "2025-12-23T09:10:12.985344",
   "signal_type_aware": true,
   "description": "Signal-type aware ensemble (ALPHA vs DISCOVERY)",
   "all_features": [
@@ -34,16 +34,14 @@
     "is_high_volume"
   ],
   "selected_features": [
+    "price_change_h24_pct",
     "liquidity_to_volume_ratio",
     "fdv_to_liquidity_ratio",
     "top_10_holders_pct",
     "total_lp_locked_usd",
     "is_lp_locked_95_plus",
     "total_insider_networks",
-    "largest_insider_network_size",
     "total_insider_token_amount",
-    "pump_dump_risk_score",
-    "is_weekend_utc",
     "token_age_at_signal_seconds",
     "is_very_fresh",
     "log_liquidity",
@@ -51,6 +49,8 @@
     "log_fdv",
     "log_lp_locked",
     "liquidity_depth_pct",
+    "whale_dominated",
+    "strong_uptrend",
     "volume_quality",
     "peak_hours",
     "is_high_volume"
@@ -63,20 +63,20 @@
     "randomforest": 0.25
   },
   "test_metrics": {
-    "ensemble_auc": 0.6093406593406593,
-    "xgboost_auc": 0.6033882783882784,
-    "lightgbm_auc": 0.5913919413919414,
-    "catboost_auc": 0.6216117216117216,
-    "randomforest_auc": 0.6230769230769231
+    "ensemble_auc": 0.6216900759843427,
+    "xgboost_auc": 0.6152429196408012,
+    "lightgbm_auc": 0.6141683935835444,
+    "catboost_auc": 0.6325120884181441,
+    "randomforest_auc": 0.6181594903676414
   },
   "data_summary": {
-    "total_samples": 1053,
-    "train_samples": 842,
-    "test_samples": 211,
+    "total_samples": 1148,
+    "train_samples": 918,
+    "test_samples": 230,
     "signal_type_distribution": {
-      "alpha": 983,
-      "discovery": 70
+      "alpha": 1066,
+      "discovery": 82
     },
-    "overall_win_rate": 0.5707502374169041
+    "overall_win_rate": 0.5618466898954704
   }
 }
