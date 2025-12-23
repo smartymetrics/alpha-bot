@@ -8,6 +8,7 @@ import numpy as np
 import joblib
 import json
 import requests
+import os
 from datetime import datetime
 import time
 import random
@@ -21,25 +22,127 @@ logger = logging.getLogger(__name__)
 
 class SolanaTokenPredictor:
     def __init__(self, model_dir='models'):
-        """Load all models and preprocessing artifacts"""
-        logger.info("Loading models...")
-        self.selector = joblib.load(f'{model_dir}/feature_selector.pkl')
-        self.xgb_model = joblib.load(f'{model_dir}/xgboost_model.pkl')
-        self.lgb_model = joblib.load(f'{model_dir}/lightgbm_model.pkl')
-        self.cat_model = joblib.load(f'{model_dir}/catboost_model.pkl')
-        self.rf_model = joblib.load(f'{model_dir}/rf_model.pkl')
-        self.iso_forest = joblib.load(f'{model_dir}/isolation_forest.pkl')
+        """
+        Load all models and preprocessing artifacts.
         
-        with open(f'{model_dir}/model_metadata.json', 'r') as f:
+        Supports two model sets:
+        1. models/signal_aware/ (if signal_type provided)
+           - Trained with signal_type awareness (requires 'alpha' or 'discovery')
+           - Better performance on signal-type-specific data
+        2. models/ (DEFAULT)
+           - Original unified model
+           - Used when signal_type not provided
+        """
+        logger.info("Loading models...")
+        
+        # Always load standard models first
+        self.model_dir = 'models'
+        self.selector = joblib.load(f'{self.model_dir}/feature_selector.pkl')
+        self.xgb_model = joblib.load(f'{self.model_dir}/xgboost_model.pkl')
+        self.lgb_model = joblib.load(f'{self.model_dir}/lightgbm_model.pkl')
+        self.cat_model = joblib.load(f'{self.model_dir}/catboost_model.pkl')
+        self.rf_model = joblib.load(f'{self.model_dir}/rf_model.pkl')
+        self.iso_forest = joblib.load(f'{self.model_dir}/isolation_forest.pkl')
+        
+        # Load scaler
+        try:
+            self.scaler = joblib.load(f'{self.model_dir}/scaler.pkl')
+        except FileNotFoundError:
+            from sklearn.preprocessing import StandardScaler
+            self.scaler = StandardScaler()
+            logger.warning("Scaler not found, using default StandardScaler")
+        
+        with open(f'{self.model_dir}/model_metadata.json', 'r') as f:
             self.metadata = json.load(f)
         
         self.ensemble_weights = self.metadata['ensemble_weights']
         self.selected_features = self.metadata['selected_features']
-        self.all_features = self.metadata['all_features']
         
-        logger.info(f"✅ Loaded {self.metadata['model_type']} model")
-        logger.info(f"   Test AUC: {self.metadata['performance']['test_auc']:.4f}")
+        # Load all_features if available
+        if 'all_features' in self.metadata:
+            self.all_features = self.metadata['all_features']
+        else:
+            self.all_features = self.selected_features
+        
+        logger.info(f"📦 Loaded STANDARD model from {self.model_dir}/")
+        
+        if 'test_metrics' in self.metadata:
+            auc = self.metadata['test_metrics'].get('ensemble_auc', self.metadata.get('performance', {}).get('test_auc', 0))
+            logger.info(f"   Ensemble AUC: {auc:.4f}")
+        
         logger.info(f"   Selected features: {len(self.selected_features)}")
+        
+        # Check if signal-aware models are available (optional enhancement)
+        self.signal_aware_available = os.path.exists('models/signal_aware/xgboost_model.pkl')
+        if self.signal_aware_available:
+            logger.info("🎯 Signal-aware models also available!")
+            logger.info("   Use signal_type='alpha' or 'discovery' for better results")
+        
+        # Current active model set (will be updated in predict if signal_type provided)
+        self.current_model_dir = self.model_dir
+    
+    def _load_signal_aware_models(self):
+        """Load signal-aware models if not already loaded"""
+        if not hasattr(self, '_signal_aware_loaded'):
+            logger.info("Loading signal-aware models...")
+            signal_aware_dir = 'models/signal_aware'
+            self.selector = joblib.load(f'{signal_aware_dir}/feature_selector.pkl')
+            self.xgb_model = joblib.load(f'{signal_aware_dir}/xgboost_model.pkl')
+            self.lgb_model = joblib.load(f'{signal_aware_dir}/lightgbm_model.pkl')
+            self.cat_model = joblib.load(f'{signal_aware_dir}/catboost_model.pkl')
+            self.rf_model = joblib.load(f'{signal_aware_dir}/rf_model.pkl')
+            self.iso_forest = joblib.load(f'{signal_aware_dir}/isolation_forest.pkl')
+            
+            try:
+                self.scaler = joblib.load(f'{signal_aware_dir}/scaler.pkl')
+            except FileNotFoundError:
+                pass  # Use existing scaler
+            
+            with open(f'{signal_aware_dir}/model_metadata.json', 'r') as f:
+                self.metadata = json.load(f)
+            
+            self.ensemble_weights = self.metadata['ensemble_weights']
+            self.selected_features = self.metadata['selected_features']
+            
+            if 'all_features' in self.metadata:
+                self.all_features = self.metadata['all_features']
+            else:
+                self.all_features = self.selected_features
+            
+            self.current_model_dir = signal_aware_dir
+            self._signal_aware_loaded = True
+            logger.info("🎯 Switched to SIGNAL-AWARE models")
+    
+    def _load_standard_models(self):
+        """Load standard models"""
+        if self.current_model_dir != 'models':
+            logger.info("Loading standard models...")
+            self.model_dir = 'models'
+            self.selector = joblib.load(f'{self.model_dir}/feature_selector.pkl')
+            self.xgb_model = joblib.load(f'{self.model_dir}/xgboost_model.pkl')
+            self.lgb_model = joblib.load(f'{self.model_dir}/lightgbm_model.pkl')
+            self.cat_model = joblib.load(f'{self.model_dir}/catboost_model.pkl')
+            self.rf_model = joblib.load(f'{self.model_dir}/rf_model.pkl')
+            self.iso_forest = joblib.load(f'{self.model_dir}/isolation_forest.pkl')
+            
+            try:
+                self.scaler = joblib.load(f'{self.model_dir}/scaler.pkl')
+            except FileNotFoundError:
+                pass
+            
+            with open(f'{self.model_dir}/model_metadata.json', 'r') as f:
+                self.metadata = json.load(f)
+            
+            self.ensemble_weights = self.metadata['ensemble_weights']
+            self.selected_features = self.metadata['selected_features']
+            
+            if 'all_features' in self.metadata:
+                self.all_features = self.metadata['all_features']
+            else:
+                self.all_features = self.selected_features
+            
+            self.current_model_dir = self.model_dir
+            logger.info("📦 Switched to STANDARD models")
     
     def fetch_dexscreener_data(self, mint: str) -> Optional[Dict]:
         """
@@ -256,7 +359,7 @@ class SolanaTokenPredictor:
         
         return sum(risk_components)
     
-    def engineer_features(self, raw_data: Dict) -> Dict:
+    def engineer_features(self, raw_data: Dict, signal_type: Optional[str] = None) -> Dict:
         """Engineer all features from raw API data"""
         now = datetime.utcnow()
         
@@ -404,36 +507,63 @@ class SolanaTokenPredictor:
             'volume_quality': volume / (1 + abs(price_change)) if price_change != 0 else volume,
         })
         
+        # === SIGNAL TYPE FEATURE (for learning different patterns) ===
+        # One-hot encode signal type: 1 = alpha, 0 = discovery, 0.5 = unknown
+        if signal_type and signal_type.upper() == 'ALPHA':
+            features['signal_type_alpha'] = 1.0
+        elif signal_type and signal_type.upper() == 'DISCOVERY':
+            features['signal_type_alpha'] = 0.0
+        else:
+            # Unknown/none - use neutral value
+            features['signal_type_alpha'] = 0.5
+        
         # === ANOMALY DETECTION ===
         # Prepare features for isolation forest (must match training)
+        # Training used: ['log_volume', 'price_change_h24_pct']
         anomaly_input = pd.DataFrame([{
-            'log_liquidity': features.get('log_liquidity', 0),
             'log_volume': features.get('log_volume', 0),
             'price_change_h24_pct': features.get('price_change_h24_pct', 0),
-            'top_10_holders_pct': features.get('top_10_holders_pct', 0),
-            'creator_balance_pct': features.get('creator_balance_pct', 0)
         }])
         
-        # Calculate anomaly score (higher is more anomalous)
-        # Note: score_samples returns negative values, we negated it in training
-        features['anomaly_score'] = -self.iso_forest.score_samples(anomaly_input)[0]
-        features['is_anomaly'] = int(self.iso_forest.predict(anomaly_input)[0] == -1)
+        # Calculate anomaly score (IsolationForest returns -1 for anomalies, 1 for normal)
+        features['anomaly_score'] = int(self.iso_forest.predict(anomaly_input)[0] == -1)
+        features['is_anomaly'] = features['anomaly_score']
         
         return features
     
-    def predict(self, mint: str, threshold: float = 0.50, action_threshold: float = 0.70) -> Dict:
+    def predict(self, mint: str, threshold: float = 0.50, action_threshold: float = 0.70, signal_type: Optional[str] = None) -> Dict:
         """
-        Predict if token will reach 50% gain
+        Predict if token will reach 50% gain.
         
         Args:
             mint: Token mint address
             threshold: Probability threshold for filtering/upload (default 0.50)
             action_threshold: Probability threshold for BUY/CONSIDER actions (default 0.70)
+            signal_type: Signal type indicator:
+                - If using signal-aware models (models/signal_aware/):
+                  REQUIRED. Values: 'alpha' (winner wallets) or 'discovery' (fresh tokens)
+                - If using standard models (models/):
+                  OPTIONAL. Defaults to neutral 0.5 if not provided
         
         Returns:
             dict with prediction, probability, and recommendation
         """
-        logger.info(f"Analyzing token: {mint}")
+        # Load appropriate models based on signal_type
+        if signal_type and signal_type.upper() in ['ALPHA', 'DISCOVERY']:
+            # Signal type provided - use signal-aware models if available
+            if self.signal_aware_available:
+                self._load_signal_aware_models()
+                logger.info(f"Analyzing token: {mint} (signal_type={signal_type})")
+            else:
+                # Signal-aware not available, use standard
+                self._load_standard_models()
+                logger.info(f"Analyzing token: {mint} (signal_type={signal_type}, using standard model)")
+        else:
+            # No signal type or invalid - always use standard models
+            if signal_type:
+                logger.warning(f"⚠️ Invalid signal_type='{signal_type}'. Valid values: 'alpha' or 'discovery'. Using standard model.")
+            self._load_standard_models()
+            logger.info(f"Analyzing token: {mint}")
         
         # Fetch data from APIs
         logger.info("Fetching DexScreener data...")
@@ -451,7 +581,7 @@ class SolanaTokenPredictor:
         
         # Engineer features
         logger.info("Engineering features...")
-        features = self.engineer_features(raw_data)
+        features = self.engineer_features(raw_data, signal_type=signal_type)
         
         # Create DataFrame with all features
         df = pd.DataFrame([features])
@@ -571,16 +701,29 @@ if __name__ == "__main__":
     
     predictor = SolanaTokenPredictor()
     
-    # Get mint from command line or use example
+    # Parse command-line arguments
+    # Usage:
+    #   python ml_predictor.py <mint>
+    #   python ml_predictor.py <mint> alpha
+    #   python ml_predictor.py <mint> discovery
+    #   python ml_predictor.py <mint> alpha 0.50
+    
     if len(sys.argv) > 1:
         mint_address = sys.argv[1]
+        signal_type = sys.argv[2].lower() if len(sys.argv) > 2 else None
+        threshold = float(sys.argv[3]) if len(sys.argv) > 3 else 0.50
     else:
         # Example mint (replace with actual)
         mint_address = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"  # USDC as example
+        signal_type = None
+        threshold = 0.50
         print(f"No mint provided, using example: {mint_address}")
+        print(f"Usage: python ml_predictor.py <mint> [signal_type] [threshold]")
+        print(f"  signal_type: 'alpha' or 'discovery' (optional)")
+        print(f"  threshold: filtering threshold (optional, default 0.50)")
     
     # Get prediction
-    result = predictor.predict(mint_address, threshold=0.60)
+    result = predictor.predict(mint_address, threshold=threshold, action_threshold=0.70, signal_type=signal_type)
     
     if 'error' in result:
         print(f"\n❌ Error: {result['error']}")
@@ -589,6 +732,8 @@ if __name__ == "__main__":
         print("🎯 PREDICTION RESULT")
         print("="*80)
         print(f"\nMint: {result['mint']}")
+        if signal_type:
+            print(f"Signal Type: {signal_type.upper()}")
         print(f"\n🎲 Action: {result['action']}")
         print(f"📊 Win Probability: {result['win_probability']:.1%}")
         print(f"🎯 Confidence: {result['confidence']}")

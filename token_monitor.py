@@ -2577,7 +2577,8 @@ class Monitor:
             ml_prediction_result = self.ml_classifier.predict(
                 mint, 
                 threshold=ML_PREDICTION_THRESHOLD,
-                action_threshold=ML_ACTION_THRESHOLD
+                action_threshold=ML_ACTION_THRESHOLD,
+                signal_type='discovery'
             )
         except Exception as e:
             ml_prediction_result = {'action': 'ERROR', 'error': str(e)}

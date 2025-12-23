@@ -253,6 +253,9 @@ DERIVED_FEATURES = [
     'anomaly_score',
     'is_anomaly',
     
+    # Signal type (for learning different patterns: 1=alpha, 0=discovery, 0.5=unknown)
+    'signal_type_alpha',
+    
     # New
     'creator_sold_out',
     'is_high_volume'

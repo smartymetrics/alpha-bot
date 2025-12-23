@@ -1638,7 +1638,8 @@ class AlphaTokenAnalyzer:
                 ml_prediction_result = self.ml_classifier.predict(
                     mint, 
                     threshold=ML_PREDICTION_THRESHOLD,
-                    action_threshold=ML_ACTION_THRESHOLD
+                    action_threshold=ML_ACTION_THRESHOLD,
+                    signal_type='alpha'
                 )
                 
                 if not ml_prediction_result or ml_prediction_result.get("error"):
