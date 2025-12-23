@@ -519,11 +519,24 @@ class SolanaTokenPredictor:
         
         # === ANOMALY DETECTION ===
         # Prepare features for isolation forest (must match training)
-        # Training used: ['log_volume', 'price_change_h24_pct']
-        anomaly_input = pd.DataFrame([{
-            'log_volume': features.get('log_volume', 0),
-            'price_change_h24_pct': features.get('price_change_h24_pct', 0),
-        }])
+        # Standard model trained with: ['log_liquidity', 'log_volume', 'price_change_h24_pct', 'top_10_holders_pct', 'creator_balance_pct']
+        # Signal-aware model trained with: ['log_volume', 'price_change_h24_pct']
+        
+        if self.current_model_dir == 'models/signal_aware':
+            # Signal-aware: Use 2 features
+            anomaly_input = pd.DataFrame([{
+                'log_volume': features.get('log_volume', 0),
+                'price_change_h24_pct': features.get('price_change_h24_pct', 0),
+            }])
+        else:
+            # Standard model: Use all 5 features
+            anomaly_input = pd.DataFrame([{
+                'log_liquidity': features.get('log_liquidity', 0),
+                'log_volume': features.get('log_volume', 0),
+                'price_change_h24_pct': features.get('price_change_h24_pct', 0),
+                'top_10_holders_pct': features.get('top_10_holders_pct', 0),
+                'creator_balance_pct': features.get('creator_balance_pct', 0),
+            }])
         
         # Calculate anomaly score (IsolationForest returns -1 for anomalies, 1 for normal)
         features['anomaly_score'] = int(self.iso_forest.predict(anomaly_input)[0] == -1)
@@ -594,20 +607,19 @@ class SolanaTokenPredictor:
         # Select features in correct order
         X = df[self.all_features]
         
-        # Apply feature selection (returns DataFrame with selected features)
+        # Apply feature selection (returns numpy array)
         X_selected = self.selector.transform(X)
         
-        # Convert back to DataFrame with selected feature names for models
-        X_selected_df = pd.DataFrame(
-            X_selected, 
-            columns=self.selected_features
-        )
+        # Convert to DataFrame with selected feature names (for models fitted with feature names)
+        X_selected_df = pd.DataFrame(X_selected, columns=self.selected_features)
         
-        # Get predictions from all models (now with proper feature names)
-        xgb_proba = self.xgb_model.predict_proba(X_selected_df)[0, 1]
-        lgb_proba = self.lgb_model.predict_proba(X_selected_df)[0, 1]
-        cat_proba = self.cat_model.predict_proba(X_selected_df)[0, 1]
-        rf_proba = self.rf_model.predict_proba(X_selected_df)[0, 1]
+        # Get predictions from all models
+        # XGBoost, CatBoost, RandomForest: can handle numpy array
+        # LightGBM: needs DataFrame with feature names
+        xgb_proba = self.xgb_model.predict_proba(X_selected)[0, 1]
+        lgb_proba = self.lgb_model.predict_proba(X_selected_df)[0, 1]  # Use DataFrame
+        cat_proba = self.cat_model.predict_proba(X_selected)[0, 1]
+        rf_proba = self.rf_model.predict_proba(X_selected)[0, 1]
         
         # Ensemble prediction
         ensemble_proba = (
