@@ -253,9 +253,6 @@ DERIVED_FEATURES = [
     'anomaly_score',
     'is_anomaly',
     
-    # Signal type (for learning different patterns: 1=alpha, 0=discovery, 0.5=unknown)
-    'signal_type_alpha',
-    
     # New
     'creator_sold_out',
     'is_high_volume'
@@ -299,18 +296,6 @@ if to_drop:
 else:
     print(" No features with correlation > 0.90 found")
 
-print(f"\n Final feature count: {len(ALL_FEATURES)}")
-
-# ============================================================================
-# TEMPORAL TRAIN/TEST SPLIT (Fix Temporal Leakage)
-# ============================================================================
-
-print("\n" + "="*80)
-print(" TEMPORAL TRAIN/TEST SPLIT")
-print("="*80)
-
-# Sort by token age to create temporal split
-df = df.sort_values('checked_at_timestamp').reset_index(drop=True)
 print(f"\n Final feature count: {len(ALL_FEATURES)}")
 
 # ============================================================================

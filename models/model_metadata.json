@@ -9,7 +9,7 @@
     "logistic_regression": 0.0,
     "mlp_neural_network": 0.0
   },
-  "trained_at": "2025-12-26T10:08:04.835941",
+  "trained_at": "2025-12-26T10:21:55.384900",
   "performance": {
     "test_auc": 0.5983760351966874,
     "cv_auc_mean": 0.6019572561692128

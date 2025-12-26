@@ -313,7 +313,8 @@ X_temp = df[ALL_FEATURES].copy()
 corr_matrix = X_temp.corr().abs()
 
 upper_tri = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
-to_drop = [column for column in upper_tri.columns if any(upper_tri[column] > 0.90)]
+# EXEMPT signal_type_alpha from being dropped (User preferred explicit inclusion)
+to_drop = [column for column in upper_tri.columns if any(upper_tri[column] > 0.90) and column != 'signal_type_alpha']
 
 if to_drop:
     print(f" Removing {len(to_drop)} highly correlated features (corr > 0.90):")
