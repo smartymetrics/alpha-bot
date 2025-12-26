@@ -9,21 +9,21 @@
     "logistic_regression": 0.0,
     "mlp_neural_network": 0.0
   },
-  "trained_at": "2025-12-23T09:08:54.349226",
+  "trained_at": "2025-12-26T10:08:04.835941",
   "performance": {
-    "test_auc": 0.6559981579553303,
-    "cv_auc_mean": 0.587614254309846
+    "test_auc": 0.5983760351966874,
+    "cv_auc_mean": 0.6019572561692128
   },
   "selected_features": [
-    "price_change_h24_pct",
     "fdv_to_liquidity_ratio",
     "top_10_holders_pct",
-    "total_lp_locked_usd",
     "is_lp_locked_95_plus",
     "total_insider_networks",
+    "largest_insider_network_size",
     "total_insider_token_amount",
-    "time_of_day_utc",
     "token_age_at_signal_seconds",
+    "is_very_fresh",
+    "insider_supply_pct",
     "log_liquidity",
     "log_volume",
     "log_fdv",

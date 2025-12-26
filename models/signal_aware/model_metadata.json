@@ -1,5 +1,5 @@
 {
-  "timestamp": "2025-12-23T09:10:12.985344",
+  "timestamp": "2025-12-26T10:13:53.041302",
   "signal_type_aware": true,
   "description": "Signal-type aware ensemble (ALPHA vs DISCOVERY)",
   "all_features": [
@@ -37,6 +37,7 @@
     "price_change_h24_pct",
     "liquidity_to_volume_ratio",
     "fdv_to_liquidity_ratio",
+    "creator_balance_pct",
     "top_10_holders_pct",
     "total_lp_locked_usd",
     "is_lp_locked_95_plus",
@@ -50,7 +51,6 @@
     "log_lp_locked",
     "liquidity_depth_pct",
     "whale_dominated",
-    "strong_uptrend",
     "volume_quality",
     "peak_hours",
     "is_high_volume"
@@ -63,20 +63,20 @@
     "randomforest": 0.25
   },
   "test_metrics": {
-    "ensemble_auc": 0.6216900759843427,
-    "xgboost_auc": 0.6152429196408012,
-    "lightgbm_auc": 0.6141683935835444,
-    "catboost_auc": 0.6325120884181441,
-    "randomforest_auc": 0.6181594903676414
+    "ensemble_auc": 0.6592261904761905,
+    "xgboost_auc": 0.6634963768115941,
+    "lightgbm_auc": 0.6381340579710144,
+    "catboost_auc": 0.652238612836439,
+    "randomforest_auc": 0.6632375776397516
   },
   "data_summary": {
-    "total_samples": 1148,
-    "train_samples": 918,
-    "test_samples": 230,
+    "total_samples": 1246,
+    "train_samples": 996,
+    "test_samples": 250,
     "signal_type_distribution": {
-      "alpha": 1066,
-      "discovery": 82
+      "alpha": 1135,
+      "discovery": 111
     },
-    "overall_win_rate": 0.5618466898954704
+    "overall_win_rate": 0.5537720706260032
   }
 }
