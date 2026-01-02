@@ -501,7 +501,7 @@ async def run_full_analysis_task(
         if SUPABASE_AVAILABLE:
             balances, trades = await asyncio.to_thread(get_wallet_data, address, refresh)
         else:
-            trades = await asyncio.to_thread(get_dex_trades_from_moralis, address, interval_days)
+            trades = await asyncio.to_thread(get_dex_trades_from_moralis, address)
             balances, _ = await asyncio.to_thread(get_current_balances_from_helius_rpc, address, False)
         
         if trades is None or balances is None:
@@ -718,7 +718,7 @@ async def get_wallet_token_pnl_paginated(
             balances, trades = await asyncio.to_thread(get_wallet_data, address, refresh)
         else:
             trades = await asyncio.to_thread(get_dex_trades_from_moralis, address, interval_days)
-            balances, _ = await asyncio.to_thread(get_current_balances_from_helius_rpc, address, False)
+            balances, _ = await asyncio.to_thread(get_current_balances_from_helius_rpc, address, interval_days, False)
         
         if trades is None or balances is None:
             raise HTTPException(status_code=500, detail="Failed to fetch wallet data")

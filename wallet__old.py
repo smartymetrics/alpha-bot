@@ -62,9 +62,6 @@ DEXSCREENER_API_URL = "https://api.dexscreener.com/latest/dex/tokens/{}"
 
 # --- Constants ---
 SOL_MINT_ADDRESS = "So11111111111111111111111111111111111111112"
-USDC_MINT_ADDRESS = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-USDT_MINT_ADDRESS = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
-BASE_TOKENS = {SOL_MINT_ADDRESS, USDC_MINT_ADDRESS, USDT_MINT_ADDRESS}
 BALANCE_NOT_BOUGHT_MODE = "clamped"
 
 # --- DexScreener Price Cache ---
@@ -259,14 +256,6 @@ def extract_token_entries(trade: dict):
                     add_entry(inputs, val)
                     add_entry(outputs, val)
 
-    # Support for Moralis Solana Swaps direct fields (mint_in, amount_in, etc.)
-    mint_in = trade.get('mint_in')
-    mint_out = trade.get('mint_out')
-    if mint_in:
-        add_entry(inputs, {'account': mint_in, 'amount': trade.get('amount_in')})
-    if mint_out:
-        add_entry(outputs, {'account': mint_out, 'amount': trade.get('amount_out')})
-
     if not inputs or not outputs:
         for v in trade.values():
             if isinstance(v, dict) and any(key in v for key in ('address','account','mint','tokenAddress')):
@@ -297,26 +286,18 @@ def extract_token_entries(trade: dict):
 
 # --- API Fetching Functions ---
 
-def get_dex_trades_from_moralis(wallet_address: str, interval_days: int = 0):
-    print(f"Fetching historical DEX trades from Moralis (interval: {interval_days} days)...")
+def get_dex_trades_from_moralis(wallet_address: str):
+    print("Fetching historical DEX trades from Moralis...")
     all_trades = []
     cursor = None
     url = f"{MORALIS_BASE_URL}/account/mainnet/{wallet_address}/swaps"
     session = requests.Session()
     max_attempts = len(MORALIS_KEYS) * 2
 
-    # Calculate fromDate if interval_days > 0
-    from_date_str = None
-    if interval_days > 0:
-        from_date = datetime.datetime.now(timezone.utc) - timedelta(days=interval_days)
-        from_date_str = from_date.strftime("%Y-%m-%dT%H:%M:%SZ")
-
     while True:
         params = {"limit": 100}
         if cursor:
             params["cursor"] = cursor
-        if from_date_str:
-            params["fromDate"] = from_date_str
 
         response = None
         data = None
@@ -527,28 +508,28 @@ def process_trade_data(raw_trades: List[Dict[str, Any]]) -> pd.DataFrame:
                 print(f"[DEBUG] Skipping trade (no inputs/outputs found). idx={idx}, keys={list(trade.keys())}")
             continue
 
-        base_in_inputs = any(item['account'] in BASE_TOKENS for item in inputs)
-        base_in_outputs = any(item['account'] in BASE_TOKENS for item in outputs)
+        sol_in_inputs = any(item['account'] == SOL_MINT_ADDRESS for item in inputs)
+        sol_in_outputs = any(item['account'] == SOL_MINT_ADDRESS for item in outputs)
 
-        if not (base_in_inputs or base_in_outputs):
+        if not (sol_in_inputs or sol_in_outputs):
             skipped += 1
             continue
 
-        def find_non_base_token(side_list):
+        def find_non_sol_token(side_list):
             for it in side_list:
-                if it.get('account') and it.get('account') not in BASE_TOKENS and safe_float(it.get('amount')) > 0:
+                if it.get('account') and it.get('account') != SOL_MINT_ADDRESS and safe_float(it.get('amount')) > 0:
                     return it
             return None
 
         token_entry = None
         trade_type = None
 
-        if base_in_inputs:
+        if sol_in_inputs:
             trade_type = 'buy'
-            token_entry = find_non_base_token(outputs) or find_non_base_token(inputs)
-        elif base_in_outputs:
+            token_entry = find_non_sol_token(outputs) or find_non_sol_token(inputs)
+        elif sol_in_outputs:
             trade_type = 'sell'
-            token_entry = find_non_base_token(inputs) or find_non_base_token(outputs)
+            token_entry = find_non_sol_token(inputs) or find_non_sol_token(outputs)
 
         if token_entry is None:
             skipped += 1
@@ -560,7 +541,7 @@ def process_trade_data(raw_trades: List[Dict[str, Any]]) -> pd.DataFrame:
         token_amount = safe_float(token_entry.get('amount'), 0.0)
 
         amount_usd = 0.0
-        for usd_key in ('transactionValueUSD', 'valueUSD', 'amountUSD', 'totalValueUsd', 'usdAmount', 'total_value_usd', 'totalValueUSD', 'usd_value', 'usdValue', 'usd_amount'):
+        for usd_key in ('transactionValueUSD', 'valueUSD', 'amountUSD', 'totalValueUsd', 'usdAmount', 'total_value_usd', 'totalValueUSD'):
             if usd_key in trade and trade.get(usd_key) is not None:
                 amount_usd = safe_float(trade.get(usd_key), 0.0)
                 break
