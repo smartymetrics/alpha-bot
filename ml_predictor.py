@@ -612,7 +612,14 @@ class SolanaTokenPredictor:
         xgb_proba = self.xgb_model.predict_proba(X_selected)[0, 1]
         lgb_proba = self.lgb_model.predict_proba(X_selected_df)[0, 1]
         cat_proba = self.cat_model.predict_proba(X_selected)[0, 1]
-        rf_proba = self.rf_model.predict_proba(X_selected)[0, 1]
+        
+        # Random Forest Prediction (Handle input type difference)
+        if self.current_model_dir == 'models/signal_aware':
+            # Signal-aware RF was trained on numpy array (scaled) -> Pass array
+            rf_proba = self.rf_model.predict_proba(X_selected)[0, 1]
+        else:
+            # Standard RF was trained on DataFrame (with names) -> Pass DataFrame
+            rf_proba = self.rf_model.predict_proba(X_selected_df)[0, 1]
         
         # Ensemble prediction (with fallback weights)
         weights = self.ensemble_weights
