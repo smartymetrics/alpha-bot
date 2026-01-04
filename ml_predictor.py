@@ -466,28 +466,25 @@ class SolanaTokenPredictor:
             'total_insider_token_amount': total_insider_tokens,
         })
         
-        # 🔴 KEY DERIVED INSIDER FEATURES
+        # 🔴 KEY DERIVED INSIDER FEATURES (Aligned with train_model.py v4.0)
         features['insider_supply_pct'] = (total_insider_tokens / token_supply * 100) if token_supply > 0 else 0
-        features['avg_insider_network_size'] = largest_network / total_networks if total_networks > 0 else 0
-        features['insider_density'] = total_insider_tokens / total_networks if total_networks > 0 else 0
-        features['insider_risk_composite'] = (
+        features['insider_risk_score'] = (
             features['insider_supply_pct'] * 0.4 +
-            largest_network * 0.3 +
-            (total_networks * 2) * 0.3
+            largest_network * 0.4 +
+            (total_networks * 2) * 0.2
         )
         
-        # Update concentration risk to include insiders
+        # Update concentration risk (Aligned with train_model.py v4.0)
         features['concentration_risk'] = (
-            top_10_pct * 0.5 +
-            creator_pct * 0.3 +
-            features['insider_supply_pct'] * 0.2
+            top_10_pct * 0.6 +
+            creator_pct * 0.4
         )
         
         # === RISK SCORES ===
         features['pump_dump_risk_score'] = self.calculate_pump_dump_risk(raw_data)
         features['liquidity_risk_score'] = (100 - features['lp_lock_quality']) * 0.5 if features['is_lp_locked_95_plus'] == 0 else 0
         features['insider_holder_risk'] = (
-            features['insider_risk_composite'] * 0.5 +
+            features['insider_risk_score'] * 0.5 +
             features['concentration_risk'] * 0.5
         )
         
@@ -505,7 +502,11 @@ class SolanaTokenPredictor:
             'moderate_uptrend': int(20 < price_change <= 50),
             'weak_momentum': int(price_change < 10),
             'volume_quality': volume / (1 + abs(price_change)) if price_change != 0 else volume,
+            'is_high_volume': int(volume > 50000), # Simple heuristic if median is unknown
         })
+        
+        # === CREATOR SOLD OUT ===
+        features['creator_sold_out'] = int(creator_pct < 1)
         
         # === SIGNAL TYPE FEATURE (for learning different patterns) ===
         # One-hot encode signal type: 1 = alpha, 0 = discovery, 0.5 = unknown
@@ -518,18 +519,18 @@ class SolanaTokenPredictor:
             features['signal_type_alpha'] = 0.5
         
         # === ANOMALY DETECTION ===
-        # Prepare features for isolation forest (must match training)
         # Standard model trained with: ['log_liquidity', 'log_volume', 'price_change_h24_pct', 'top_10_holders_pct', 'creator_balance_pct']
-        # Signal-aware model trained with: ['log_volume', 'price_change_h24_pct']
+        # Feature engineered anomaly score must match training logic
         
         if self.current_model_dir == 'models/signal_aware':
-            # Signal-aware: Use 2 features
+            # Signal-aware: Use 2 features + BINARY score
             anomaly_input = pd.DataFrame([{
                 'log_volume': features.get('log_volume', 0),
                 'price_change_h24_pct': features.get('price_change_h24_pct', 0),
             }])
+            features['anomaly_score'] = int(self.iso_forest.predict(anomaly_input)[0] == -1)
         else:
-            # Standard model: Use all 5 features
+            # Standard model v4.0: Use all 5 features + CONTINUOUS score
             anomaly_input = pd.DataFrame([{
                 'log_liquidity': features.get('log_liquidity', 0),
                 'log_volume': features.get('log_volume', 0),
@@ -537,42 +538,26 @@ class SolanaTokenPredictor:
                 'top_10_holders_pct': features.get('top_10_holders_pct', 0),
                 'creator_balance_pct': features.get('creator_balance_pct', 0),
             }])
-        
-        # Calculate anomaly score (IsolationForest returns -1 for anomalies, 1 for normal)
-        features['anomaly_score'] = int(self.iso_forest.predict(anomaly_input)[0] == -1)
-        features['is_anomaly'] = features['anomaly_score']
+            # Invert so higher = more anomalous (matches train_model.py line 190)
+            features['anomaly_score'] = -self.iso_forest.score_samples(anomaly_input)[0]
+            
+        features['is_anomaly'] = int(self.iso_forest.predict(anomaly_input)[0] == -1)
         
         return features
     
     def predict(self, mint: str, threshold: float = 0.50, action_threshold: float = 0.70, signal_type: Optional[str] = None) -> Dict:
         """
         Predict if token will reach 50% gain.
-        
-        Args:
-            mint: Token mint address
-            threshold: Probability threshold for filtering/upload (default 0.50)
-            action_threshold: Probability threshold for BUY/CONSIDER actions (default 0.70)
-            signal_type: Signal type indicator:
-                - If using signal-aware models (models/signal_aware/):
-                  REQUIRED. Values: 'alpha' (winner wallets) or 'discovery' (fresh tokens)
-                - If using standard models (models/):
-                  OPTIONAL. Defaults to neutral 0.5 if not provided
-        
-        Returns:
-            dict with prediction, probability, and recommendation
         """
         # Load appropriate models based on signal_type
         if signal_type and signal_type.upper() in ['ALPHA', 'DISCOVERY']:
-            # Signal type provided - use signal-aware models if available
             if self.signal_aware_available:
                 self._load_signal_aware_models()
                 logger.info(f"Analyzing token: {mint} (signal_type={signal_type})")
             else:
-                # Signal-aware not available, use standard
                 self._load_standard_models()
                 logger.info(f"Analyzing token: {mint} (signal_type={signal_type}, using standard model)")
         else:
-            # No signal type or invalid - always use standard models
             if signal_type:
                 logger.warning(f"⚠️ Invalid signal_type='{signal_type}'. Valid values: 'alpha' or 'discovery'. Using standard model.")
             self._load_standard_models()
@@ -610,26 +595,35 @@ class SolanaTokenPredictor:
         # Apply feature selection (returns numpy array)
         X_selected = self.selector.transform(X)
         
-        # Convert to DataFrame with selected feature names (for models fitted with feature names)
+        # Apply scaling if available (Required for signal-aware models)
+        if hasattr(self, 'scaler') and self.scaler:
+            try:
+                # Only scale if the scaler was actually fitted on training data
+                # Standard model v4.0 doesn't use a scaler in train_model.py
+                if self.current_model_dir == 'models/signal_aware':
+                    X_selected = self.scaler.transform(X_selected)
+            except Exception as e:
+                logger.warning(f"Scaling failed: {e}. Proceeding without scale.")
+        
+        # Convert to DataFrame with selected feature names
         X_selected_df = pd.DataFrame(X_selected, columns=self.selected_features)
         
         # Get predictions from all models
-        # XGBoost, CatBoost, RandomForest: can handle numpy array
-        # LightGBM: needs DataFrame with feature names
         xgb_proba = self.xgb_model.predict_proba(X_selected)[0, 1]
-        lgb_proba = self.lgb_model.predict_proba(X_selected_df)[0, 1]  # Use DataFrame
+        lgb_proba = self.lgb_model.predict_proba(X_selected_df)[0, 1]
         cat_proba = self.cat_model.predict_proba(X_selected)[0, 1]
         rf_proba = self.rf_model.predict_proba(X_selected)[0, 1]
         
-        # Ensemble prediction
+        # Ensemble prediction (with fallback weights)
+        weights = self.ensemble_weights
         ensemble_proba = (
-            self.ensemble_weights.get('catboost', 0.25) * cat_proba +
-            self.ensemble_weights.get('lightgbm', 0.25) * lgb_proba +
-            self.ensemble_weights.get('xgboost', 0.25) * xgb_proba +
-            self.ensemble_weights.get('random_forest', 0.25) * rf_proba
+            weights.get('xgboost', 0.25) * xgb_proba +
+            weights.get('lightgbm', 0.25) * lgb_proba +
+            weights.get('catboost', 0.25) * cat_proba +
+            weights.get('random_forest', weights.get('randomforest', 0.25)) * rf_proba
         )
         
-        # Decision logic (using action_threshold, not filtering threshold)
+        # Decision logic
         if ensemble_proba >= action_threshold:
             action = "BUY"
             confidence = "HIGH"
@@ -647,7 +641,6 @@ class SolanaTokenPredictor:
             confidence = "VERY LOW"
             risk_tier = "VERY HIGH RISK"
         
-        # Model agreement score
         model_predictions = [xgb_proba, lgb_proba, cat_proba, rf_proba]
         agreement = 1 - (np.std(model_predictions) / np.mean(model_predictions)) if np.mean(model_predictions) > 0 else 0
         
@@ -673,6 +666,7 @@ class SolanaTokenPredictor:
                 'top_10_holders_pct': float(raw_data.get('top_10_holders_pct', 0)),
                 'pump_dump_risk_score': float(features.get('pump_dump_risk_score', 0)),
                 'market_health_score': float(features.get('market_health_score', 0)),
+                'anomaly_score': float(features.get('anomaly_score', 0)),
             },
             'warnings': self._generate_warnings(features, raw_data)
         }
