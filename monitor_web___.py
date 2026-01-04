@@ -7,7 +7,7 @@ Enhanced with Wallet PnL Analysis endpoints
 import os
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 from contextlib import asynccontextmanager
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Query
@@ -230,29 +230,6 @@ async def status():
         }
     }
 
-# ==================== Helper Functions ====================
-
-def _calculate_time_bounds(interval_days: int) -> tuple:
-    """
-    Calculate time bounds for a wallet analysis request.
-    
-    This ensures that pagination consistency: all pages in a multi-page response
-    use the SAME time window, not a "moving window" that shifts with each request.
-    
-    Args:
-        interval_days: Number of days back from now (0 = all time)
-    
-    Returns:
-        Tuple of (from_date: datetime, to_date: datetime) or (None, None) if all time
-    """
-    if interval_days <= 0:
-        # All time - no bounds
-        return None, None
-    
-    to_date = datetime.utcnow()
-    from_date = to_date - timedelta(days=interval_days)
-    return from_date, to_date
-
 # ==================== Wallet PnL Endpoints ====================
 
 @app.get("/wallet/{address}/pnl")
@@ -273,19 +250,11 @@ async def get_wallet_pnl(
         service_status["wallet_requests"] += 1
         service_status["last_wallet_request"] = datetime.utcnow().isoformat()
         
-        # Calculate time bounds once for consistency
-        from_date, to_date = _calculate_time_bounds(interval_days)
-        
         # Fetch data
-        # NOTE: Skip Supabase cache for interval-based queries (use fresh time-bounded data)
-        if SUPABASE_AVAILABLE and interval_days == 0:
-            # Only use Supabase cache for all-time analysis
+        if SUPABASE_AVAILABLE:
             balances, trades = await asyncio.to_thread(get_wallet_data, address, refresh)
         else:
-            # For interval-based analysis, fetch fresh data with time bounds
-            trades = await asyncio.to_thread(
-                get_dex_trades_from_moralis, address, interval_days, from_date, to_date
-            )
+            trades = await asyncio.to_thread(get_dex_trades_from_moralis, address)
             balances, _ = await asyncio.to_thread(get_current_balances_from_helius_rpc, address, False)
         
         if trades is None or balances is None:
@@ -340,11 +309,11 @@ async def get_wallet_behavior(
         service_status["wallet_requests"] += 1
         service_status["last_wallet_request"] = datetime.utcnow().isoformat()
         
-        # Fetch data (behavior uses all-time data)
+        # Fetch data
         if SUPABASE_AVAILABLE:
             balances, trades = await asyncio.to_thread(get_wallet_data, address, refresh)
         else:
-            trades = await asyncio.to_thread(get_dex_trades_from_moralis, address, 0, None, None)
+            trades = await asyncio.to_thread(get_dex_trades_from_moralis, address)
             balances, _ = await asyncio.to_thread(get_current_balances_from_helius_rpc, address, False)
         
         if trades is None:
@@ -400,11 +369,11 @@ async def get_wallet_pnl_distribution(
         service_status["wallet_requests"] += 1
         service_status["last_wallet_request"] = datetime.utcnow().isoformat()
         
-        # Fetch data (uses all-time data)
+        # Fetch data
         if SUPABASE_AVAILABLE:
             balances, trades = await asyncio.to_thread(get_wallet_data, address, refresh)
         else:
-            trades = await asyncio.to_thread(get_dex_trades_from_moralis, address, 0, None, None)
+            trades = await asyncio.to_thread(get_dex_trades_from_moralis, address)
         
         if trades is None:
             raise HTTPException(status_code=500, detail="Failed to fetch wallet data")
@@ -453,11 +422,11 @@ async def get_wallet_token_breakdown(
         service_status["wallet_requests"] += 1
         service_status["last_wallet_request"] = datetime.utcnow().isoformat()
         
-        # Fetch data (uses all-time data)
+        # Fetch data
         if SUPABASE_AVAILABLE:
             balances, trades = await asyncio.to_thread(get_wallet_data, address, refresh)
         else:
-            trades = await asyncio.to_thread(get_dex_trades_from_moralis, address, 0, None, None)
+            trades = await asyncio.to_thread(get_dex_trades_from_moralis, address)
             balances, _ = await asyncio.to_thread(get_current_balances_from_helius_rpc, address, False)
         
         if trades is None or balances is None:
@@ -528,18 +497,11 @@ async def run_full_analysis_task(
         service_status["wallet_requests"] += 1
         service_status["last_wallet_request"] = datetime.utcnow().isoformat()
         
-        # Calculate time bounds once for consistency across all analysis metrics
-        from_date, to_date = _calculate_time_bounds(interval_days)
-        
         # Step 1: Fetch data from cache or APIs
-        # NOTE: For interval-based analysis, we skip Supabase cache and fetch fresh data
-        # because cached data might be all-time, not interval-specific
-        if SUPABASE_AVAILABLE and interval_days == 0:
-            # Only use Supabase cache for all-time analysis
+        if SUPABASE_AVAILABLE:
             balances, trades = await asyncio.to_thread(get_wallet_data, address, refresh)
         else:
-            # For interval-based analysis, fetch fresh data with time bounds
-            trades = await asyncio.to_thread(get_dex_trades_from_moralis, address, interval_days, from_date, to_date)
+            trades = await asyncio.to_thread(get_dex_trades_from_moralis, address, interval_days)
             balances, _ = await asyncio.to_thread(get_current_balances_from_helius_rpc, address, False)
         
         if trades is None or balances is None:
@@ -751,17 +713,11 @@ async def get_wallet_token_pnl_paginated(
         service_status["wallet_requests"] += 1
         service_status["last_wallet_request"] = datetime.utcnow().isoformat()
         
-        # Calculate time bounds once for consistency across pagination
-        from_date, to_date = _calculate_time_bounds(interval_days)
-        
         # Fetch data
-        # NOTE: Skip Supabase cache for interval-based queries (use fresh time-bounded data)
-        if SUPABASE_AVAILABLE and interval_days == 0:
-            # Only use Supabase cache for all-time analysis
+        if SUPABASE_AVAILABLE:
             balances, trades = await asyncio.to_thread(get_wallet_data, address, refresh)
         else:
-            # For interval-based analysis, fetch fresh data with time bounds
-            trades = await asyncio.to_thread(get_dex_trades_from_moralis, address, interval_days, from_date, to_date)
+            trades = await asyncio.to_thread(get_dex_trades_from_moralis, address, interval_days)
             balances, _ = await asyncio.to_thread(get_current_balances_from_helius_rpc, address, False)
         
         if trades is None or balances is None:
@@ -822,11 +778,11 @@ async def get_wallet_trades_paginated(
         service_status["wallet_requests"] += 1
         service_status["last_wallet_request"] = datetime.utcnow().isoformat()
         
-        # Fetch data (trades uses all-time data)
+        # Fetch data
         if SUPABASE_AVAILABLE:
             balances, trades = await asyncio.to_thread(get_wallet_data, address, refresh)
         else:
-            trades = await asyncio.to_thread(get_dex_trades_from_moralis, address, 0, None, None)
+            trades = await asyncio.to_thread(get_dex_trades_from_moralis, address)
         
         if trades is None:
             raise HTTPException(status_code=500, detail="Failed to fetch wallet data")
@@ -886,11 +842,11 @@ async def get_wallet_holdings_paginated(
         service_status["wallet_requests"] += 1
         service_status["last_wallet_request"] = datetime.utcnow().isoformat()
         
-        # Fetch data (holdings uses all-time data)
+        # Fetch data
         if SUPABASE_AVAILABLE:
             balances, trades = await asyncio.to_thread(get_wallet_data, address, refresh)
         else:
-            trades = await asyncio.to_thread(get_dex_trades_from_moralis, address, 0, None, None)
+            trades = await asyncio.to_thread(get_dex_trades_from_moralis, address)
             balances, _ = await asyncio.to_thread(get_current_balances_from_helius_rpc, address, False)
         
         if trades is None or balances is None:

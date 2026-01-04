@@ -297,30 +297,7 @@ def extract_token_entries(trade: dict):
 
 # --- API Fetching Functions ---
 
-def get_dex_trades_from_moralis(
-    wallet_address: str, 
-    interval_days: int = 0,
-    from_date: datetime.datetime = None,
-    to_date: datetime.datetime = None
-):
-    """
-    Fetches historical DEX trades from Moralis API.
-    
-    Args:
-        wallet_address: Solana wallet address
-        interval_days: Number of days back from now (0 = all time). Legacy parameter.
-                      Ignored if from_date/to_date are provided.
-        from_date: Lower time bound (optional). If provided, overrides interval_days.
-        to_date: Upper time bound (optional). Defaults to now if not provided.
-    
-    Returns:
-        List of trades, or None on error
-    
-    Note: For backward compatibility:
-    - If only interval_days is provided, fetches from (now - interval_days) to now
-    - If from_date/to_date provided, they take precedence over interval_days
-    - If neither provided, fetches all trades
-    """
+def get_dex_trades_from_moralis(wallet_address: str, interval_days: int = 0):
     print(f"Fetching historical DEX trades from Moralis (interval: {interval_days} days)...")
     all_trades = []
     cursor = None
@@ -328,23 +305,11 @@ def get_dex_trades_from_moralis(
     session = requests.Session()
     max_attempts = len(MORALIS_KEYS) * 2
 
-    # Calculate time bounds
-    if to_date is None:
-        to_date = datetime.datetime.now(timezone.utc)
-    
+    # Calculate fromDate if interval_days > 0
     from_date_str = None
-    to_date_str = None
-    
-    # Use from_date/to_date if provided, otherwise calculate from interval_days
-    if from_date is not None:
+    if interval_days > 0:
+        from_date = datetime.datetime.now(timezone.utc) - timedelta(days=interval_days)
         from_date_str = from_date.strftime("%Y-%m-%dT%H:%M:%SZ")
-    elif interval_days > 0:
-        from_date_obj = to_date - timedelta(days=interval_days)
-        from_date_str = from_date_obj.strftime("%Y-%m-%dT%H:%M:%SZ")
-    
-    # Add toDate parameter for better Moralis query optimization
-    if from_date is not None or interval_days > 0:
-        to_date_str = to_date.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     while True:
         params = {"limit": 100}
@@ -352,8 +317,6 @@ def get_dex_trades_from_moralis(
             params["cursor"] = cursor
         if from_date_str:
             params["fromDate"] = from_date_str
-        if to_date_str:
-            params["toDate"] = to_date_str
 
         response = None
         data = None
