@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-01-04T07:34:52.289370",
+  "timestamp": "2026-01-07T12:21:14.546531",
   "signal_type_aware": true,
   "description": "Signal-type aware ensemble (ALPHA vs DISCOVERY)",
   "all_features": [
@@ -34,20 +34,20 @@
     "is_high_volume"
   ],
   "selected_features": [
-    "price_change_h24_pct",
     "fdv_to_liquidity_ratio",
-    "creator_balance_pct",
     "top_10_holders_pct",
     "total_lp_locked_usd",
     "is_lp_locked_95_plus",
     "total_insider_networks",
     "total_insider_token_amount",
+    "time_of_day_utc",
     "token_age_at_signal_seconds",
     "is_very_fresh",
     "log_liquidity",
     "log_volume",
     "log_fdv",
     "liquidity_depth_pct",
+    "whale_dominated",
     "strong_uptrend",
     "weak_momentum",
     "volume_quality",
@@ -63,20 +63,20 @@
     "randomforest": 0.25
   },
   "test_metrics": {
-    "ensemble_auc": 0.6601333693791115,
-    "xgboost_auc": 0.6674326394521041,
-    "lightgbm_auc": 0.6567540776786519,
-    "catboost_auc": 0.6337748941155267,
-    "randomforest_auc": 0.6401279625123908
+    "ensemble_auc": 0.616953044579935,
+    "xgboost_auc": 0.6034523715258532,
+    "lightgbm_auc": 0.601789532029456,
+    "catboost_auc": 0.631443503048539,
+    "randomforest_auc": 0.6177448729115528
   },
   "data_summary": {
-    "total_samples": 1493,
-    "train_samples": 1194,
-    "test_samples": 299,
+    "total_samples": 1595,
+    "train_samples": 1276,
+    "test_samples": 319,
     "signal_type_distribution": {
-      "alpha": 1330,
-      "discovery": 163
+      "alpha": 1421,
+      "discovery": 174
     },
-    "overall_win_rate": 0.5411922304085733
+    "overall_win_rate": 0.541692789968652
   }
 }

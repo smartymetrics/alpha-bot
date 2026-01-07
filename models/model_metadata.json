@@ -9,14 +9,15 @@
     "logistic_regression": 0.0,
     "mlp_neural_network": 0.0
   },
-  "trained_at": "2026-01-04T07:28:12.562959",
+  "trained_at": "2026-01-07T12:18:33.246386",
   "performance": {
-    "test_auc": 0.5841218347301071,
-    "cv_auc_mean": 0.6340025642732466
+    "test_auc": 0.6166363132472881,
+    "cv_auc_mean": 0.611209289904942
   },
   "selected_features": [
-    "creator_balance_pct",
+    "fdv_to_liquidity_ratio",
     "top_10_holders_pct",
+    "total_lp_locked_usd",
     "is_lp_locked_95_plus",
     "total_insider_networks",
     "total_insider_token_amount",
@@ -28,7 +29,11 @@
     "liquidity_depth_pct",
     "whale_dominated",
     "strong_uptrend",
+    "weak_momentum",
+    "volume_quality",
+    "peak_hours",
     "anomaly_score",
+    "creator_sold_out",
     "is_high_volume"
   ],
   "all_features": [
