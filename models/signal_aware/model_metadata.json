@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-01-07T12:21:14.546531",
+  "timestamp": "2026-01-11T20:21:34.665233",
   "signal_type_aware": true,
   "description": "Signal-type aware ensemble (ALPHA vs DISCOVERY)",
   "all_features": [
@@ -34,7 +34,7 @@
     "is_high_volume"
   ],
   "selected_features": [
-    "fdv_to_liquidity_ratio",
+    "liquidity_to_volume_ratio",
     "top_10_holders_pct",
     "total_lp_locked_usd",
     "is_lp_locked_95_plus",
@@ -63,20 +63,20 @@
     "randomforest": 0.25
   },
   "test_metrics": {
-    "ensemble_auc": 0.616953044579935,
-    "xgboost_auc": 0.6034523715258532,
-    "lightgbm_auc": 0.601789532029456,
-    "catboost_auc": 0.631443503048539,
-    "randomforest_auc": 0.6177448729115528
+    "ensemble_auc": 0.6860773634967183,
+    "xgboost_auc": 0.6677489177489179,
+    "lightgbm_auc": 0.6931643625192011,
+    "catboost_auc": 0.6721477447283899,
+    "randomforest_auc": 0.6816087138667783
   },
   "data_summary": {
-    "total_samples": 1595,
-    "train_samples": 1276,
-    "test_samples": 319,
+    "total_samples": 1697,
+    "train_samples": 1357,
+    "test_samples": 340,
     "signal_type_distribution": {
-      "alpha": 1421,
-      "discovery": 174
+      "alpha": 1505,
+      "discovery": 192
     },
-    "overall_win_rate": 0.541692789968652
+    "overall_win_rate": 0.5468473777253977
   }
 }
