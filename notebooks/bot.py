@@ -92,8 +92,9 @@ if not BOT_TOKEN:
 # ----------------------
 # Disable ALL logging
 # ----------------------
-logging.disable(logging.CRITICAL)  # Disable all logging
-logging.getLogger().setLevel(logging.CRITICAL + 1)  # Set to higher than CRITICAL
+# logging.disable(logging.CRITICAL)  # Disable all logging
+# logging.getLogger().setLevel(logging.CRITICAL + 1)  # Set to higher than CRITICAL
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 # ----------------------
 # Thread-safe joblib file access
@@ -422,6 +423,7 @@ def load_latest_tokens_from_overlap() -> Dict[str, Dict[str, Any]]:
                 continue
             result = history[-1].get("result", {})
             latest_tokens[token_id] = {
+                "token": token_id, # CRITICAL: Needed for fallback in format_alert_html
                 "grade": result.get("grade", "NONE"),
                 "token_metadata": {
                     "mint": token_id,

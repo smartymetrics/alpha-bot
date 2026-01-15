@@ -707,11 +707,8 @@ class TokenDiscovery:
                             program_id="dexscreener_profile",
                             detected_via="dexscreener",
                             extra={
-                                "name": item.get("tokenName"), # NEW
-                                "symbol": item.get("tokenSymbol"), # NEW
                                 "description": item.get("description"),
-                                "url": item.get("url"),
-                                "icon": item.get("icon") # NEW
+                                "url": item.get("url")
                             },
                             fdv_usd=0.0,
                             volume_usd=0.0,
@@ -2716,8 +2713,6 @@ class Monitor:
 
         # === 4. POST-HELIUS PROCESSING ===
         grade = overlap_result.get("grade", "NONE")
-        if self.debug:
-            print(f"[Analysis] {mint} Overlap Check: Grade={grade}, Count={overlap_result.get('overlap_count')}, Pct={overlap_result.get('overlap_percentage')}%")
         
         if grade == "NONE":
             # Save NONE result
@@ -2799,8 +2794,6 @@ class Monitor:
             "ML_PASSED": ml_passed
         })
         self.overlap_store.save(obj)
-        if self.debug:
-            print(f"[Analysis] {mint} SAVED to overlap_results.pkl (Grade: {grade}, ML_PASSED: {ml_passed})")
         
         if mint in self.pending_risky_tokens:
             self.pending_risky_tokens.pop(mint, None)

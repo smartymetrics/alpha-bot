@@ -131,15 +131,22 @@ def prepare_json_from_pkl(pkl_path: str, debug: bool = True) -> bytes:
             continue
         grade = safe_get_grade(history[-1])
         if grade != "NONE":
-            latest = history[-1]
+            # Note: We create a copy to avoid mutating the original data in memory
+            # if this function is called multiple times on the same object.
+            latest = dict(history[-1])
             # Ensure dexscreener section exists
             if "dexscreener" not in latest or not isinstance(latest["dexscreener"], dict):
                 latest["dexscreener"] = {}
+            else:
+                latest["dexscreener"] = dict(latest["dexscreener"])
+                
             # Add current price if missing
             if "current_price_usd" not in latest["dexscreener"]:
                 price = fetch_dexscreener_price(token_id, debug=debug)
                 latest["dexscreener"]["current_price_usd"] = price
-            filtered[token_id] = history
+            
+            history_copy = list(history[:-1]) + [latest]
+            filtered[token_id] = history_copy
 
     if not filtered:
         if debug:
@@ -168,16 +175,8 @@ def prepare_json_from_pkl(pkl_path: str, debug: bool = True) -> bytes:
     if debug:
         print(f"✅ JSON ready: {len(pruned)} tokens, {len(json_bytes)/1024:.2f} KB")
 
-    # Save enriched data back to PKL
-    try:
-        with open(pkl_path, "wb") as f:
-            pickle.dump(pruned, f)
-        if debug:
-            print(f"💾 Updated PKL with Dexscreener prices: {pkl_path}")
-    except Exception as e:
-        if debug:
-            print(f"⚠️ Failed to update PKL with prices: {e}")
-
+    # DO NOT save back to pkl_path here. 
+    # The caller (upload_overlap_results) will handle temporary file creation for PKL upload.
     return json_bytes
 
 
@@ -212,33 +211,45 @@ def upload_file(file_path: str, bucket: str = BUCKET_NAME, remote_path: str = No
         return False
 
 def upload_overlap_results(file_path: str, bucket: str = BUCKET_NAME, debug: bool = True) -> bool:
-    """Upload overlap_results.pkl + JSON, with Dexscreener enrichment."""
+    """Upload overlap_results.pkl + JSON, with Dexscreener enrichment. Filters NONE grades."""
     if not os.path.exists(file_path):
         if debug:
             print(f"❌ Missing {file_path}")
         return False
 
-    # Generate enriched JSON and update PKL
+    # 1. Generate enriched JSON (already filters NONE grades)
     json_bytes = prepare_json_from_pkl(file_path, debug=debug)
+    
     try:
         json_obj = json.loads(json_bytes)
-    except Exception:
-        json_obj = {}
-
-    # if not json_obj:
-    #     if debug:
-    #         print("🚫 Filtered JSON empty, removing remote files")
-    #         get_supabase_client().storage.from_(bucket).remove([OVERLAP_FILE_NAME, OVERLAP_JSON_NAME])
-    #     return False
-
-    # Upload PKL
-    if not upload_file(file_path, bucket, OVERLAP_FILE_NAME, debug=debug):
+        if not json_obj:
+            if debug:
+                print("🚫 Filtered data empty or all NONE. Skipping upload.")
+            return False
+    except Exception as e:
+        if debug:
+            print(f"❌ Error validating JSON for upload: {e}")
         return False
 
-    # Upload JSON
+    # 2. Create a temporary filtered PKL for upload
+    # We want to upload ONLY the tokens that made it into the JSON
+    tmp_pkl = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pkl") as tmp:
+            pickle.dump(json_obj, tmp)
+            tmp_pkl = tmp.name
+        
+        # 3. Upload the filtered PKL
+        if not upload_file(tmp_pkl, bucket, OVERLAP_FILE_NAME, debug=debug):
+            return False
+    finally:
+        if tmp_pkl and os.path.exists(tmp_pkl):
+            os.remove(tmp_pkl)
+
+    # 4. Upload JSON
     try:
         supabase = get_supabase_client()
-        supabase.storage.from_(bucket).remove([OVERLAP_JSON_NAME])  # 🔥 delete old JSON first
+        supabase.storage.from_(bucket).remove([OVERLAP_JSON_NAME])  # delete old JSON
         supabase.storage.from_(bucket).upload(
             OVERLAP_JSON_NAME, json_bytes, {"content-type": "application/json"}
         )
