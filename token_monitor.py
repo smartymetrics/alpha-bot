@@ -2775,6 +2775,32 @@ class Monitor:
         if self.debug:
             print(f"[Analysis] ML Result for {mint}: PASSED={ml_passed}, Prob={ml_probability}")
 
+        # Enrich metadata if missing from start or previous checks
+        if "token_metadata" not in overlap_result:
+            overlap_result["token_metadata"] = {}
+        
+        meta = overlap_result["token_metadata"]
+        
+        # 1. Fallback to RugCheck for Name/Symbol
+        if not meta.get("name") or not meta.get("symbol"):
+            rc_raw = r.get("raw", {})
+            if isinstance(rc_raw, dict):
+                token_info = rc_raw.get("token", {})
+                if not meta.get("name"): meta["name"] = token_info.get("name")
+                if not meta.get("symbol"): meta["symbol"] = token_info.get("symbol")
+        
+        # 2. Fallback to DexScreener for Name/Symbol
+        if not meta.get("name") or not meta.get("symbol"):
+            ds_raw = dex_data.get("raw", {})
+            if isinstance(ds_raw, dict):
+                base_token = ds_raw.get("baseToken", {})
+                if not meta.get("name"): meta["name"] = base_token.get("name")
+                if not meta.get("symbol"): meta["symbol"] = base_token.get("symbol")
+        
+        # 3. Fallback to start.extra if still missing
+        if not meta.get("name") and start.extra: meta["name"] = start.extra.get("name")
+        if not meta.get("symbol") and start.extra: meta["symbol"] = start.extra.get("symbol")
+
         # Save Final
         obj = safe_load_overlap(self.overlap_store)
         obj.setdefault(mint, []).append({
@@ -3408,6 +3434,7 @@ class Monitor:
             "token_metadata": {
                 k: v for k, v in {
                     "name": start.extra.get("name") if start.extra else None,
+                    "symbol": start.extra.get("symbol") if start.extra else None,
                     "fdv_usd": start.fdv_usd,
                     "volume_usd": start.volume_usd,
                     "source_dex": start.source_dex,

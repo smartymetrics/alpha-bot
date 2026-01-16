@@ -58,20 +58,29 @@ def get_supabase_client() -> Client:
 # -------------------
 # Dexscreener Helper
 # -------------------
-def fetch_dexscreener_price(token_id: str, debug: bool = True) -> float | None:
-    """Fetch current USD price for a token from Dexscreener (pairs[0].priceUsd)."""
+def fetch_dexscreener_data(token_id: str, debug: bool = True) -> dict:
+    """Fetch current USD price and metadata for a token from Dexscreener."""
+    out = {"price": None, "name": None, "symbol": None}
     try:
         url = f"https://api.dexscreener.com/latest/dex/tokens/{token_id}"
         resp = requests.get(url, timeout=10)
         data = resp.json()
-        price = data.get("pairs", [{}])[0].get("priceUsd")
-        # if debug:
-        #     print(f"💰 Dexscreener price for {token_id}: {price}")
-        return float(price) if price else None
+        pairs = data.get("pairs")
+        if pairs:
+            p0 = pairs[0]
+            out["price"] = float(p0.get("priceUsd")) if p0.get("priceUsd") else None
+            base = p0.get("baseToken", {})
+            out["name"] = base.get("name")
+            out["symbol"] = base.get("symbol")
+        return out
     except Exception as e:
         if debug:
             print(f"⚠️ Dexscreener fetch failed for {token_id}: {e}")
-        return None
+        return out
+
+def fetch_dexscreener_price(token_id: str, debug: bool = True) -> float | None:
+    """Fetch current USD price for a token from Dexscreener (pairs[0].priceUsd)."""
+    return fetch_dexscreener_data(token_id, debug=debug)["price"]
 
 
 # -------------------
@@ -176,10 +185,22 @@ def prepare_json_from_pkl(pkl_path: str, debug: bool = True) -> bytes:
             if "dexscreener" not in target_dict or not isinstance(target_dict.get("dexscreener"), dict):
                 target_dict["dexscreener"] = {}
                 
-            # Add current price if missing
-            if "current_price_usd" not in target_dict["dexscreener"]:
-                price = fetch_dexscreener_price(token_id, debug=debug)
-                target_dict["dexscreener"]["current_price_usd"] = price
+            # Add current price and metadata if missing
+            needs_metadata = "token_metadata" not in target_dict or not target_dict["token_metadata"].get("name") or not target_dict["token_metadata"].get("symbol")
+            if "current_price_usd" not in target_dict["dexscreener"] or needs_metadata:
+                ds_data = fetch_dexscreener_data(token_id, debug=debug)
+                
+                if "current_price_usd" not in target_dict["dexscreener"]:
+                    target_dict["dexscreener"]["current_price_usd"] = ds_data["price"]
+                
+                if needs_metadata:
+                    if "token_metadata" not in target_dict:
+                        target_dict["token_metadata"] = {}
+                    
+                    if not target_dict["token_metadata"].get("name"):
+                        target_dict["token_metadata"]["name"] = ds_data["name"]
+                    if not target_dict["token_metadata"].get("symbol"):
+                        target_dict["token_metadata"]["symbol"] = ds_data["symbol"]
             
             filtered[token_id] = history
 
@@ -209,16 +230,6 @@ def prepare_json_from_pkl(pkl_path: str, debug: bool = True) -> bytes:
 
     if debug:
         print(f"✅ JSON ready: {len(pruned)} tokens, {len(json_bytes)/1024:.2f} KB")
-
-    # Save enriched data back to PKL
-    try:
-        with open(pkl_path, "wb") as f:
-            pickle.dump(pruned, f)
-        if debug:
-            print(f"💾 Updated PKL with Dexscreener prices: {pkl_path}")
-    except Exception as e:
-        if debug:
-            print(f"⚠️ Failed to update PKL with prices: {e}")
 
     return json_bytes
 
@@ -262,17 +273,41 @@ def upload_overlap_results(file_path: str, bucket: str = BUCKET_NAME, debug: boo
             print(f"❌ Missing {file_path}")
         return False
 
-    # Generate enriched JSON and update PKL
+    # 1. Generate enriched JSON (returns bytes)
+    # This also filters out NONE grades.
     json_bytes = prepare_json_from_pkl(file_path, debug=debug)
     
-    # Upload PKL
-    if not upload_file(file_path, bucket, OVERLAP_FILE_NAME, debug=debug):
+    try:
+        json_obj = json.loads(json_bytes)
+    except Exception as e:
+        if debug:
+            print(f"❌ Failed to parse prepared JSON: {e}")
         return False
 
-    # Upload JSON
+    if not json_obj:
+        if debug:
+            print("🚫 Filtered data empty or all NONE. Skipping upload.")
+        return False
+
+    # 2. Create a temporary filtered PKL for upload
+    import tempfile
+    tmp_pkl = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pkl") as tmp:
+            pickle.dump(json_obj, tmp)
+            tmp_pkl = tmp.name
+        
+        # 3. Upload the filtered PKL as "overlap_results.pkl"
+        if not upload_file(tmp_pkl, bucket, OVERLAP_FILE_NAME, debug=debug):
+            return False
+    finally:
+        if tmp_pkl and os.path.exists(tmp_pkl):
+            os.remove(tmp_pkl)
+
+    # 4. Upload JSON
     try:
         supabase = get_supabase_client()
-        supabase.storage.from_(bucket).remove([OVERLAP_JSON_NAME])  # 🔥 delete old JSON first
+        supabase.storage.from_(bucket).remove([OVERLAP_JSON_NAME])  # delete old JSON first
         supabase.storage.from_(bucket).upload(
             OVERLAP_JSON_NAME, json_bytes, {"content-type": "application/json"}
         )

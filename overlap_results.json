@@ -1,0 +1,556 @@
+{
+  "8pZ2pGJCR4Z37MUhPKoatixJf4anA4xB7eL9KWeWBAGS": [
+    {
+      "ts": "2026-01-16T05:19:24.618277+00:00",
+      "result": {
+        "token": "8pZ2pGJCR4Z37MUhPKoatixJf4anA4xB7eL9KWeWBAGS",
+        "checked_at": "2026-01-16T05:19:17.515961+00:00",
+        "top_holders_checked": 153,
+        "overlap_count": 8,
+        "overlap_percentage": 5.23,
+        "concentration": 0.05,
+        "weighted_concentration": 1.31,
+        "total_winner_wallets": 16853,
+        "overlap_wallets_sample": [
+          "8psNvWTrdNTiVRNzAgsou9kETXNJm2SXZyaKuJraVRtf",
+          "G7Ma785WQNQzWNaXm515gQ5myMVYmDjvaq6dkscGJDmg",
+          "14We9EpeX2vQ2QF24bR6nG3Ss5a6uk4ph6URVbh8x88M",
+          "9KFnMigaRyuun47QmePZkaYzneqSiCJpbp3Kuuy6eBJM",
+          "5gaEC7DqbbKkmVRQmMsLNGSE6uVFG9bNFnkH7s6ZacsV",
+          "bsyaucgZVVRXGVD8umxneMPDXg4vn2eF2GQmEGAYSex",
+          "FhVo3mqL8PW5pH5U2CN4XE33DokiyZnUwuGpH2hmHLuM",
+          "8NXxPC78XDpgxwG78sfXMunR1GmyZ9USwxVoMS4EVTZV"
+        ],
+        "grade": "LOW",
+        "detected_via": "rugcheck",
+        "block_time": 1768540132,
+        "token_metadata": {
+          "fdv_usd": 0.0,
+          "volume_usd": 0.0,
+          "source_dex": "unknown",
+          "price_change_percentage": 0.0
+        },
+        "ML_PASSED": false,
+        "dexscreener": {
+          "current_price_usd": 3.103e-05
+        }
+      },
+      "security": "passed_rugcheck",
+      "probation_meta": {
+        "probation": false,
+        "top_n_pct": 29.153326,
+        "top_n": 3,
+        "threshold_pct": 40.0,
+        "explanation": "Top 3 holders own 29.15% of supply; threshold is >40.0%. Probation=False."
+      },
+      "rugcheck": {
+        "top1_holder_pct": 24.5510585506312,
+        "top_10_holders_pct": 43.01138343976299,
+        "holder_count": 155,
+        "has_authorities": false,
+        "creator_balance": 0.0,
+        "transfer_fee_pct": 0,
+        "lp_locked_pct": 100.0,
+        "total_liquidity_usd": 17006.186232740176,
+        "lp_lock_details": [
+          {
+            "market_type": "meteora_dbc",
+            "locked_usd": 17006.186232740176,
+            "total_usd": 17006.186232740176,
+            "locked_pct": 100
+          }
+        ]
+      },
+      "dexscreener": {
+        "current_price_usd": 3.103e-05,
+        "market_cap_usd": 31034.16
+      },
+      "ml_prediction": {
+        "probability": 0.3471378039595234,
+        "confidence": "VERY LOW",
+        "risk_tier": "VERY HIGH RISK",
+        "action": "AVOID",
+        "error": null,
+        "key_metrics": {
+          "token_age_hours": 0.19042897396617464,
+          "liquidity_usd": 0.0,
+          "volume_h24_usd": 64514.66,
+          "price_change_h24_pct": 599.0,
+          "insider_supply_pct": 0.0,
+          "top_10_holders_pct": 43.01138343976299,
+          "pump_dump_risk_score": 10.0,
+          "market_health_score": 4169.052385142753,
+          "anomaly_score": 0.0
+        },
+        "warnings": [
+          "\ud83d\udca7 Low liquidity (<$10k)"
+        ]
+      },
+      "ML_PASSED": false
+    }
+  ],
+  "2GL3PTYVE4J85HRuySaLsK1HK9cVkG34UQJDkQHbBAGS": [
+    {
+      "ts": "2026-01-16T05:16:40.104893+00:00",
+      "result": {
+        "token": "2GL3PTYVE4J85HRuySaLsK1HK9cVkG34UQJDkQHbBAGS",
+        "checked_at": "2026-01-16T05:16:03.412060+00:00",
+        "top_holders_checked": 196,
+        "overlap_count": 10,
+        "overlap_percentage": 5.1,
+        "concentration": 0.06,
+        "weighted_concentration": 3.95,
+        "total_winner_wallets": 16853,
+        "overlap_wallets_sample": [
+          "8psNvWTrdNTiVRNzAgsou9kETXNJm2SXZyaKuJraVRtf",
+          "2rbMgYvzAb3xDk6vXrzKkY3VwsmyDZsJTkvB3JJYsRzA",
+          "BM9CcyErJcu2mjrFvUsRRrD3snGeHDDVirJLvL6EjvMN",
+          "9vcZ18DBF1nf9A9QBMDPcqMhaB9nRwhpRMAcLoS3CWtM",
+          "AXRMVdW2HQL7s4MomXz8zfWdmiJsmzE63wcSt4YvVZct",
+          "FhVo3mqL8PW5pH5U2CN4XE33DokiyZnUwuGpH2hmHLuM",
+          "JBAqCAkK9XqfSYDGa4K67qCVmKk44GG93rsmZyQ3Hsp7",
+          "EY6NDQzc8omTvVZJqwvbGZ8wu2CBrBu4qYLyqpfp69T5",
+          "9kEVJA8TCf6y6Tiek1tdRBSSiLYZVLATMRCQzAF25ozP",
+          "HLnpSz9h2S4hiLQ43rnSD9XkcUThA7B8hQMKmDaiTLcC"
+        ],
+        "grade": "LOW",
+        "detected_via": "dexscreener",
+        "block_time": 1768539850,
+        "token_metadata": {
+          "fdv_usd": 0.0,
+          "volume_usd": 0.0,
+          "source_dex": "dexscreener",
+          "price_change_percentage": 0.0
+        },
+        "ML_PASSED": true,
+        "dexscreener": {
+          "current_price_usd": 7.135e-05
+        }
+      },
+      "security": "passed_rugcheck",
+      "probation_meta": {
+        "probation": false,
+        "top_n_pct": 22.960043,
+        "top_n": 3,
+        "threshold_pct": 40.0,
+        "explanation": "Top 3 holders own 22.96% of supply; threshold is >40.0%. Probation=False."
+      },
+      "rugcheck": {
+        "top1_holder_pct": 17.03804337897596,
+        "top_10_holders_pct": 40.42929534905189,
+        "holder_count": 115,
+        "has_authorities": false,
+        "creator_balance": 0.0,
+        "transfer_fee_pct": 0,
+        "lp_locked_pct": 100.0,
+        "total_liquidity_usd": 23671.564866700362,
+        "lp_lock_details": [
+          {
+            "market_type": "meteora_damm_v2",
+            "locked_usd": 23671.564866700362,
+            "total_usd": 23671.564866700362,
+            "locked_pct": 100
+          }
+        ]
+      },
+      "dexscreener": {
+        "current_price_usd": 6.624e-05,
+        "market_cap_usd": 66241.0
+      },
+      "ml_prediction": {
+        "probability": 0.40437597754752974,
+        "confidence": "VERY LOW",
+        "risk_tier": "VERY HIGH RISK",
+        "action": "AVOID",
+        "error": null,
+        "key_metrics": {
+          "token_age_hours": 0.031652171280648976,
+          "liquidity_usd": 24210.47,
+          "volume_h24_usd": 5440.59,
+          "price_change_h24_pct": 0.53,
+          "insider_supply_pct": 0.0,
+          "top_10_holders_pct": 40.93407475138973,
+          "pump_dump_risk_score": 10.0,
+          "market_health_score": 203.0414226306201,
+          "anomaly_score": 0.0
+        },
+        "warnings": []
+      },
+      "ML_PASSED": true
+    }
+  ],
+  "74A3EPgE4p52hW6ZCgLJ8BNA1rKC2LsGxWuACA3Lpump": [
+    {
+      "ts": "2026-01-16T05:16:20.218651+00:00",
+      "result": {
+        "token": "74A3EPgE4p52hW6ZCgLJ8BNA1rKC2LsGxWuACA3Lpump",
+        "checked_at": "2026-01-16T05:14:32.821907+00:00",
+        "top_holders_checked": 45,
+        "overlap_count": 5,
+        "overlap_percentage": 11.11,
+        "concentration": 0.03,
+        "weighted_concentration": 0.02,
+        "total_winner_wallets": 16853,
+        "overlap_wallets_sample": [
+          "9UBRSYrAmZzi4u6r5yeHxz12t4F6qZy8EVfKLhZS574V",
+          "BtDaZUqHr2mKH5EYQCztuerHBuBEfQNYdquTDtEZp2Ym",
+          "54r8D4idnbBWwi4qxLWKTrXq2YYwinaoDhy3q9sM4DWe",
+          "67yc8XWcZPAUPkvyM3JsXFETYebuUZp7mVZKqsE93Mpf",
+          "4k6t2FfnAgRTn6vYf5PytVwxusC5tUe9PrAjmJ98FQaB"
+        ],
+        "grade": "LOW",
+        "detected_via": "dexscreener",
+        "block_time": 1768539850,
+        "token_metadata": {
+          "fdv_usd": 0.0,
+          "volume_usd": 0.0,
+          "source_dex": "dexscreener",
+          "price_change_percentage": 0.0
+        },
+        "ML_PASSED": true,
+        "dexscreener": {
+          "current_price_usd": 9.129e-05
+        }
+      },
+      "security": "passed_rugcheck",
+      "probation_meta": {
+        "probation": false,
+        "top_n_pct": 24.565185,
+        "top_n": 3,
+        "threshold_pct": 40.0,
+        "explanation": "Top 3 holders own 24.57% of supply; threshold is >40.0%. Probation=False."
+      },
+      "rugcheck": {
+        "top1_holder_pct": 17.866462096443144,
+        "top_10_holders_pct": 40.22981179526123,
+        "holder_count": 529,
+        "has_authorities": false,
+        "creator_balance": 0.0,
+        "transfer_fee_pct": 0,
+        "lp_locked_pct": 100.0,
+        "total_liquidity_usd": 30100.89218536499,
+        "lp_lock_details": [
+          {
+            "market_type": "pump_fun_amm",
+            "locked_usd": 30100.89218536499,
+            "total_usd": 30100.89218536499,
+            "locked_pct": 100
+          }
+        ]
+      },
+      "dexscreener": {
+        "current_price_usd": 9.41e-05,
+        "market_cap_usd": 94105.0
+      },
+      "ml_prediction": {
+        "probability": 0.6401684276387808,
+        "confidence": "MEDIUM",
+        "risk_tier": "MEDIUM RISK",
+        "action": "CONSIDER",
+        "error": null,
+        "key_metrics": {
+          "token_age_hours": 2.579486502011617,
+          "liquidity_usd": 31776.67,
+          "volume_h24_usd": 600541.64,
+          "price_change_h24_pct": 60.95,
+          "insider_supply_pct": 0.0,
+          "top_10_holders_pct": 39.32892693355795,
+          "pump_dump_risk_score": 10.0,
+          "market_health_score": 12814.848649685135,
+          "anomaly_score": 0.0
+        },
+        "warnings": [
+          "\ud83d\udea8 Creator appears to have dumped"
+        ]
+      },
+      "ML_PASSED": true
+    }
+  ],
+  "7SqLLuFbGNjZkrLZmpCBp6JRZtueVvnMtkfpJfx1pump": [
+    {
+      "ts": "2026-01-16T05:16:17.915414+00:00",
+      "result": {
+        "token": "7SqLLuFbGNjZkrLZmpCBp6JRZtueVvnMtkfpJfx1pump",
+        "checked_at": "2026-01-16T05:14:32.710041+00:00",
+        "top_holders_checked": 174,
+        "overlap_count": 10,
+        "overlap_percentage": 5.75,
+        "concentration": 0.06,
+        "weighted_concentration": 1.98,
+        "total_winner_wallets": 16853,
+        "overlap_wallets_sample": [
+          "8psNvWTrdNTiVRNzAgsou9kETXNJm2SXZyaKuJraVRtf",
+          "BM9CcyErJcu2mjrFvUsRRrD3snGeHDDVirJLvL6EjvMN",
+          "D9GYt4W7VvteKCSvTgyjzuiBJyTy94Kmr6YiC9fbxGjW",
+          "3MZoQ9EgEcVys92eCMrgvCJRGQNUySQ75mZKbekPhhXj",
+          "Ac2H3RxU2vVszXps63sKPg11xViBNHcTWkZHNXrairKW",
+          "EgVWFFuzWNzBUZubXDvKwix98nkEBPDW6YeFEHxLMgfR",
+          "FTsnPd6Da6EDyMx6W1oDpn6HaoqFSBES8kVS6SiyR1KT",
+          "3Px8d5Wz1CTYKUFNwZfMhkMdM6TBYqNgSWRpTGhuw5bD",
+          "BEochrdGhm5pcKVF73DURYrGo1DLzxq6bBcUBphQR64d",
+          "AkTgH1uW6J6j6QHmFNGzZuZwwXaHQsPCpHUriED28tRj"
+        ],
+        "grade": "LOW",
+        "detected_via": "dexscreener",
+        "block_time": 1768539850,
+        "token_metadata": {
+          "fdv_usd": 0.0,
+          "volume_usd": 0.0,
+          "source_dex": "dexscreener",
+          "price_change_percentage": 0.0
+        },
+        "ML_PASSED": true,
+        "dexscreener": {
+          "current_price_usd": null
+        }
+      },
+      "security": "passed_rugcheck",
+      "probation_meta": {
+        "probation": false,
+        "top_n_pct": 37.06407,
+        "top_n": 3,
+        "threshold_pct": 40.0,
+        "explanation": "Top 3 holders own 37.06% of supply; threshold is >40.0%. Probation=False."
+      },
+      "rugcheck": {
+        "top1_holder_pct": 32.39864403377861,
+        "top_10_holders_pct": 48.94924104052762,
+        "holder_count": 176,
+        "has_authorities": false,
+        "creator_balance": 0.0,
+        "transfer_fee_pct": 0,
+        "lp_locked_pct": 100.0,
+        "total_liquidity_usd": 10486.60423080129,
+        "lp_lock_details": [
+          {
+            "market_type": "pump_fun",
+            "locked_usd": 10486.60423080129,
+            "total_usd": 10486.60423080129,
+            "locked_pct": 100
+          }
+        ]
+      },
+      "dexscreener": {
+        "current_price_usd": 2.865e-05,
+        "market_cap_usd": 28653.6
+      },
+      "ml_prediction": {
+        "probability": 0.6412099011595391,
+        "confidence": "MEDIUM",
+        "risk_tier": "MEDIUM RISK",
+        "action": "CONSIDER",
+        "error": null,
+        "key_metrics": {
+          "token_age_hours": 2.648291592333052,
+          "liquidity_usd": 0.0,
+          "volume_h24_usd": 165594.17,
+          "price_change_h24_pct": 455.0,
+          "insider_supply_pct": 0.0,
+          "top_10_holders_pct": 49.06442159134469,
+          "pump_dump_risk_score": 10.0,
+          "market_health_score": 11568.537200836827,
+          "anomaly_score": 0.0
+        },
+        "warnings": [
+          "\ud83d\udca7 Low liquidity (<$10k)",
+          "\ud83d\udea8 Creator appears to have dumped"
+        ]
+      },
+      "ML_PASSED": true
+    }
+  ],
+  "Eevkzw3D7stq3gbLHQfuWT9FNzpWR9WxUUNBrCrWpump": [
+    {
+      "ts": "2026-01-16T05:16:08.407669+00:00",
+      "result": {
+        "token": "Eevkzw3D7stq3gbLHQfuWT9FNzpWR9WxUUNBrCrWpump",
+        "checked_at": "2026-01-16T05:14:26.735915+00:00",
+        "top_holders_checked": 200,
+        "overlap_count": 25,
+        "overlap_percentage": 12.5,
+        "concentration": 0.15,
+        "weighted_concentration": 0.49,
+        "total_winner_wallets": 16853,
+        "overlap_wallets_sample": [
+          "EEkfTsopSiY19gcBmyfEFz61kH5Eff1KdvoCSnFUs9ta",
+          "8B9zATz67fNu7xeFjJyh7NacYHzP79NBgFEfaKzG5cB4",
+          "GiUJjUD2i15ZsTs9bF9x9F4fR2hwpd9we3bTWWkcqAou",
+          "9D3kcc3c7wnfeJ7Geh4WW2Fd2HjYm75jgR56GKdVqVN7",
+          "6TNAaxPdLKMdy2znAdopaRU53wj4PxPvxpqR45GyenQ9",
+          "8FiuwM6FmVKmBLCaJ6QcNScnVw4NuNs7Tt4Skf91saF8",
+          "zr7orgZWya4tN96j8BTwHwAYPcJS5nG1dX2hQ4avA7k",
+          "CWRgomciERUj7RBobsmGK5gJW3WCZSWoS7k9hUmcWAW3",
+          "BM9CcyErJcu2mjrFvUsRRrD3snGeHDDVirJLvL6EjvMN",
+          "7jX21Es5WQhR8QgTG87pnqZHKZwJyE2fSCn1btq22XsN",
+          "6Kkojzd2WiC57nhUAdMzzWEyZrNJPC6tvQueh652M6fm",
+          "2nsAqR69LbFin7RAtwTVeaRSKLQ4ou97DJ618EWJZU7t",
+          "C2CrQBtQeiiybk7fF4YosoYfzRJyDaQay1bpTLxZk2o3",
+          "9Jd5LHoygg4mytSzXvxfy8YSzVWmxDZ6X8gppSnTS4V2",
+          "DQmdRpYYwRgP1C2p9uEZsNL5FWWKAkuPrCJCKGDzWanx",
+          "3sJgWi4272mhjHQ5ay9Qzovnj9wQ7M8qwVse3uWGvJA2",
+          "8jXp48s2Lv3eVv3rgXaqHhAAD3iys6WYtmFCPjEZYNbb",
+          "51ktg8vYic3XHpZ7N8AFv7GriVC4ake7TQ5j8RX7N1J5",
+          "BC9PJTHiz3GRGh2TgzDyXRRDEfhbhoS4wPNqNQ5SRpLB",
+          "6b7Ze41CGDY38prCGdQpkS7zmgVoLJfefVh6GEczPj8i"
+        ],
+        "grade": "LOW",
+        "detected_via": "dexscreener",
+        "block_time": 1768539850,
+        "token_metadata": {
+          "fdv_usd": 0.0,
+          "volume_usd": 0.0,
+          "source_dex": "dexscreener",
+          "price_change_percentage": 0.0
+        },
+        "ML_PASSED": true,
+        "dexscreener": {
+          "current_price_usd": 0.0001395
+        }
+      },
+      "security": "passed_rugcheck",
+      "probation_meta": {
+        "probation": false,
+        "top_n_pct": 17.87221,
+        "top_n": 3,
+        "threshold_pct": 40.0,
+        "explanation": "Top 3 holders own 17.87% of supply; threshold is >40.0%. Probation=False."
+      },
+      "rugcheck": {
+        "top1_holder_pct": 13.428636125459963,
+        "top_10_holders_pct": 30.239286587955476,
+        "holder_count": 2418,
+        "has_authorities": false,
+        "creator_balance": 0.0,
+        "transfer_fee_pct": 0,
+        "lp_locked_pct": 100.0,
+        "total_liquidity_usd": 37583.785203333406,
+        "lp_lock_details": [
+          {
+            "market_type": "pump_fun_amm",
+            "locked_usd": 37583.785203333406,
+            "total_usd": 37583.785203333406,
+            "locked_pct": 100
+          }
+        ]
+      },
+      "dexscreener": {
+        "current_price_usd": 0.0001371,
+        "market_cap_usd": 137142.0
+      },
+      "ml_prediction": {
+        "probability": 0.44084376521228597,
+        "confidence": "VERY LOW",
+        "risk_tier": "VERY HIGH RISK",
+        "action": "AVOID",
+        "error": null,
+        "key_metrics": {
+          "token_age_hours": 1.2220136934518815,
+          "liquidity_usd": 37160.46,
+          "volume_h24_usd": 80941.98,
+          "price_change_h24_pct": 110.0,
+          "insider_supply_pct": 0.0,
+          "top_10_holders_pct": 30.24447227413067,
+          "pump_dump_risk_score": 10.0,
+          "market_health_score": 1232.711426744443,
+          "anomaly_score": 0.0
+        },
+        "warnings": []
+      },
+      "ML_PASSED": true
+    }
+  ],
+  "FcnrZ2WB6ZdNxD4RMvJKGiG5SJmSUZH8DQDQbChwpump": [
+    {
+      "ts": "2026-01-16T05:16:07.211454+00:00",
+      "result": {
+        "token": "FcnrZ2WB6ZdNxD4RMvJKGiG5SJmSUZH8DQDQbChwpump",
+        "checked_at": "2026-01-16T05:14:25.115038+00:00",
+        "top_holders_checked": 200,
+        "overlap_count": 14,
+        "overlap_percentage": 7.0,
+        "concentration": 0.08,
+        "weighted_concentration": 0.19,
+        "total_winner_wallets": 16853,
+        "overlap_wallets_sample": [
+          "EEkfTsopSiY19gcBmyfEFz61kH5Eff1KdvoCSnFUs9ta",
+          "D3cZYa6zooDEHfGc2XLhF7xFHfAKc7ggYLoL2iC3A7vE",
+          "4DGRGJLpJS82ceqqiCCCVkXyTiiQiciArti3fY3gGk6E",
+          "D7qWUTH7khcA6Mp3hdmTBZy6msvd5TuKghjjbZZs3xkG",
+          "EbpZp7vbpGXH4J22dJQAnLVoqTH688rQeJuaPWvF2sbz",
+          "HFocWWooaJFv9jvBQjHUidSSRBrCHBegSxjPFYCzfFnK",
+          "D9GYt4W7VvteKCSvTgyjzuiBJyTy94Kmr6YiC9fbxGjW",
+          "9w92vcQjsXagAYonioHrHaBgiAwtwUz3t1hGfjcEthTY",
+          "C5LYS2AXVi3R6kbdJfqetiohdaFhfb7XrxEd3RctSiJk",
+          "FVpjDJyVKCmrDbwxpXR9NLUsByGtqfgraYxcDb6gEETD",
+          "DLEHDdMs6Mfy5ygss7qtJ4ofe2TGRaLedYgL5yrbsyfc",
+          "8FiuwM6FmVKmBLCaJ6QcNScnVw4NuNs7Tt4Skf91saF8",
+          "AgEkFUGK8FxfkBJCGaL9iRY4mj8zL5KVi1bEofsbu4BW",
+          "FWx3SVhQQA6XAcYiCQoDqp8Tgw6zVoTeYpCbzKzBmTmj"
+        ],
+        "grade": "LOW",
+        "detected_via": "dexscreener",
+        "block_time": 1768539850,
+        "token_metadata": {
+          "fdv_usd": 0.0,
+          "volume_usd": 0.0,
+          "source_dex": "dexscreener",
+          "price_change_percentage": 0.0
+        },
+        "ML_PASSED": true,
+        "dexscreener": {
+          "current_price_usd": 0.0002621
+        }
+      },
+      "security": "passed_rugcheck",
+      "probation_meta": {
+        "probation": false,
+        "top_n_pct": 12.057798,
+        "top_n": 3,
+        "threshold_pct": 40.0,
+        "explanation": "Top 3 holders own 12.06% of supply; threshold is >40.0%. Probation=False."
+      },
+      "rugcheck": {
+        "top1_holder_pct": 9.58776814355911,
+        "top_10_holders_pct": 19.76240114535542,
+        "holder_count": 1423,
+        "has_authorities": false,
+        "creator_balance": 0.0,
+        "transfer_fee_pct": 0,
+        "lp_locked_pct": 100.0,
+        "total_liquidity_usd": 53043.609334939654,
+        "lp_lock_details": [
+          {
+            "market_type": "pump_fun_amm",
+            "locked_usd": 53043.609334939654,
+            "total_usd": 53043.609334939654,
+            "locked_pct": 100
+          }
+        ]
+      },
+      "dexscreener": {
+        "current_price_usd": 0.0002611,
+        "market_cap_usd": 261148.0
+      },
+      "ml_prediction": {
+        "probability": 0.5721255114171231,
+        "confidence": "LOW",
+        "risk_tier": "HIGH RISK",
+        "action": "SKIP",
+        "error": null,
+        "key_metrics": {
+          "token_age_hours": 1.1405705552630954,
+          "liquidity_usd": 51525.31,
+          "volume_h24_usd": 212193.91,
+          "price_change_h24_pct": 345.0,
+          "insider_supply_pct": 0.0,
+          "top_10_holders_pct": 20.02096640324722,
+          "pump_dump_risk_score": 10.0,
+          "market_health_score": 1676.1395357621675,
+          "anomaly_score": 0.0
+        },
+        "warnings": []
+      },
+      "ML_PASSED": true
+    }
+  ]
+}
