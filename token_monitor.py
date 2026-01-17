@@ -283,6 +283,8 @@ class TokenDiscovery:
         # --- DexScreener Config ---
         self.dexscreener_profiles_url = "https://api.dexscreener.com/token-profiles/latest/v1"
         self.dexscreener_boosts_url = "https://api.dexscreener.com/token-boosts/latest/v1"
+        self.last_dexscreener_boost_call = 0
+        self.dexscreener_boost_interval = 300 # 5 minutes
         
         # --- RugCheck Config ---
         self.rugcheck_new_url = "https://api.rugcheck.xyz/v1/stats/new_tokens"
@@ -720,7 +722,58 @@ class TokenDiscovery:
                         ))
                     return out
         except Exception as e:
-            if self.debug: print(f"[DexScreener] Error: {e}")
+            if self.debug: print(f"[DexScreener Profile] Error: {e}")
+            return []
+
+    async def _fetch_dexscreener_boosted_tokens(self) -> List[TradingStart]:
+        """Fetch latest boosted tokens from DexScreener."""
+        now = time.time()
+        if now - self.last_dexscreener_boost_call < self.dexscreener_boost_interval:
+            if self.debug:
+                print(f"[DexScreener Boosts] Skipping (throttling: {now - self.last_dexscreener_boost_call:.1f}s < {self.dexscreener_boost_interval:.1f}s)")
+            return []
+
+        if self.debug:
+            print("[DexScreener Boosts] Fetching latest boosts...")
+
+        try:
+            self.last_dexscreener_boost_call = now
+            async with aiohttp.ClientSession() as sess:
+                async with sess.get(self.dexscreener_boosts_url, timeout=20) as resp:
+                    if resp.status != 200: return []
+                    data = await resp.json()
+                    
+                    if not isinstance(data, list): return []
+                    
+                    out = []
+                    now_ts = int(now)
+                    for item in data:
+                        if item.get("chainId") != "solana": continue
+                        mint = item.get("tokenAddress")
+                        if not mint: continue
+                        
+                        out.append(TradingStart(
+                            mint=mint,
+                            block_time=now_ts,
+                            program_id="dexscreener_boost",
+                            detected_via="dexscreener_boost",
+                            extra={
+                                "url": item.get("url"),
+                                "description": item.get("description"),
+                                "icon": item.get("icon"),
+                                "header": item.get("header"),
+                                "links": item.get("links"),
+                                "totalAmount": item.get("totalAmount"),
+                                "amount": item.get("amount")
+                            },
+                            fdv_usd=0.0,
+                            volume_usd=0.0,
+                            source_dex="dexscreener",
+                            price_change_percentage=0.0
+                        ))
+                    return out
+        except Exception as e:
+            if self.debug: print(f"[DexScreener Boosts] Error: {e}")
             return []
 
     # ---------------- RugCheck Logic (Primary Source) ----------------
@@ -793,6 +846,7 @@ class TokenDiscovery:
         
         be_task = self._fetch_birdeye_new_tokens()
         dx_task = self._fetch_dexscreener_new_tokens()
+        dx_boost_task = self._fetch_dexscreener_boosted_tokens()
         
         rc_task = retry_with_backoff(
             self._fetch_rugcheck_new_tokens,
@@ -801,17 +855,18 @@ class TokenDiscovery:
         )
 
         # 2. Run concurrently
-        results = await asyncio.gather(gt_task, be_task, dx_task, rc_task, return_exceptions=True)
+        results = await asyncio.gather(gt_task, be_task, dx_task, dx_boost_task, rc_task, return_exceptions=True)
         
         # 3. Handle Results
         gt_raw_pools = results[0] if not isinstance(results[0], Exception) else []
         be_starts = results[1] if not isinstance(results[1], Exception) else []
         dx_starts = results[2] if not isinstance(results[2], Exception) else []
-        rc_starts = results[3] if not isinstance(results[3], Exception) else []
+        dx_boosted_starts = results[3] if not isinstance(results[3], Exception) else []
+        rc_starts = results[4] if not isinstance(results[4], Exception) else []
         
         # Log failures if any
         if self.debug:
-            for i, name in enumerate(["GeckoTerminal", "BirdEye", "DexScreener", "RugCheck"]):
+            for i, name in enumerate(["GeckoTerminal", "BirdEye", "DexScreener", "DexScreenerBoost", "RugCheck"]):
                 if isinstance(results[i], Exception):
                     print(f"[TokenDiscovery] {name} failed: {results[i]}")
 
@@ -848,6 +903,9 @@ class TokenDiscovery:
         for ts in dx_starts:
             unique_tokens[ts.mint] = ts
 
+        for ts in dx_boosted_starts:
+            unique_tokens[ts.mint] = ts
+
         for ts in gt_starts:
             unique_tokens[ts.mint] = ts
 
@@ -855,7 +913,7 @@ class TokenDiscovery:
 
         if self.debug:
             print(f"[TokenDiscovery] Combined Total: {len(final_list)} unique tokens "
-                  f"(GT: {len(gt_starts)}, BE: {len(be_starts)}, DX: {len(dx_starts)}, RC: {len(rc_starts)})")
+                  f"(GT: {len(gt_starts)}, BE: {len(be_starts)}, DX: {len(dx_starts)}, DX_BOOST: {len(dx_boosted_starts)}, RC: {len(rc_starts)})")
 
         return final_list
 

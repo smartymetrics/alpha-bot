@@ -11,10 +11,10 @@ Now using CoinGecko Pro API for new token discovery.
 - Removed functions: _security_gate_and_route, _schedule_first_check_only, _schedule_repeat_check_only.
 - Renamed `check_holders_overlap` to `_fetch_and_calculate_overlap` for clarity.
 
-*** MODIFIED (ML V2 Integration) ***
-- Runs ml_predictor_v2.py ONLY on tokens that pass ALL security/overlap checks.
-- Adds 'ml_prediction' (probability, confidence, risk_tier) to the final
-  results file for data confirmation, NOT as a filter.
+*** MODIFIED (RPC FALLBACK) ***
+- Implemented `_fetch_rpc_security_report` to handle RugCheck 400/429 errors.
+- Uses Helius RPC to manually check Authorities, Supply, and Creator Balance.
+- Uses DexScreener to check Liquidity during fallback.
 """
 import asyncio
 import aiohttp
@@ -47,6 +47,8 @@ load_dotenv()
 
 PROBATION_TOP_N = int(os.getenv("PROBATION_TOP_N", "3"))
 PROBATION_THRESHOLD_PCT = float(os.getenv("PROBATION_THRESHOLD_PCT", "40"))
+ML_PREDICTION_THRESHOLD = float(os.getenv("ML_PREDICTION_THRESHOLD", "0.50"))
+ML_ACTION_THRESHOLD = float(os.getenv("ML_ACTION_THRESHOLD", "0.70"))
 MAX_CREATOR_PCT = 20
 
 COINGECKO_PRO_API_KEY = os.environ.get("GECKO_API")
@@ -90,19 +92,6 @@ async def retry_with_backoff(func, *args, retries: int = 5, base_delay: float = 
     """
     Retry an async function with exponential backoff and jitter.
     Now handles 429 rate limiting with Retry-After header support.
-    
-    Args:
-        func: Async function to retry
-        *args: Positional arguments for func
-        retries: Maximum number of retry attempts
-        base_delay: Base delay in seconds for exponential backoff
-        **kwargs: Keyword arguments for func
-        
-    Returns:
-        Result from successful func call
-        
-    Raises:
-        RuntimeError: If all retries are exhausted
     """
     for attempt in range(1, retries + 1):
         try:
@@ -118,7 +107,6 @@ async def retry_with_backoff(func, *args, retries: int = 5, base_delay: float = 
                     try:
                         retry_after = int(e.headers['Retry-After'])
                     except (ValueError, TypeError):
-                        # If Retry-After is not a valid integer, ignore it
                         pass
                 
                 # Determine wait time
@@ -272,9 +260,29 @@ class TokenDiscovery:
         self.client = client
         self.debug = bool(debug)
         
-        # --- CoinGecko Config ---
+        # --- CoinGecko / GeckoTerminal Config ---
+        # Switch from Pro to Public GeckoTerminal API
         self.coingecko_pro_api_key = coingecko_pro_api_key or os.environ.get("GECKO_API")
-        self.coingecko_url = "https://pro-api.coingecko.com/api/v3/onchain/networks/solana/new_pools"
+        self.geckoterminal_url = "https://api.geckoterminal.com/api/v2/networks/solana/new_pools"
+        
+        # --- BirdEye Config ---
+        self.birdeye_keys = _load_keys_list("BIRDEYE_API_KEY")
+        self.birdeye_url = "https://public-api.birdeye.so/defi/v2/tokens/new_listing"
+        self._birdeye_idx = 0
+        self._bad_birdeye_keys: Set[str] = set()
+        self.last_birdeye_call = 0
+        
+        # Throttling for BirdEye: 30,000 CUs per month per key.
+        # User analysis suggests up to 100 CUs per call for new listings.
+        # If N keys, max requests = (N * 30000) / 100 = N * 300 requests/month.
+        # Interval (seconds) = (30 days * 24h * 3600s) / (N * 300).
+        # Which simplifies to 8,640 / N_KEYS.
+        num_keys = len(self.birdeye_keys) or 1
+        self.birdeye_interval = (30 * 24 * 3600 * 100) / (num_keys * 30000)
+        
+        # --- DexScreener Config ---
+        self.dexscreener_profiles_url = "https://api.dexscreener.com/token-profiles/latest/v1"
+        self.dexscreener_boosts_url = "https://api.dexscreener.com/token-boosts/latest/v1"
         
         # --- RugCheck Config ---
         self.rugcheck_new_url = "https://api.rugcheck.xyz/v1/stats/new_tokens"
@@ -296,7 +304,7 @@ class TokenDiscovery:
         self.dune_cache_file = dune_cache_file
         
         if self.debug:
-            print("TokenDiscovery initialized with CoinGecko Pro, RugCheck, and ASYNC Dune")
+            print(f"TokenDiscovery initialized with Multi-Source: GT Public, BirdEye ({num_keys} keys), DexScreener, RugCheck, and ASYNC Dune")
 
     def _load_last_timestamp(self, cache_file: str) -> Optional[int]:
         if os.path.exists(cache_file):
@@ -524,54 +532,198 @@ class TokenDiscovery:
         
         return []
 
-    # ---------------- CoinGecko Logic ----------------
-    async def _fetch_coingecko_new_pools(self, limit: int = 500, timeout: int = 30) -> List[Dict[str, Any]]:
-        """Fetch raw pool data from CoinGecko Pro."""
-        headers = {"accept": "application/json", "x-cg-pro-api-key": self.coingecko_pro_api_key}
+    # ---------------- GeckoTerminal Logic (Verified) ----------------
+    async def _fetch_geckoterminal_new_pools(self, limit: int = 500, timeout: int = 30) -> List[Dict[str, Any]]:
+        """Fetch raw pool data from GeckoTerminal Public API."""
+        params = {
+            "include": "base_token,quote_token",
+            "include_gt_community_data": "true",
+            "page": "1" # Public tier pagination is limited
+        }
+        headers = {"accept": "application/json"}
+        
+        # If we have a Pro key, we could still use it via headers if supported by the public endpoint
+        if self.coingecko_pro_api_key:
+            headers["x-cg-pro-api-key"] = self.coingecko_pro_api_key
+
         if self.debug:
-            print("[CoinGecko] Fetching latest pools (ignoring cache)")
+            print("[GeckoTerminal] Fetching latest pools...")
 
         async with aiohttp.ClientSession() as sess:
-            async with sess.get(self.coingecko_url, headers=headers, timeout=timeout) as resp:
-                resp.raise_for_status()
+            async with sess.get(self.geckoterminal_url, headers=headers, params=params, timeout=timeout) as resp:
+                if resp.status != 200:
+                    if self.debug:
+                        print(f"[GeckoTerminal] Failed: Status {resp.status}")
+                    return []
                 data = await resp.json()
                 return data.get("data", [])
 
     @staticmethod
-    def _parse_pool_created_at(val: Any) -> Optional[int]:
+    def _parse_iso_timestamp(val: Any) -> Optional[int]:
         if not val: return None
         try:
+            # Handle formats like 2026-01-15T13:28:28Z or 2026-01-15T13:50:45
             ts_str = str(val).replace("Z", "+00:00")
+            if "T" in ts_str and len(ts_str) == 19: # 2026-01-15T13:50:45
+                ts_str += "+00:00"
             dt = datetime.fromisoformat(ts_str)
             if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
             return int(dt.timestamp())
         except Exception: return None
 
-    def _parse_coingecko_pool(self, pool: Dict[str, Any]) -> TradingStart:
+    def _parse_geckoterminal_pool(self, pool: Dict[str, Any]) -> TradingStart:
         attr = pool["attributes"]
         base_token = pool["relationships"]["base_token"]["data"]
         mint = base_token["id"].replace("eth_", "").replace("solana_", "")
-        block_time = self._parse_pool_created_at(attr["pool_created_at"])
+        block_time = self._parse_iso_timestamp(attr["pool_created_at"])
+        
+        # Parse volume - it's nested in verified GT response
+        vol_h24 = 0.0
+        vol_data = attr.get("volume_usd")
+        if isinstance(vol_data, dict):
+            vol_h24 = float(vol_data.get("h24") or 0.0)
+        elif isinstance(vol_data, (int, float, str)):
+            vol_h24 = float(vol_data)
+
         return TradingStart(
             mint=mint,
             block_time=block_time,
-            program_id="coingecko",
-            detected_via="coingecko",
+            program_id="geckoterminal",
+            detected_via="geckoterminal",
             extra={
                 "name": attr["name"].split(" / ")[0],
-                "fdv_usd": attr["fdv_usd"],
-                "market_cap_usd": attr.get("market_cap_usd") or attr["fdv_usd"],
-                "volume_usd": attr["volume_usd"]["h24"],
+                "fdv_usd": float(attr.get("fdv_usd") or 0.0),
+                "market_cap_usd": float(attr.get("market_cap_usd") or attr.get("fdv_usd") or 0.0),
+                "volume_usd": vol_h24,
                 "source_dex": pool["relationships"]["dex"]["data"]["id"],
-                "price_change_percentage": attr["price_change_percentage"]["h24"],
+                "price_change_percentage": float(attr.get("price_change_percentage", {}).get("h24") or 0.0),
             },
-            fdv_usd=attr["fdv_usd"],
-            volume_usd=attr["volume_usd"]["h24"],
+            fdv_usd=float(attr.get("fdv_usd") or 0.0),
+                volume_usd=vol_h24,
             source_dex=pool["relationships"]["dex"]["data"]["id"],
-            price_change_percentage=attr["price_change_percentage"]["h24"],
+            price_change_percentage=float(attr.get("price_change_percentage", {}).get("h24") or 0.0),
         )
 
-    # ---------------- RugCheck Logic ----------------
+    # ---------------- BirdEye Logic (Verified) ----------------
+    def _next_birdeye_key(self) -> Optional[str]:
+        """Round-robin through valid BirdEye keys"""
+        valid = [k for k in self.birdeye_keys if k not in self._bad_birdeye_keys]
+        if not valid:
+            if self.birdeye_keys:
+                self._bad_birdeye_keys.clear() # reset
+                valid = self.birdeye_keys
+            else:
+                return None
+        key = valid[self._birdeye_idx % len(valid)]
+        self._birdeye_idx += 1
+        return key
+
+    async def _fetch_birdeye_new_tokens(self) -> List[TradingStart]:
+        """Fetch the latest tokens from BirdEye API with rotation and throttling."""
+        # Throttling check
+        now = time.time()
+        if now - self.last_birdeye_call < self.birdeye_interval:
+            if self.debug:
+                print(f"[BirdEye] Skipping (throttling: {now - self.last_birdeye_call:.1f}s < {self.birdeye_interval:.1f}s)")
+            return []
+            
+        key = self._next_birdeye_key()
+        if not key: return []
+        
+        headers = {
+            "accept": "application/json",
+            "x-chain": "solana",
+            "X-API-KEY": key
+        }
+        params = {"limit": "20", "meme_platform_enabled": "true"}
+        
+        if self.debug:
+            print(f"[BirdEye] Fetching new listings (key {key[:4]}...)")
+
+        try:
+            self.last_birdeye_call = now
+            async with aiohttp.ClientSession() as sess:
+                async with sess.get(self.birdeye_url, headers=headers, params=params, timeout=20) as resp:
+                    if resp.status == 401 or resp.status == 403:
+                        self._bad_birdeye_keys.add(key)
+                        return []
+                    if resp.status != 200:
+                        return []
+                    data = await resp.json()
+                    items = data.get("data", {}).get("items", [])
+                    
+                    out = []
+                    for item in items:
+                        mint = item.get("address")
+                        if not mint: continue
+                        
+                        block_time = self._parse_iso_timestamp(item.get("liquidityAddedAt"))
+                        out.append(TradingStart(
+                            mint=mint,
+                            block_time=block_time or int(now),
+                            program_id="birdeye",
+                            detected_via="birdeye",
+                            extra={
+                                "symbol": item.get("symbol"),
+                                "name": item.get("name"),
+                                "source_dex": item.get("source"),
+                                "liquidity": item.get("liquidity")
+                            },
+                            fdv_usd=0.0, # BirdEye listed tokens often lack FDV in this endpoint
+                            volume_usd=0.0,
+                            source_dex=item.get("source") or "unknown",
+                            price_change_percentage=0.0
+                        ))
+                    return out
+        except Exception as e:
+            if self.debug: print(f"[BirdEye] Error: {e}")
+            return []
+
+    # ---------------- DexScreener Logic ----------------
+    async def _fetch_dexscreener_new_tokens(self) -> List[TradingStart]:
+        """Fetch latest tokens from DexScreener Profiles."""
+        if self.debug:
+            print("[DexScreener] Fetching latest profiles...")
+
+        try:
+            async with aiohttp.ClientSession() as sess:
+                async with sess.get(self.dexscreener_profiles_url, timeout=20) as resp:
+                    if resp.status != 200: return []
+                    data = await resp.json()
+                    
+                    # Profiles are returned as a list
+                    if not isinstance(data, list): return []
+                    
+                    out = []
+                    now_ts = int(time.time())
+                    for item in data:
+                        if item.get("chainId") != "solana": continue
+                        mint = item.get("tokenAddress")
+                        if not mint: continue
+                        
+                        out.append(TradingStart(
+                            mint=mint,
+                            block_time=now_ts, # DexScreener profiles are very fresh
+                            program_id="dexscreener_profile",
+                            detected_via="dexscreener",
+                            extra={
+                                "name": item.get("tokenName"), # NEW
+                                "symbol": item.get("tokenSymbol"), # NEW
+                                "description": item.get("description"),
+                                "url": item.get("url"),
+                                "icon": item.get("icon") # NEW
+                            },
+                            fdv_usd=0.0,
+                            volume_usd=0.0,
+                            source_dex="dexscreener",
+                            price_change_percentage=0.0
+                        ))
+                    return out
+        except Exception as e:
+            if self.debug: print(f"[DexScreener] Error: {e}")
+            return []
+
+    # ---------------- RugCheck Logic (Primary Source) ----------------
     async def _fetch_rugcheck_new_tokens(self, timeout: int = 50) -> List[TradingStart]:
         """Fetch the latest tokens from RugCheck API."""
         if self.debug:
@@ -628,18 +780,19 @@ class TokenDiscovery:
     # ---------------- Aggregated Discovery ----------------
     async def get_tokens_created_today(self, limit: int = 500) -> List[TradingStart]:
         """
-        Fetches tokens from both CoinGecko and RugCheck in parallel.
-        Merges results, prioritizing CoinGecko data if duplicates exist 
-        (because CG provides richer market data like Dex/FDV).
+        Fetches tokens from GeckoTerminal, BirdEye, DexScreener, and RugCheck in parallel.
+        Merges results, prioritizing GeckoTerminal data if duplicates exist.
         """
         # 1. Define tasks for parallel execution
-        # Use existing retry_with_backoff for robustness
-        cg_task = retry_with_backoff(
-            self._fetch_coingecko_new_pools,
+        gt_task = retry_with_backoff(
+            self._fetch_geckoterminal_new_pools,
             limit=limit,
             retries=3,
             base_delay=2.0
         )
+        
+        be_task = self._fetch_birdeye_new_tokens()
+        dx_task = self._fetch_dexscreener_new_tokens()
         
         rc_task = retry_with_backoff(
             self._fetch_rugcheck_new_tokens,
@@ -648,56 +801,61 @@ class TokenDiscovery:
         )
 
         # 2. Run concurrently
-        results = await asyncio.gather(cg_task, rc_task, return_exceptions=True)
+        results = await asyncio.gather(gt_task, be_task, dx_task, rc_task, return_exceptions=True)
         
         # 3. Handle Results
-        cg_raw_pools = results[0] if not isinstance(results[0], Exception) else []
-        rc_starts = results[1] if not isinstance(results[1], Exception) else []
+        gt_raw_pools = results[0] if not isinstance(results[0], Exception) else []
+        be_starts = results[1] if not isinstance(results[1], Exception) else []
+        dx_starts = results[2] if not isinstance(results[2], Exception) else []
+        rc_starts = results[3] if not isinstance(results[3], Exception) else []
         
         # Log failures if any
         if self.debug:
-            if isinstance(results[0], Exception):
-                print(f"[TokenDiscovery] CoinGecko failed: {results[0]}")
-            if isinstance(results[1], Exception):
-                print(f"[TokenDiscovery] RugCheck failed: {results[1]}")
+            for i, name in enumerate(["GeckoTerminal", "BirdEye", "DexScreener", "RugCheck"]):
+                if isinstance(results[i], Exception):
+                    print(f"[TokenDiscovery] {name} failed: {results[i]}")
 
-        # 4. Process CoinGecko Data
-        cg_starts = []
+        # 4. Process GeckoTerminal Data
+        gt_starts = []
         now = int(datetime.now(timezone.utc).timestamp())
         cutoff = now - 24 * 3600  # last 24 hours
 
-        for pool in cg_raw_pools:
-            block_time = self._parse_pool_created_at(pool["attributes"]["pool_created_at"])
+        for pool in gt_raw_pools:
+            block_time = self._parse_iso_timestamp(pool["attributes"]["pool_created_at"])
             if not block_time: continue
             if block_time < cutoff: continue
 
-            ts = self._parse_coingecko_pool(pool)
-            cg_starts.append(ts)
+            ts = self._parse_geckoterminal_pool(pool)
+            gt_starts.append(ts)
 
-            # Update timestamp tracker (prefer CG timestamps for history)
+            # Update timestamp tracker
             if self.last_processed_timestamp is None or block_time > self.last_processed_timestamp:
                 self.last_processed_timestamp = block_time
 
-        if cg_starts:
+        if gt_starts:
             self._save_last_timestamp()
 
-        # 5. Merge and Deduplicate
-        # Strategy: Use a dictionary keyed by mint.
-        # Add RugCheck first, then overwrite with CoinGecko.
-        # This ensures if a token is on both, we get the CG version (which has DEX/Price data).
+        # 5. Merge and Deduplicate (Priority order: RC < BE < DX < GT)
         unique_tokens = {}
         
+        # Lower priority sources first
         for ts in rc_starts:
             unique_tokens[ts.mint] = ts
+        
+        for ts in be_starts:
+            unique_tokens[ts.mint] = ts
             
-        for ts in cg_starts:
+        for ts in dx_starts:
+            unique_tokens[ts.mint] = ts
+
+        for ts in gt_starts:
             unique_tokens[ts.mint] = ts
 
         final_list = list(unique_tokens.values())
 
         if self.debug:
             print(f"[TokenDiscovery] Combined Total: {len(final_list)} unique tokens "
-                  f"({len(cg_starts)} from CG, {len(rc_starts)} from RC)")
+                  f"(GT: {len(gt_starts)}, BE: {len(be_starts)}, DX: {len(dx_starts)}, RC: {len(rc_starts)})")
 
         return final_list
 
@@ -1954,42 +2112,151 @@ class Monitor:
                 print(f"[Cleanup] Safety net removed {len(expired_mints_in_mem)} expired/completed tokens from _scheduled set.")
 
 # --------------------------------------------------------------------------
-    # --- 🚀 MODIFIED: Security Checks with Shyft Fallback 🚀 ---
+    # --- 🚀 MODIFIED: Security Checks with Helius RPC Fallback 🚀 ---
     # --------------------------------------------------------------------------
+
+    async def _fetch_rpc_security_report(self, mint: str) -> Dict[str, Any]:
+        """
+        Fallback: Manually build a security report using Helius RPC 
+        when RugCheck returns 400/404/429.
+        """
+        if self.debug:
+            print(f"[Security] 🛡️ Initiating RPC Fallback for {mint}...")
+
+        # 1. Get Mint Info (Authorities & Decimals)
+        freeze_authority = None
+        mint_authority = None
+        decimals = 0
+        
+        try:
+            info = await self.sol_client.make_rpc_call(
+                "getAccountInfo", 
+                [mint, {"encoding": "jsonParsed"}]
+            )
+            result = info.get("result")
+            value = result.get("value") if result else None
+            
+            if value:
+                parsed = value.get("data", {}).get("parsed", {}).get("info", {})
+                mint_authority = parsed.get("mintAuthority")
+                freeze_authority = parsed.get("freezeAuthority")
+                decimals = int(parsed.get("decimals", 0))
+                
+                if self.debug:
+                    if not mint_authority and not freeze_authority:
+                        print(f"[Security] ℹ️ No authorities found for {mint} (immutable mint)")
+                    else:
+                        print(f"[Security] ✅ Got authorities for {mint}: mint_auth={mint_authority[:8] if mint_authority else 'None'}..., freeze_auth={freeze_authority[:8] if freeze_authority else 'None'}...")
+            else:
+                if self.debug:
+                    print(f"[Security] ⚠️ getAccountInfo returned null for {mint} (account not found)")
+        except Exception as e:
+            if self.debug:
+                print(f"[Security] ⚠️ RPC Authority check failed for {mint}: {e}")
+
+        # 2. Get Supply
+        supply = 0
+        try:
+            s_data = await self.sol_client.make_rpc_call("getTokenSupply", [mint])
+            amount_str = s_data.get("result", {}).get("value", {}).get("amount", "0")
+            supply = int(amount_str)
+            if self.debug:
+                print(f"[Security] ✅ Got supply for {mint}: {supply}")
+        except Exception as e:
+            if self.debug:
+                print(f"[Security] ⚠️ Failed to get supply for {mint}: {e}")
+
+        # 3. Get Creator Balance (We assume Mint Authority == Creator for new tokens)
+        creator_balance_pct = 0.0
+        creator_balance_raw = 0
+        if mint_authority:
+            try:
+                # Reuse your existing helper logic here
+                normalized, success = await self._get_creator_balance_rpc(mint, decimals)
+                if success and supply > 0:
+                    # Calculate percentage based on raw supply
+                    total_supply_normalized = supply / (10 ** decimals) if decimals > 0 else supply
+                    creator_balance_pct = (normalized / total_supply_normalized) * 100
+                    creator_balance_raw = normalized # Store for record
+                    if self.debug:
+                        print(f"[Security] ✅ Creator balance for {mint}: {creator_balance_pct:.2f}%")
+                elif self.debug and not success:
+                    print(f"[Security] ⚠️ Failed to get creator balance for {mint} from RPC")
+            except Exception as e:
+                if self.debug:
+                    print(f"[Security] ⚠️ Exception getting creator balance RPC for {mint}: {e}")
+        else:
+            # Immutable mint - try to find creator from creation transaction
+            if self.debug:
+                print(f"[Security] ℹ️ Immutable mint detected for {mint} - attempting to find creator from creation tx...")
+            
+            creator = await self._get_creator_from_creation_tx(mint)
+            if creator:
+                creator_balance_pct, success = await self._get_creator_balance_for_immutable_mint(
+                    mint, creator, decimals, supply
+                )
+            else:
+                if self.debug:
+                    print(f"[Security] ⚠️ Could not find creator for immutable mint {mint}")
+
+        # 4. Get Liquidity (Optional: Quick DexScreener check just for the Fallback)
+        # We do this because RugCheck usually gives us this, and we need it for the gate.
+        total_lp_usd = 0.0
+        try:
+            dex_data = await self._run_dexscreener_check(mint)
+            if dex_data.get("ok"):
+                total_lp_usd = dex_data.get("liquidity_usd", 0.0)
+                if self.debug:
+                    print(f"[Security] ✅ Got liquidity for {mint}: ${total_lp_usd:.2f}")
+        except Exception as e:
+            if self.debug:
+                print(f"[Security] ⚠️ Failed to get liquidity for {mint}: {e}")
+
+        return {
+            "ok": True,
+            "data_source": "rpc_fallback",
+            "rugged": False, # We can't know for sure, but we assume False if valid on-chain
+            "total_holders": 0, # RPC makes this hard to count cheaply, so we skip holder count check
+            "creator_balance": creator_balance_pct, # The calculated %
+            "freeze_authority": freeze_authority,
+            "mint_authority": mint_authority,
+            "has_authorities": bool(freeze_authority or mint_authority),
+            "transfer_fee_pct": 0, # Hard to parse from RPC without complex decoding, assume 0 for fallback
+            "total_lp_usd": total_lp_usd,
+            "overall_lp_locked_pct": None, # Cannot get this from simple RPC
+            "probation": False, # Cannot calculate holder concentration easily via RPC
+            "probation_meta": {"explanation": "RPC Fallback - Concentration check skipped"},
+            "raw": {}
+        }
 
     async def _run_rugcheck_check(self, mint: str) -> Dict[str, Any]:
         """
-        Check token security using RugCheck API with comprehensive risk analysis.
-        FIXED: Properly handles creator balance as raw amounts, not percentages.
-        FIXED: Returns None for missing creator balance to trigger RPC fallback.
+        Check token security. 
+        Primary: RugCheck API.
+        Fallback: Helius RPC (if RugCheck returns 400/RateLimit).
         """
         url = f"https://api.rugcheck.xyz/v1/tokens/{mint}/report"
         session = self.http_session
         
+        # --- Attempt 1: RugCheck ---
         try:
             async with self._api_sema:
-                async with session.get(url, timeout=30) as resp:
-                    if resp.status == 429:
-                        raise aiohttp.ClientResponseError(
-                            resp.request_info, resp.history, status=429,
-                            message=f"Rate limited by RugCheck for {mint}"
-                        )
+                async with session.get(url, timeout=10) as resp:
+                    # If 400 (Report not found/generation failed) or 429/5xx
                     if resp.status != 200:
-                        text = await resp.text()
-                        raise RuntimeError(f"RugCheck Status {resp.status}: {text}")
+                        if self.debug:
+                            print(f"[Security] RugCheck returned status {resp.status}. Switching to RPC Fallback.")
+                        # TRIGGER FALLBACK DIRECTLY
+                        return await self._fetch_rpc_security_report(mint)
                     
                     data = await resp.json()
 
         except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError) as e:
             if self.debug:
-                print(f"[Security] RugCheck request failed for {mint}: {e}")
-            return {
-                "ok": False,
-                "error": "rugcheck_request_failed",
-                "error_text": str(e)
-            }
+                print(f"[Security] RugCheck request failed for {mint}: {e}. Switching to RPC Fallback.")
+            return await self._fetch_rpc_security_report(mint)
 
-        # --- Process RugCheck Data ---
+        # --- Process RugCheck Data (If Successful) ---
         probation_result = evaluate_probation_from_rugcheck(data)
         
         # Handle None returns from data.get()
@@ -2151,7 +2418,128 @@ class Monitor:
 
         return (0, 0)
 
-    async def _get_creator_balance_rpc(self, mint: str, decimals: int) -> tuple:
+    async def _get_creator_from_creation_tx(self, mint: str) -> str:
+        """
+        Extract creator address from token creation transaction.
+        When mint authority is None (immutable), we can still find the creator
+        by looking at who initiated the token creation transaction.
+        
+        Logic:
+        1. Get first signature (token creation tx) via getSignaturesForAddress
+        2. Parse transaction to find who paid for it (likely the creator)
+        3. Return creator address
+        """
+        try:
+            # Get the first (oldest) transaction - this should be token creation
+            sig_data = await self.sol_client.make_rpc_call(
+                "getSignaturesForAddress",
+                [mint, {"limit": 1}]  # Get only the first signature
+            )
+            
+            sigs = sig_data.get("result", [])
+            if not sigs:
+                if self.debug:
+                    print(f"[Security] ℹ️ No signatures found for {mint}")
+                return None
+            
+            sig = sigs[0].get("signature")
+            if not sig:
+                return None
+            
+            # Parse the transaction (with version support for Solana versioned transactions)
+            tx_data = await self.sol_client.make_rpc_call(
+                "getTransaction",
+                [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]
+            )
+            
+            if tx_data.get("error"):
+                if self.debug:
+                    print(f"[Security] ⚠️ Could not fetch creation tx for {mint}: {tx_data.get('error')}")
+                return None
+            
+            tx = tx_data.get("result", {})
+            if not tx:
+                # Retry with explicit version 0 support
+                if self.debug:
+                    print(f"[Security] ℹ️ Retrying getTransaction with explicit version support for {mint}...")
+                tx_data = await self.sol_client.make_rpc_call(
+                    "getTransaction",
+                    [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]
+                )
+                if tx_data.get("error"):
+                    if self.debug:
+                        print(f"[Security] ⚠️ Retry also failed for {mint}: {tx_data.get('error')}")
+                    return None
+                tx = tx_data.get("result", {})
+                if not tx:
+                    return None
+            
+            # Get the fee payer (first signer) - usually the creator
+            message = tx.get("transaction", {}).get("message", {})
+            account_keys = message.get("accountKeys", [])
+            
+            if account_keys:
+                creator = account_keys[0].get("pubkey") if isinstance(account_keys[0], dict) else str(account_keys[0])
+                if self.debug:
+                    print(f"[Security] ✅ Found creator from creation tx: {creator[:8] if creator else 'None'}...")
+                return creator
+            
+            return None
+            
+        except Exception as e:
+            if self.debug:
+                print(f"[Security] ⚠️ Failed to extract creator from creation tx for {mint}: {e}")
+            return None
+
+    async def _get_creator_balance_for_immutable_mint(self, mint: str, creator: str, decimals: int, supply: int) -> tuple:
+        """
+        Get creator balance when mint is immutable (no mint authority).
+        Uses the extracted creator address to find their token accounts.
+        
+        Returns (creator_balance_normalized, success_flag).
+        """
+        if not creator:
+            return (0.0, False)
+        
+        try:
+            data = await self.sol_client.make_rpc_call(
+                "getTokenAccountsByOwner",
+                [
+                    creator,
+                    {"mint": mint},
+                    {"encoding": "jsonParsed"}
+                ]
+            )
+            
+            if data.get("error"):
+                if self.debug:
+                    print(f"[Security] ⚠️ Failed to get token accounts for creator {creator[:8]}... on {mint}")
+                return (0.0, False)
+            
+            accounts = data.get("result", {}).get("value", [])
+            raw_balance = 0.0
+            
+            for acc in accounts:
+                amt_info = acc.get("account", {}).get("data", {}).get("parsed", {}).get("info", {}).get("tokenAmount", {})
+                raw_balance += float(amt_info.get("amount", 0))
+            
+            if raw_balance > 0:
+                # Normalize by decimals
+                normalized = raw_balance / (10 ** decimals) if decimals > 0 else raw_balance
+                creator_pct = (normalized / (supply / (10 ** decimals))) * 100 if supply > 0 and decimals > 0 else 0.0
+                
+                if self.debug:
+                    print(f"[Security] ✅ Immutable mint creator balance: {creator_pct:.2f}% (raw: {raw_balance})")
+                return (creator_pct, True)
+            else:
+                if self.debug:
+                    print(f"[Security] ℹ️ Creator {creator[:8]}... has 0 balance in {mint}")
+                return (0.0, True)
+            
+        except Exception as e:
+            if self.debug:
+                print(f"[Security] ⚠️ Exception getting immutable mint creator balance for {mint}: {e}")
+            return (0.0, False)
         """
         Get creator balance via RPC.
         Logic:
@@ -2218,7 +2606,7 @@ class Monitor:
     async def run_token_analysis_step(self, start: TradingStart, check_count: int):
         """
         Core analysis function that runs the full analysis lifecycle.
-        Handles both RugCheck and Shyft (fallback) data sources.
+        Handles both RugCheck and Helius RPC (fallback) data sources.
         """
         mint = start.mint
         now_ts = int(datetime.now(timezone.utc).timestamp())
@@ -2226,7 +2614,7 @@ class Monitor:
         if self.debug:
             print(f"[Analysis] Running check #{check_count} for {mint}")
 
-        # === 1. RUN SECURITY CHECK (RUGCHECK -> SHYFT) ===
+        # === 1. RUN SECURITY CHECK (RUGCHECK -> RPC FALLBACK) ===
         try:
             # We call _run_rugcheck_check directly now as it handles its own fallback/retries internally
             r = await self._run_rugcheck_check(mint)
@@ -2269,8 +2657,10 @@ class Monitor:
                 reasons.append(f"transfer_fee:{r.get('transfer_fee_pct')}%")
 
             # Rule 5: Holder Count
-            if r.get("total_holders", 0) < 50:
-                reasons.append(f"holder_count:{r.get('total_holders')}_req_50")
+            # If fallback, we skip this because fetching holder count via RPC is expensive/slow
+            if data_source != "rpc_fallback":
+                if r.get("total_holders", 0) < 50:
+                    reasons.append(f"holder_count:{r.get('total_holders')}_req_50")
 
             # Rule 6: LP Lock % (Conditional on Data Source)
             lp_locked_pct = r.get("overall_lp_locked_pct")
@@ -2279,9 +2669,10 @@ class Monitor:
                 # Strict check for RugCheck data
                 if isinstance(lp_locked_pct, (int, float)) and lp_locked_pct < 80.0:
                     reasons.append(f"lp_locked:{lp_locked_pct:.1f}%_req_80%")
-            elif data_source == "shyft":
-                # Shyft doesn't provide lock info, so we skip this rule gracefully
-                # If we wanted to be strict, we could fail here, but fallback implies best-effort
+            elif data_source == "rpc_fallback":
+                # We CANNOT check LP lock via simple RPC. 
+                # We assume risk here to allow analysis to proceed to Overlap Check.
+                # Just ensure basic Liquidity check (below) is respected.
                 pass
 
             # Rule 7: Liquidity Amount (Available from both sources via DexScreener)
@@ -2290,8 +2681,8 @@ class Monitor:
                 if total_lp < 10000.0:
                     reasons.append(f"liquidity_usd:{total_lp:.2f}_req_10000")
             else:
-                # If LP is unknown (DexScreener failed during Shyft check), that's a risk
-                if data_source == "shyft":
+                # If LP is unknown (DexScreener failed during fallback check), that's a risk
+                if data_source == "rpc_fallback":
                      reasons.append("liquidity_usd:unknown")
 
         if reasons: 
@@ -2325,6 +2716,8 @@ class Monitor:
 
         # === 4. POST-HELIUS PROCESSING ===
         grade = overlap_result.get("grade", "NONE")
+        if self.debug:
+            print(f"[Analysis] {mint} Overlap Check: Grade={grade}, Count={overlap_result.get('overlap_count')}, Pct={overlap_result.get('overlap_percentage')}%")
         
         if grade == "NONE":
             # Save NONE result
@@ -2359,226 +2752,54 @@ class Monitor:
         # ML Prediction
         ml_prediction_result = None
         try:            
-            ml_prediction_result = self.ml_classifier.predict(mint, threshold=0.70)
-        except Exception as e:
-            ml_prediction_result = {'action': 'ERROR', 'error': str(e)}
-            
-    async def run_token_analysis_step(self, start: TradingStart, check_count: int):
-        """
-        Core analysis function that runs the full analysis lifecycle.
-        FIXED: Properly handles creator balance with RPC fallback
-        FIXED: Only fallbacks to RPC when creator_balance is None (missing), not 0 (valid zero)
-        """
-        mint = start.mint
-        now_ts = int(datetime.now(timezone.utc).timestamp())
-        
-        if self.debug:
-            print(f"[Analysis] Running check #{check_count} for {mint}")
-
-        # === 1. RUN RUGCHECK ===
-        try:
-            r = await self._run_rugcheck_check(mint)
-        except Exception as e:
-            if self.debug:
-                print(f"[Security] Fatal error checking security for {mint}: {e}")
-            reasons = [f"security_check_exception:{str(e)}"]
-            await self._start_or_update_probation(mint, start, {"mint": mint, "grade": "NONE"}, reasons)
-            return
-
-        # === 2. SECURITY GATE ===
-        reasons = []
-        if not r.get("ok"):
-            reasons.append(f"security_error:{r.get('error')}")
-        else:
-            data_source = r.get("data_source", "rugcheck")
-            
-            # Rule 0: Probation
-            if r.get("probation"):
-                reasons.append(r.get("probation_meta", {}).get("explanation", "Probation"))
-
-            # Rule 1: Rugged
-            if r.get("rugged"):
-                reasons.append("rugged:true")
-
-            # Rule 2: Authorities
-            if r.get("has_authorities"):
-                authorities = []
-                if r.get("freeze_authority"): authorities.append("freeze")
-                if r.get("mint_authority"): authorities.append("mint")
-                reasons.append(f"authorities:{','.join(authorities)}")
-            
-            # Get supply and decimals for creator balance validation
-            raw_data = r.get("raw", {})
-            token_data = raw_data.get("token", {})
-            
-            supply = token_data.get("supply", 0)
-            decimals = token_data.get("decimals", 0)
-            data_source_supply = "rugcheck"
-            
-            # If RugCheck didn't provide valid supply/decimals, try RPC
-            if not supply or not decimals:
-                if self.debug:
-                    print(f"[Security] ⚠️ RugCheck missing supply/decimals for {mint}, trying RPC...")
-                supply, decimals = await self._get_supply_and_decimals_rpc(mint)
-                data_source_supply = "rpc"
-                if supply and decimals and self.debug:
-                    print(f"[Security] ✅ Using supply from {data_source_supply}: {supply}, decimals: {decimals}")
-            
-            # Calculate total supply with zero check
-            total_supply = 0
-            if supply and decimals:
-                try:
-                    total_supply = float(supply) / (10 ** int(decimals))
-                    if self.debug:
-                        print(f"[Security] 📊 Calculated total_supply from {data_source_supply}: {total_supply}")
-                except (ZeroDivisionError, ValueError, TypeError, OverflowError):
-                    total_supply = 0
-                    if self.debug:
-                        print(f"[Security] ❌ Error calculating total_supply for {mint}")
-            
-            # --- FIXED: Creator Balance Check (only fallback if None) ---
-            creator_balance_raw = r.get("creator_balance")  # This is RAW amount or None
-            creator_balance_pct = None  # The calculated percentage
-
-            # Only use RPC fallback if RugCheck didn't provide ANY data (None)
-            if creator_balance_raw is None:
-                if self.debug:
-                    print(f"[Security] ⚠️ RugCheck missing creator balance for {mint}, trying RPC...")
-                
-                creator_balance_normalized, rpc_success = await self._get_creator_balance_rpc(mint, decimals)
-                
-                if rpc_success and total_supply > 0:
-                    creator_balance_pct = (creator_balance_normalized / total_supply) * 100
-                    if self.debug:
-                        print(f"[Security] ✅ Using creator balance from RPC: {creator_balance_normalized:.2f} tokens ({creator_balance_pct:.2f}%)")
-                else:
-                    creator_balance_pct = 0.0
-                    if self.debug:
-                        print(f"[Security] ⚠️ RPC fallback failed, defaulting to 0%")
-            else:
-                # RugCheck provided a RAW value (could be 0 or positive integer)
-                # We need to calculate the percentage ourselves
-                try:
-                    creator_raw_amount = float(creator_balance_raw)
-                    
-                    if decimals > 0 and total_supply > 0:
-                        # Normalize: raw_amount / (10^decimals) to get actual token count
-                        creator_balance_normalized = creator_raw_amount / (10 ** int(decimals))
-                        # Calculate percentage
-                        creator_balance_pct = (creator_balance_normalized / total_supply) * 100
-                        
-                        if self.debug:
-                            if creator_balance_pct == 0.0:
-                                print(f"[Security] ✅ RugCheck: creator holds 0 tokens (0.00%)")
-                            else:
-                                print(f"[Security] 💰 RugCheck: creator holds {creator_balance_normalized:.2f} tokens ({creator_balance_pct:.2f}%)")
-                    else:
-                        creator_balance_pct = 0.0
-                        if self.debug:
-                            print(f"[Security] ⚠️ Cannot calculate creator %: total_supply={total_supply}, decimals={decimals}")
-                except (ValueError, TypeError, ZeroDivisionError) as e:
-                    creator_balance_pct = 0.0
-                    if self.debug:
-                        print(f"[Security] ⚠️ Error calculating creator balance %: {e}")
-
-            # Validate creator balance percentage
-            if creator_balance_pct is None:
-                creator_balance_pct = 0.0
-
-            # Rule 3: Creator Balance
-            if total_supply > 0 and creator_balance_pct > MAX_CREATOR_PCT:
-                reasons.append(f"creator_balance_pct:{creator_balance_pct:.2f}_req_{MAX_CREATOR_PCT}%")
-            elif total_supply == 0 and creator_balance_raw is not None and float(creator_balance_raw) > 0:
-                reasons.append(f"invalid_supply:creator_has_balance_but_supply_is_zero_source_{data_source_supply}")
-                if self.debug:
-                    print(f"[Security] ⚠️ Suspicious: creator has raw balance {creator_balance_raw} but total_supply=0")
-
-            # Rule 4: Transfer Fee
-            if r.get("transfer_fee_pct", 0) > 5:
-                reasons.append(f"transfer_fee:{r.get('transfer_fee_pct')}%")
-
-            # Rule 5: Holder Count
-            if r.get("total_holders", 0) < 50:
-                reasons.append(f"holder_count:{r.get('total_holders')}_req_50")
-
-            # Rule 6: LP Lock %
-            lp_locked_pct = r.get("overall_lp_locked_pct")
-            if isinstance(lp_locked_pct, (int, float)) and lp_locked_pct < 80.0:
-                reasons.append(f"lp_locked:{lp_locked_pct:.1f}%_req_80%")
-
-            # Rule 7: Liquidity Amount
-            total_lp = r.get("total_lp_usd")
-            if total_lp != "unknown":
-                if total_lp < 10000.0:
-                    reasons.append(f"liquidity_usd:{total_lp:.2f}_req_10000")
-
-        if reasons: 
-            if self.debug:
-                print(f"[Security] {mint} FAILED Gate ({r.get('data_source')}): {reasons}")
-            overlap_result_stub = {"mint": mint, "grade": "NONE", "probation_meta": r.get("probation_meta")}
-            await self._start_or_update_probation(mint, start, overlap_result_stub, reasons)
-            
-            self.scheduling_store.update_token_state(mint, {
-                "status": "probation",
-                "last_completed_check": now_ts,
-                "next_scheduled_check": now_ts + self.repeat_interval_seconds,
-                "total_checks_completed": check_count
-            })
-            return
-
-        # === 3. HELIUS CALL (GATE PASSED) ===
-        if self.debug:
-            print(f"[Security] {mint} PASSED Gate ({r.get('data_source')}). Fetching holders...")
-        
-        try:
-            overlap_result = await self._fetch_and_calculate_overlap(start)
-        except Exception as e:
-            if self.debug:
-                print(f"[Analysis] Helius call failed for {mint}: {e}")
-            self.scheduling_store.update_token_state(mint, {
-                "last_error": f"Helius_fail: {e}",
-                "last_error_at": datetime.now(timezone.utc).isoformat()
-            })
-            return
-
-        # === 4. POST-HELIUS PROCESSING ===
-        grade = overlap_result.get("grade", "NONE")
-        
-        if grade == "NONE":
-            obj = safe_load_overlap(self.overlap_store)
-            obj.setdefault(mint, []).append({
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "result": overlap_result,
-                "security": f"passed_grade_none_{r.get('data_source')}",
-                "rugcheck": self._extract_rugcheck_summary(r)
-            })
-            self.overlap_store.save(obj)
-            
-            self.scheduling_store.update_token_state(mint, {
-                "status": "active",
-                "last_completed_check": now_ts,
-                "next_scheduled_check": now_ts + self.repeat_interval_seconds,
-                "total_checks_completed": check_count
-            })
-            return
-
-        # Grade PASSED -> DexScreener + ML + Final Save
-        if self.debug:
-            print(f"[Analysis] {mint} PASSED ALL CHECKS (Grade: {grade}).")
-
-        try:
-            dex_data = await retry_with_backoff(
-                self._run_dexscreener_check, mint, retries=8, base_delay=1.5
+            ml_prediction_result = self.ml_classifier.predict(
+                mint, 
+                threshold=ML_PREDICTION_THRESHOLD,
+                action_threshold=ML_ACTION_THRESHOLD,
+                signal_type='discovery'
             )
-        except Exception:
-            dex_data = {"ok": False, "price_usd": None, "market_cap_usd": None}
-
-        # ML Prediction
-        ml_prediction_result = None
-        try:            
-            ml_prediction_result = self.ml_classifier.predict(mint, threshold=0.70)
         except Exception as e:
             ml_prediction_result = {'action': 'ERROR', 'error': str(e)}
+        
+        # Calculate ML_PASSED based on probability vs threshold
+        ml_probability = ml_prediction_result.get("win_probability")
+        ml_passed = False
+        if ml_probability is not None:
+            try:
+                ml_passed = float(ml_probability) >= ML_PREDICTION_THRESHOLD
+            except (ValueError, TypeError):
+                ml_passed = False
+
+        # Add ML_PASSED to overlap_result
+        overlap_result["ML_PASSED"] = ml_passed
+        if self.debug:
+            print(f"[Analysis] ML Result for {mint}: PASSED={ml_passed}, Prob={ml_probability}")
+
+        # Enrich metadata if missing from start or previous checks
+        if "token_metadata" not in overlap_result:
+            overlap_result["token_metadata"] = {}
+        
+        meta = overlap_result["token_metadata"]
+        
+        # 1. Fallback to RugCheck for Name/Symbol
+        if not meta.get("name") or not meta.get("symbol"):
+            rc_raw = r.get("raw", {})
+            if isinstance(rc_raw, dict):
+                token_info = rc_raw.get("token", {})
+                if not meta.get("name"): meta["name"] = token_info.get("name")
+                if not meta.get("symbol"): meta["symbol"] = token_info.get("symbol")
+        
+        # 2. Fallback to DexScreener for Name/Symbol
+        if not meta.get("name") or not meta.get("symbol"):
+            ds_raw = dex_data.get("raw", {})
+            if isinstance(ds_raw, dict):
+                base_token = ds_raw.get("baseToken", {})
+                if not meta.get("name"): meta["name"] = base_token.get("name")
+                if not meta.get("symbol"): meta["symbol"] = base_token.get("symbol")
+        
+        # 3. Fallback to start.extra if still missing
+        if not meta.get("name") and start.extra: meta["name"] = start.extra.get("name")
+        if not meta.get("symbol") and start.extra: meta["symbol"] = start.extra.get("symbol")
 
         # Save Final
         obj = safe_load_overlap(self.overlap_store)
@@ -2600,9 +2821,12 @@ class Monitor:
                 "error": ml_prediction_result.get("error"),
                 "key_metrics": ml_prediction_result.get("key_metrics"),
                 "warnings": ml_prediction_result.get("warnings")
-            }
+            },
+            "ML_PASSED": ml_passed
         })
         self.overlap_store.save(obj)
+        if self.debug:
+            print(f"[Analysis] {mint} SAVED to overlap_results.pkl (Grade: {grade}, ML_PASSED: {ml_passed})")
         
         if mint in self.pending_risky_tokens:
             self.pending_risky_tokens.pop(mint, None)
@@ -2638,241 +2862,6 @@ class Monitor:
             "lp_lock_details": r.get("lp_lock_details", [])
         }
     
-    # async def run_token_analysis_step(self, start: TradingStart, check_count: int):
-    #     """
-    #     Core analysis function that runs the full analysis lifecycle.
-    #     Now properly handles RugCheck rate limiting with retry logic.
-        
-    #     Steps:
-    #     1. Run RugCheck (with retry on 429)
-    #     2. Run Pre-Helius Security Gate
-    #     3. If fail, send to probation and RETURN
-    #     4. If pass, run Helius call (_fetch_and_calculate_overlap)
-    #     5. If overlap=NONE, save and RETURN
-    #     6. If overlap=PASS, run DexScreener, run ML prediction, save, and mark as completed
-    #     """
-    #     mint = start.mint
-    #     now_ts = int(datetime.now(timezone.utc).timestamp())
-        
-    #     if self.debug:
-    #         print(f"[Analysis] Running check #{check_count} for {mint}")
-
-    #     # === 1. RUN RUGCHECK WITH RETRY LOGIC ===
-    #     try:
-    #         r = await retry_with_backoff(
-    #             self._run_rugcheck_check, 
-    #             mint, 
-    #             retries=5,      # Increased from 2 to handle rate limits better
-    #             base_delay=2.0  # Start with 2s delay (appropriate for rate limits)
-    #         )
-    #     except RuntimeError as e:
-    #         # This catches the case where all retries are exhausted
-    #         if self.debug:
-    #             print(f"[Security] RugCheck failed for {mint} after all retries: {e}")
-    #         reasons = [f"rugcheck_max_retries_exceeded:{str(e)}"]
-    #         await self._start_or_update_probation(mint, start, {"mint": mint, "grade": "NONE"}, reasons)
-    #         return
-    #     except Exception as e:
-    #         # Unexpected exception during RugCheck
-    #         if self.debug:
-    #             print(f"[Security] Unexpected exception fetching RugCheck data for {mint}: {e}")
-    #         reasons = [f"rugcheck_exception:{str(e)}"]
-    #         await self._start_or_update_probation(mint, start, {"mint": mint, "grade": "NONE"}, reasons)
-    #         return
-
-    #     # === 2. PRE-HELIUS SECURITY GATE ===
-    #     reasons = []
-    #     if not r.get("ok"):
-    #         reasons.append(f"rugcheck_error:{r.get('error')}")
-    #     else:
-    #         # Rule 0: Check for high holder concentration (probation)
-    #         if r.get("probation"):
-    #             probation_reason = r.get("probation_meta", {}).get("explanation", "Probation: High top holder concentration")
-    #             reasons.append(probation_reason)
-
-    #         # Rule 1: Check if token is marked as rugged
-    #         if r.get("rugged"):
-    #             reasons.append("rugged:true")
-
-    #         # Rule 2: Check for mint/freeze authorities
-    #         if r.get("has_authorities"):
-    #             authorities = []
-    #             if r.get("freeze_authority"): authorities.append("freeze")
-    #             if r.get("mint_authority"): authorities.append("mint")
-    #             reasons.append(f"authorities:{','.join(authorities)}")
-            
-    #         # Extract supply data safely
-    #         supply = 0
-    #         decimals = 0
-    #         raw_data = r.get("raw", {})
-    #         if raw_data:
-    #             token_data = raw_data.get("token", {})
-    #             if token_data:
-    #                 supply = token_data.get("supply", 0)
-    #                 decimals = token_data.get("decimals", 0)
-
-    #         total_supply = supply / (10 ** decimals) if decimals > 0 else supply
-
-    #         # Rule 3: Check creator token balance
-    #         creator_balance_val = r.get("creator_balance", 0)
-    #         if total_supply > 0 and (creator_balance_val / total_supply * 100) > MAX_CREATOR_PCT:
-    #             reasons.append(f"creator_balance_pct:{creator_balance_val / total_supply * 100}")
-    #         elif total_supply == 0 and creator_balance_val > 0:
-    #             reasons.append(f"creator_balance_pct:invalid_supply")
-
-    #         # Rule 4: Check transfer fee (must be <= 5%)
-    #         if r.get("transfer_fee_pct", 0) > 5:
-    #             reasons.append(f"transfer_fee:{r.get('transfer_fee_pct')}%")
-
-    #         # Rule 5: Check holder count (must be >= 50)
-    #         if r.get("total_holders", 0) < 50:
-    #             reasons.append(f"holder_count:{r.get('total_holders')}_req_50")
-
-    #         # Rule 6: Check aggregated liquidity lock percentage (must be >= 80%)
-    #         if r.get("overall_lp_locked_pct", 0.0) < 80.0:
-    #             reasons.append(f"lp_locked:{r.get('overall_lp_locked_pct'):.1f}%_req_80%")
-
-    #         # Rule 7: Check aggregated total liquidity (must be >= $10,000)
-    #         if r.get("total_lp_usd", 0.0) < 10000.0:
-    #             reasons.append(f"liquidity_usd:{r.get('total_lp_usd'):.2f}_req_10000")
-
-    #     if reasons: 
-    #         if self.debug:
-    #             print(f"[Security] {mint} FAILED pre-Helius check: {reasons}")
-    #         overlap_result_stub = {"mint": mint, "grade": "NONE", "probation_meta": r.get("probation_meta")}
-    #         await self._start_or_update_probation(mint, start, overlap_result_stub, reasons)
-            
-    #         # Update scheduler to reflect "active" (but on probation) state
-    #         self.scheduling_store.update_token_state(mint, {
-    #             "status": "probation",
-    #             "last_completed_check": now_ts,
-    #             "next_scheduled_check": now_ts + self.repeat_interval_seconds,
-    #             "total_checks_completed": check_count
-    #         })
-    #         return  # Stop here, don't run Helius
-
-    #     # === 3. HELIUS CALL (GATE PASSED) ===
-    #     if self.debug:
-    #         print(f"[Security] {mint} PASSED pre-Helius check. Fetching holders...")
-        
-    #     try:
-    #         overlap_result = await self._fetch_and_calculate_overlap(start)
-    #     except Exception as e:
-    #         if self.debug:
-    #             print(f"[Analysis] Helius call (_fetch_and_calculate_overlap) failed for {mint}: {e}")
-    #         self.scheduling_store.update_token_state(mint, {
-    #             "last_error": f"Helius_fail: {e}",
-    #             "last_error_at": datetime.now(timezone.utc).isoformat()
-    #         })
-    #         return  # Retry on next loop
-
-    #     # === 4. POST-HELIUS PROCESSING (SAVE/ROUTE) ===
-    #     grade = overlap_result.get("grade", "NONE")
-        
-    #     # 4a. Handle NONE Grade (Passed security, but no overlap)
-    #     if grade == "NONE":
-    #         if self.debug:
-    #             print(f"[Analysis] {mint} passed security, 0 overlap. Saving as NONE.")
-    #         obj = safe_load_overlap(self.overlap_store)
-    #         obj.setdefault(mint, []).append({
-    #             "ts": datetime.now(timezone.utc).isoformat(),
-    #             "result": overlap_result,
-    #             "security": "passed_grade_none",
-    #             "rugcheck": self._extract_rugcheck_summary(r)
-    #         })
-    #         self.overlap_store.save(obj)
-            
-    #         # Token stays "active" and will be re-checked
-    #         self.scheduling_store.update_token_state(mint, {
-    #             "status": "active",
-    #             "last_completed_check": now_ts,
-    #             "next_scheduled_check": now_ts + self.repeat_interval_seconds,
-    #             "total_checks_completed": check_count
-    #         })
-    #         return
-
-    #     # 4b. Handle PASSED Token (Security PASS + Overlap PASS)
-    #     if self.debug:
-    #         print(f"[Analysis] {mint} PASSED ALL CHECKS (Grade: {grade}). Fetching DexScreener and saving.")
-
-    #     try:
-    #         dex_data = await retry_with_backoff(
-    #             self._run_dexscreener_check, mint, retries=8, base_delay=1.5
-    #         )
-    #     except Exception as e:
-    #         if self.debug:
-    #             print(f"[Analysis] Dexscreener check for {mint} failed after all retries: {e}")
-    #         dex_data = {"ok": False, "price_usd": None, "market_cap_usd": None, "raw": {}}
-
-    #     # === ML PREDICTION ===
-    #     ml_prediction_result = None
-    #     try:            
-    #         if self.debug:
-    #             print(f"[Analysis] 📞 Calling ML predictor for mint: {mint}")
-
-    #         ml_prediction_result = self.ml_classifier.predict(mint, threshold=0.70)
-            
-    #         if not ml_prediction_result or ml_prediction_result.get("error"):
-    #             raise ValueError(f"ML prediction returned an error: {ml_prediction_result.get('error', 'Unknown')}")
-                
-    #     except Exception as e:
-    #         if self.debug:
-    #             print(f"[Analysis] ML prediction failed for {mint}: {e}")
-    #         ml_prediction_result = {
-    #             'action': 'ERROR',
-    #             'win_probability': 0.0,
-    #             'confidence': 'NONE',
-    #             'risk_tier': 'UNKNOWN',
-    #             'error': str(e)
-    #         }
-
-    #     # === SAVE TO OVERLAP STORE ===
-    #     obj = safe_load_overlap(self.overlap_store)
-    #     obj.setdefault(mint, []).append({
-    #         "ts": datetime.now(timezone.utc).isoformat(),
-    #         "result": overlap_result,
-    #         "security": "passed",
-    #         "probation_meta": r.get("probation_meta"),
-    #         "rugcheck": self._extract_rugcheck_summary(r),
-    #         "dexscreener": {
-    #             "current_price_usd": dex_data.get("price_usd"),
-    #             "market_cap_usd": dex_data.get("market_cap_usd"),
-    #         },
-    #         "ml_prediction": {
-    #             "probability": ml_prediction_result.get("win_probability"),
-    #             "confidence": ml_prediction_result.get("confidence"),
-    #             "risk_tier": ml_prediction_result.get("risk_tier"),
-    #             "action": ml_prediction_result.get("action"),
-    #             "error": ml_prediction_result.get("error"),
-    #             "key_metrics": ml_prediction_result.get("key_metrics"),
-    #             "warnings": ml_prediction_result.get("warnings")
-    #         }
-    #     })
-    #     self.overlap_store.save(obj)
-        
-    #     # Remove from probation (if it was there)
-    #     if mint in self.pending_risky_tokens:
-    #         self.pending_risky_tokens.pop(mint, None)
-    #         if self.debug:
-    #             print(f"[Analysis] {mint} promoted from probation.")
-        
-    #     # Mark as "completed" in scheduler, stopping further checks
-    #     self.scheduling_store.update_token_state(mint, {
-    #         "status": "completed",
-    #         "promoted_at": datetime.now(timezone.utc).isoformat(),
-    #         "security_passed": True,
-    #         "liquidity_usd": r.get("total_lp_usd", 0.0),
-    #         "lp_locked_pct": r.get("overall_lp_locked_pct", 0.0),
-    #         "last_completed_check": now_ts,
-    #         "total_checks_completed": check_count
-    #     })
-    #     if self.debug:
-    #         print(f"[Analysis] {mint} successfully processed and saved. Status set to 'completed'.")
-    
-    # --------------------------------------------------------------------------
-    # --- 🚀 END: NEW ANALYSIS LOGIC 🚀 ---
-    # --------------------------------------------------------------------------
-
     async def _run_dexscreener_check(self, mint: str) -> Dict[str, Any]:
         """
         Fetches token data from DexScreener.
@@ -3445,6 +3434,7 @@ class Monitor:
             "token_metadata": {
                 k: v for k, v in {
                     "name": start.extra.get("name") if start.extra else None,
+                    "symbol": start.extra.get("symbol") if start.extra else None,
                     "fdv_usd": start.fdv_usd,
                     "volume_usd": start.volume_usd,
                     "source_dex": start.source_dex,
