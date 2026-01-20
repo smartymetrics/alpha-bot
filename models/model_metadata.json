@@ -2,22 +2,24 @@
   "model_version": "4.0_neural_anomaly",
   "model_type": "6-Model Ensemble",
   "ensemble_weights": {
-    "xgboost": 0.33,
-    "lightgbm": 0.33,
-    "catboost": 0.33,
-    "random_forest": 0.0,
+    "xgboost": 0.2,
+    "lightgbm": 0.2,
+    "catboost": 0.2,
+    "random_forest": 0.4,
     "logistic_regression": 0.0,
     "mlp_neural_network": 0.0
   },
-  "trained_at": "2026-01-14T07:23:31.763806",
+  "trained_at": "2026-01-20T15:16:42.521385",
   "performance": {
-    "test_auc": 0.651350734838857,
-    "cv_auc_mean": 0.6289972892892712
+    "test_auc": 0.6212675416577015,
+    "cv_auc_mean": 0.6209356271541803
   },
   "selected_features": [
     "top_10_holders_pct",
-    "is_lp_locked_95_plus",
+    "total_lp_locked_usd",
     "total_insider_networks",
+    "total_insider_token_amount",
+    "pump_dump_risk_score",
     "token_age_at_signal_seconds",
     "is_very_fresh",
     "log_liquidity",
@@ -27,8 +29,11 @@
     "whale_dominated",
     "strong_uptrend",
     "weak_momentum",
+    "volume_quality",
     "peak_hours",
+    "anomaly_score",
     "is_anomaly",
+    "creator_sold_out",
     "is_high_volume"
   ],
   "all_features": [
