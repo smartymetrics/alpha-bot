@@ -55,6 +55,7 @@ from token_monitor import (
     evaluate_probation_from_rugcheck
 )
 from ml_predictor import SolanaTokenPredictor
+from smart_money_scorer import SmartMoneyScorer, apply_smart_money_boost
 
 load_dotenv()
 
@@ -76,6 +77,11 @@ ML_ACTION_THRESHOLD = float(os.getenv("ML_ACTION_THRESHOLD", "0.70"))
 
 # --- Monitoring Window Config ---
 TOKEN_MONITORING_WINDOW_HOURS = int(os.getenv("TOKEN_MONITORING_WINDOW_HOURS", "6"))
+
+# --- Smart Money Config ---
+SMART_MONEY_ENABLED = os.getenv("SMART_MONEY_ENABLED", "true").lower() == "true"
+SMART_MONEY_TOP_N_LABEL = int(os.getenv("SMART_MONEY_TOP_N_LABEL", "500"))
+SMART_MONEY_CLUSTER_WINDOW_SECONDS = int(os.getenv("SMART_MONEY_CLUSTER_WINDOW_SECONDS", "1800"))
 
 # --- MINIMUM SECURITY REQUIREMENTS ---
 MIN_HOLDER_COUNT = 50
@@ -812,7 +818,8 @@ class AlphaTokenAnalyzer:
         helius_limiter: AsyncRateLimiter,
         rugcheck_client: RugCheckClient,
         dex_limiter: AsyncRateLimiter,
-        ml_classifier: SolanaTokenPredictor, 
+        ml_classifier: SolanaTokenPredictor,
+        smart_money_scorer: Optional["SmartMoneyScorer"] = None,
         debug: bool = False
     ):
         self.http_session = http_session
@@ -822,10 +829,12 @@ class AlphaTokenAnalyzer:
         self.rugcheck_client = rugcheck_client
         self.dex_limiter = dex_limiter
         self.ml_classifier = ml_classifier
+        self.smart_money_scorer = smart_money_scorer   # None = SM disabled
         self.debug = debug
         
         if self.debug:
-            print("[TokenAnalyzer] Initialized.")
+            sm_status = "ENABLED" if smart_money_scorer else "DISABLED"
+            print(f"[TokenAnalyzer] Initialized. Smart Money: {sm_status}")
 
     async def _get_supply_and_decimals_rpc(self, mint: str) -> tuple:
         """
@@ -1692,7 +1701,94 @@ class AlphaTokenAnalyzer:
             cleared_status = "CLEARED for upload" if is_cleared_for_upload else "NOT CLEARED (No Grade)"
 
             print(f"[TokenAnalyzer] ✅ {mint} -> Grade: {grade}, Overlap: {overlap_count}, ML Prob: {ml_prob_str}, Status: {cleared_status}")
-            
+
+        # --- SMART MONEY SCORING (Post-Prediction Overlay) ---
+        # Only runs for tokens that are cleared for upload (passed all gates).
+        # The scorer enriches the result dict but never blocks the upload path.
+        if is_cleared_for_upload and self.smart_money_scorer is not None and overlap_count > 0:
+            try:
+                if self.debug:
+                    print(f"[TokenAnalyzer] 🧠 Running Smart Money scorer for {mint}...")
+
+                # Pass the effective overlap wallets and their Dune frequencies
+                sm_score = await self.smart_money_scorer.score_token(
+                    mint=mint,
+                    overlap_wallets=list(overlap),
+                    wallet_freq=wallet_freq,
+                )
+
+                # Apply post-prediction grade boost
+                final_grade, alert_label, is_super_alpha = apply_smart_money_boost(
+                    current_grade=grade,
+                    ml_prediction=result.get("ml_prediction"),
+                    smart_money_score=sm_score,
+                )
+
+                # Embed enrichment into result (non-destructive to existing keys)
+                result["smart_money"] = {
+                    "enabled": True,
+                    "boost_tier": sm_score.boost_tier,
+                    "boost_reason": sm_score.boost_reason,
+                    "alert_label": alert_label,
+                    "is_super_alpha": is_super_alpha,
+                    "final_grade": final_grade,
+                    "effective_overlap_count": sm_score.effective_overlap_count,
+                    "smart_money_weighted_score": sm_score.smart_money_weighted_score,
+                    "positive_entity_wallets": sm_score.positive_entity_wallets,
+                    "negative_entity_wallets": sm_score.negative_entity_wallets,
+                    "insider_wallets": sm_score.insider_wallets,
+                    "has_cluster": sm_score.has_smart_money_cluster,
+                    "cluster_wallets": sm_score.cluster_wallets,
+                    "wallet_profiles": sm_score.wallet_profiles,
+                }
+
+                # Promote grade if Smart Money boosts it
+                if final_grade != grade:
+                    if self.debug:
+                        print(
+                            f"[TokenAnalyzer] 🚀 {mint} grade boosted: "
+                            f"{grade} → {final_grade} [{alert_label}]"
+                        )
+                    result["grade"] = final_grade
+                    result["grade_boosted_from"] = grade
+
+                if is_super_alpha:
+                    result["SUPER_ALPHA"] = True
+                    if self.debug:
+                        print(f"[TokenAnalyzer] 🔥 {mint} promoted to SUPER-ALPHA!")
+
+                # FILTERED: Smart Money detected only bots/CEX — suppress upload
+                if sm_score.boost_tier == "FILTERED":
+                    if self.debug:
+                        print(
+                            f"[TokenAnalyzer] 🚫 {mint} FILTERED by Smart Money "
+                            f"(all overlap wallets are negative entities). "
+                            f"Moving to monitoring."
+                        )
+                    result["needs_monitoring"] = True
+                    result["skip_reason"] = "smart_money_filtered_negative_entities"
+
+            except Exception as sm_err:
+                # Smart Money failure must NEVER block the main pipeline
+                if self.debug:
+                    print(f"[TokenAnalyzer] ⚠️ Smart Money scorer error for {mint}: {sm_err}")
+                result["smart_money"] = {
+                    "enabled": True,
+                    "error": str(sm_err),
+                    "boost_tier": "NONE",
+                    "alert_label": "STANDARD 📊",
+                    "is_super_alpha": False,
+                }
+        else:
+            # Smart Money disabled or token not cleared
+            result["smart_money"] = {
+                "enabled": False,
+                "boost_tier": "NONE",
+                "alert_label": "STANDARD 📊",
+                "is_super_alpha": False,
+            }
+        # --- END SMART MONEY SCORING ---
+
         return result
 
     async def batch_analyze_tokens(self, mints: List[str]) -> List[Dict[str, Any]]:
@@ -2292,7 +2388,20 @@ async def main():
             helius_limiter=helius_limiter,
             rugcheck_client=rugcheck_client,
             dex_limiter=dex_limiter,
-            ml_classifier=ml_classifier, 
+            ml_classifier=ml_classifier,
+            smart_money_scorer=(
+                SmartMoneyScorer(
+                    moralis_client=moralis_client,
+                    helius_api_key=HELIUS_API_KEY or "",
+                    http_session=http_session,
+                    wallet_ranker=wallet_ranker,
+                    top_n_label_threshold=SMART_MONEY_TOP_N_LABEL,
+                    cluster_window_seconds=SMART_MONEY_CLUSTER_WINDOW_SECONDS,
+                    debug=debug_mode,
+                )
+                if SMART_MONEY_ENABLED
+                else None
+            ),
             debug=debug_mode
         )
         
