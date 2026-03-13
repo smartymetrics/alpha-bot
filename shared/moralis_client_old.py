@@ -27,16 +27,6 @@ import threading
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Any, Set, Optional
 
-# Supabase helpers — use the real functions from supabase_utils
-# upload_file(local_path, bucket, remote_path) — deletes old, uploads new
-# download_file(save_path, remote_name, bucket) — conditional GET, 304-aware
-try:
-    from supabase_utils import upload_file as _supabase_upload_file
-    from supabase_utils import download_file as _supabase_download_file
-    _SUPABASE_AVAILABLE = True
-except ImportError:
-    _SUPABASE_AVAILABLE = False
-
 # ---------------------------------------------------------------------------
 # Label constants — used by SmartMoneyScorer in smart_money_scorer.py
 # ---------------------------------------------------------------------------
@@ -65,23 +55,18 @@ class MoralisClient:
         api_keys: List[str],
         debug: bool = False,
         label_cache_path: str = "./data/wallet_labels.pkl",
-        supabase_bucket: str = "monitor-data",
     ):
         if not api_keys:
             raise ValueError("MoralisClient requires at least one API key.")
         self.http_session = http_session
         self.api_keys = api_keys
         self.debug = debug
-        self.supabase_bucket = supabase_bucket
 
         # ---- Smart Money label cache ----
         self._label_cache_path = label_cache_path
-        self._label_cache_remote_name = os.path.basename(label_cache_path)  # wallet_labels.pkl
         self._label_cache: Dict[str, Dict] = {}
         self._label_cache_lock = threading.Lock()
-        self._label_cache_dirty = False
-        self._last_supabase_upload: float = 0.0
-        self._supabase_upload_interval: float = 300.0  # 5 minutes
+        self._label_cache_dirty = False           # write-back flag
         os.makedirs(os.path.dirname(self._label_cache_path), exist_ok=True)
         self._load_label_cache()
 
@@ -108,117 +93,22 @@ class MoralisClient:
                 if isinstance(data, dict):
                     self._label_cache = data
                     if self.debug:
-                        print(f"[MoralisClient] Loaded {len(data)} wallet labels from local cache.")
+                        print(f"[MoralisClient] Loaded {len(data)} wallet labels from cache.")
             except Exception as e:
                 if self.debug:
                     print(f"[MoralisClient] ⚠️ Label cache load failed: {e}. Starting fresh.")
                 self._label_cache = {}
 
-    def download_label_cache_from_supabase(self):
-        """
-        Download the label cache from Supabase on startup and merge with any
-        local entries.  Remote wins on conflict (remote is always a superset).
-        Called once synchronously from winner_monitor.py startup().
-
-        Remote path: smart_money/wallet_labels.pkl
-        This keeps Smart Money files grouped separately from overlap results
-        and dune_cache/ files in the bucket.
-        """
-        if not _SUPABASE_AVAILABLE:
-            if self.debug:
-                print("[MoralisClient] ⚠️ Supabase not available — skipping label cache download.")
-            return
-
-        remote_path = f"smart_money/{self._label_cache_remote_name}"
-
-        try:
-            if self.debug:
-                print(f"[MoralisClient] ⬇️  Downloading label cache from Supabase ({remote_path})...")
-
-            # download_file(save_path, file_name, bucket)
-            # Uses signed URL + conditional GET (304-aware) — same as all other downloads
-            result = _supabase_download_file(
-                save_path=self._label_cache_path,
-                file_name=remote_path,
-                bucket=self.supabase_bucket,
-            )
-
-            if result is not None and os.path.exists(self._label_cache_path):
-                try:
-                    remote_data = joblib.load(self._label_cache_path)
-                    if isinstance(remote_data, dict):
-                        with self._label_cache_lock:
-                            # Merge: remote entries overwrite local on conflict
-                            # because the remote file is the accumulated superset
-                            merged = {**self._label_cache, **remote_data}
-                            self._label_cache = merged
-                        if self.debug:
-                            print(
-                                f"[MoralisClient] ✅ Label cache merged. "
-                                f"Total entries: {len(self._label_cache)}"
-                            )
-                except Exception as e:
-                    if self.debug:
-                        print(f"[MoralisClient] ⚠️ Failed to parse downloaded label cache: {e}")
-            else:
-                if self.debug:
-                    print("[MoralisClient] ℹ️  No remote label cache found — using local only.")
-
-        except Exception as e:
-            if self.debug:
-                print(f"[MoralisClient] ⚠️ Label cache download failed: {e}")
-
-    def _save_label_cache(self, force_supabase: bool = False):
-        """
-        Persist label cache to disk (immediate, background thread).
-        Also uploads to Supabase if 5 minutes have elapsed since last upload,
-        or if force_supabase=True.
-
-        Remote path: smart_money/wallet_labels.pkl
-        upload_file() deletes the old file first, then uploads the new one
-        (same behaviour as all other files in supabase_utils).
-        """
+    def _save_label_cache(self):
+        """Persist label cache to disk (background thread, non-blocking)."""
         def _write():
             with self._label_cache_lock:
-                snapshot = dict(self._label_cache)
-
-            # Always save locally first
-            try:
-                joblib.dump(snapshot, self._label_cache_path)
-                self._label_cache_dirty = False
-            except Exception as e:
-                if self.debug:
-                    print(f"[MoralisClient] ⚠️ Label cache local save failed: {e}")
-                return
-
-            # Throttled Supabase upload
-            now = time.time()
-            elapsed = now - self._last_supabase_upload
-            should_upload = force_supabase or (elapsed >= self._supabase_upload_interval)
-
-            if should_upload and _SUPABASE_AVAILABLE:
-                remote_path = f"smart_money/{self._label_cache_remote_name}"
                 try:
-                    # upload_file(file_path, bucket, remote_path)
-                    # Internally does: remove(remote_path) then upload(remote_path, data)
-                    success = _supabase_upload_file(
-                        self._label_cache_path,
-                        self.supabase_bucket,
-                        remote_path,
-                    )
-                    if success:
-                        self._last_supabase_upload = now
-                        if self.debug:
-                            print(
-                                f"[MoralisClient] ☁️  Label cache uploaded to "
-                                f"Supabase ({remote_path}, {len(snapshot)} entries)."
-                            )
-                    elif self.debug:
-                        print("[MoralisClient] ⚠️ Label cache Supabase upload failed.")
+                    joblib.dump(dict(self._label_cache), self._label_cache_path)
+                    self._label_cache_dirty = False
                 except Exception as e:
                     if self.debug:
-                        print(f"[MoralisClient] ⚠️ Label cache Supabase upload error: {e}")
-
+                        print(f"[MoralisClient] ⚠️ Label cache save failed: {e}")
         threading.Thread(target=_write, daemon=True).start()
 
     def get_cached_label(self, address: str) -> Optional[Dict]:

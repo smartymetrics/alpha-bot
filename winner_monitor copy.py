@@ -1874,13 +1874,6 @@ class WinnerMonitor:
         cache_files = await self.wallet_ranker.download_dune_caches_for_last_7_days()
         self.wallet_ranker.extract_and_rank_wallets(cache_files)
         self.wallet_scheduler.load_state()
-
-        # Download Smart Money label cache from Supabase and merge with local
-        # This recovers all previously discovered entity labels after a restart
-        if hasattr(self.moralis_client, "download_label_cache_from_supabase"):
-            if self.debug:
-                print("🚀 [WinnerMonitor] Syncing Smart Money label cache from Supabase...")
-            self.moralis_client.download_label_cache_from_supabase()
         
         if self.debug:
             print("🚀 [WinnerMonitor] Startup complete. Starting loops...")
@@ -2340,12 +2333,7 @@ async def main():
             supabase_bucket=SUPABASE_BUCKET
         )
         
-        moralis_client = MoralisClient(
-            http_session,
-            MORALIS_API_KEYS,
-            debug=debug_mode,
-            supabase_bucket=SUPABASE_BUCKET,
-        )
+        moralis_client = MoralisClient(http_session, MORALIS_API_KEYS, debug=debug_mode)
         wallet_ranker = WinnerWalletRanker(
             supabase_bucket=SUPABASE_BUCKET, debug=debug_mode
         )
