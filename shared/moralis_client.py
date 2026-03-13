@@ -49,7 +49,15 @@ NEGATIVE_ENTITY_CATEGORIES = frozenset({
     "bot", "arb bot", "spam", "scammer",
 })
 
-# Sentinel value stored in cache when a wallet has NO Moralis entity record
+# How many days before a cached label is considered stale and re-fetched.
+# Positive entity labels (Funds, VCs) are stable identities — 30 days is safe.
+# Negative entity labels (MEV bots) are also stable — they don't reform.
+# Set to 0 to disable TTL (cache forever).
+LABEL_CACHE_TTL_DAYS = int(os.getenv("SMART_MONEY_LABEL_TTL_DAYS", "30"))
+
+# Sentinel value stored in cache when a wallet has NO Moralis entity record.
+# _cached_at is always set so TTL applies equally to "no entity" wallets —
+# this prevents permanently skipping a wallet that later gets labeled by Moralis.
 _NO_ENTITY_SENTINEL = {"entity_name": None, "category": None, "labels": [], "_cached_at": 0}
 
 
@@ -221,14 +229,42 @@ class MoralisClient:
 
         threading.Thread(target=_write, daemon=True).start()
 
+    def _is_label_stale(self, label: Dict) -> bool:
+        """
+        Return True if a cached label has exceeded LABEL_CACHE_TTL_DAYS.
+        Always returns False if TTL is disabled (set to 0).
+        """
+        if LABEL_CACHE_TTL_DAYS <= 0:
+            return False
+        cached_at = label.get("_cached_at", 0)
+        if not cached_at:
+            return True  # No timestamp = treat as stale, force re-fetch
+        age_days = (time.time() - cached_at) / 86400
+        return age_days >= LABEL_CACHE_TTL_DAYS
+
     def get_cached_label(self, address: str) -> Optional[Dict]:
         """
-        Return the cached label dict for *address*, or None if not cached yet.
+        Return the cached label dict for *address*, or None if:
+          - Not yet cached, OR
+          - Cache entry exists but has exceeded LABEL_CACHE_TTL_DAYS
+
+        Returning None forces get_wallet_labels() to make a fresh API call.
         Callers can distinguish 'no entity found' from 'not yet looked up'
         because we store the _NO_ENTITY_SENTINEL for wallets with no record.
         """
         with self._label_cache_lock:
-            return self._label_cache.get(address)
+            label = self._label_cache.get(address)
+        if label is None:
+            return None
+        if self._is_label_stale(label):
+            if self.debug:
+                age_days = (time.time() - label.get("_cached_at", 0)) / 86400
+                print(
+                    f"[MoralisClient] 🔄 Label for {address[:8]}... is stale "
+                    f"({age_days:.0f}d old, TTL={LABEL_CACHE_TTL_DAYS}d) — will re-fetch."
+                )
+            return None  # Treat as cache miss → triggers fresh API call
+        return label
 
     # =========================================================================
     # Public Smart Money API method  (NEW)
