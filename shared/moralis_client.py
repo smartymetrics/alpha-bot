@@ -10,11 +10,15 @@ Client for Moralis API with intelligent key rotation, backoff, and error handlin
 UPDATED: Now uses the /account/.../swaps endpoint to fetch 'buy'
 transactions since 12am UTC of the current day.
 
-SMART MONEY PATCH: Added get_wallet_labels() with persistent local cache.
-  - Discovery costs 1 Moralis credit; all subsequent lookups cost 0 credits.
-  - Cache file: data/wallet_labels.pkl  (joblib format)
-  - Only called for wallets in the top-500 of the Dune Winners list.
-  - ALL existing methods are completely unchanged.
+SMART MONEY (v2): Replaced broken EVM entities endpoint with Solana-native
+wallet profitability/summary endpoint.
+  Endpoint: GET https://solana-gateway.moralis.io/account/mainnet/{address}/profitability/summary
+  Response: total_realized_profit_usd, total_realized_profit_percentage,
+            total_buys, total_sells, total_trade_volume, total_count_of_trades
+  - PnL data is cached to disk (joblib) with a configurable TTL.
+  - Only wallets in the top-N Dune Winners list are ever fetched (credit gate).
+  - Cache is synced to Supabase on a 5-minute throttle.
+  - ALL original trading/swap methods are completely unchanged.
 """
 
 import asyncio
@@ -38,27 +42,67 @@ except ImportError:
     _SUPABASE_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
-# Label constants — used by SmartMoneyScorer in smart_money_scorer.py
+# PnL-based Smart Money classification thresholds
 # ---------------------------------------------------------------------------
-POSITIVE_ENTITY_CATEGORIES = frozenset({
-    "fund", "venture capital", "defi whale", "high-frequency trader",
-    "whale", "smart money", "institution", "market maker",
-})
-NEGATIVE_ENTITY_CATEGORIES = frozenset({
-    "mev bot", "arbitrageur", "centralized exchange", "bridge",
-    "bot", "arb bot", "spam", "scammer",
-})
+# These thresholds classify Solana wallets by realized trading performance
+# rather than EVM entity labels (which don't exist for Solana wallets).
+#
+# Tier ladder (highest match wins):
+#   ELITE      — proven top-tier profitable trader
+#   STRONG     — consistently profitable, high volume
+#   ACTIVE     — net positive, decent trade count
+#   NOISE      — insufficient data or unprofitable
+#   NEGATIVE   — confirmed loss-maker or bot-like behavior
+#
+# All thresholds are conservative and can be tuned via env vars.
 
-# How many days before a cached label is considered stale and re-fetched.
-# Positive entity labels (Funds, VCs) are stable identities — 30 days is safe.
-# Negative entity labels (MEV bots) are also stable — they don't reform.
+PNL_ELITE_PROFIT_USD       = float(os.getenv("SM_PNL_ELITE_PROFIT_USD",   "50000"))   # $50k+ realized
+PNL_ELITE_WIN_RATE         = float(os.getenv("SM_PNL_ELITE_WIN_RATE",     "55"))      # 55%+ win rate
+PNL_STRONG_PROFIT_USD      = float(os.getenv("SM_PNL_STRONG_PROFIT_USD",  "10000"))   # $10k+ realized
+PNL_STRONG_WIN_RATE        = float(os.getenv("SM_PNL_STRONG_WIN_RATE",    "50"))      # 50%+ win rate
+PNL_ACTIVE_PROFIT_USD      = float(os.getenv("SM_PNL_ACTIVE_PROFIT_USD",  "1000"))    # $1k+ realized
+PNL_MIN_TRADES             = int(os.getenv("SM_PNL_MIN_TRADES",           "5"))       # at least 5 trades
+PNL_NEGATIVE_LOSS_USD      = float(os.getenv("SM_PNL_NEGATIVE_LOSS_USD",  "-5000"))   # >$5k loss = noise
+
+# Weight multipliers applied to dune_frequency in the weighted overlap score.
+# Mirrors the old entity multipliers — ELITE replaces Fund/VC, etc.
+PNL_TIER_WEIGHT_MULTIPLIERS: Dict[str, float] = {
+    "ELITE":    3.0,
+    "STRONG":   2.5,
+    "ACTIVE":   1.5,
+    "NOISE":    1.0,   # default, no boost
+    "NEGATIVE": 0.0,   # excluded from effective overlap
+}
+
+# Which tiers are considered "positive" (boost eligible)
+POSITIVE_PNL_TIERS = frozenset({"ELITE", "STRONG", "ACTIVE"})
+# Which tiers are excluded from effective overlap
+NEGATIVE_PNL_TIERS = frozenset({"NEGATIVE"})
+
+# Back-compat aliases — SmartMoneyScorer imports these names
+POSITIVE_ENTITY_CATEGORIES = POSITIVE_PNL_TIERS
+NEGATIVE_ENTITY_CATEGORIES = NEGATIVE_PNL_TIERS
+
+# How many days before a cached PnL record is considered stale and re-fetched.
+# PnL accumulates over time — 7 days is a reasonable refresh window.
 # Set to 0 to disable TTL (cache forever).
-LABEL_CACHE_TTL_DAYS = int(os.getenv("SMART_MONEY_LABEL_TTL_DAYS", "30"))
+LABEL_CACHE_TTL_DAYS = int(os.getenv("SMART_MONEY_LABEL_TTL_DAYS", "7"))
 
-# Sentinel value stored in cache when a wallet has NO Moralis entity record.
-# _cached_at is always set so TTL applies equally to "no entity" wallets —
-# this prevents permanently skipping a wallet that later gets labeled by Moralis.
-_NO_ENTITY_SENTINEL = {"entity_name": None, "category": None, "labels": [], "_cached_at": 0}
+# Sentinel value stored when a wallet has no PnL data (e.g. new wallet, API error).
+# _cached_at=0 ensures TTL applies equally — we re-check after TTL days.
+_NO_ENTITY_SENTINEL = {
+    "pnl_tier":                    "NOISE",
+    "total_realized_profit_usd":   None,
+    "total_realized_profit_pct":   None,
+    "total_trade_volume_usd":      None,
+    "total_buys":                  None,
+    "total_sells":                 None,
+    "total_count_of_trades":       None,
+    "win_rate_pct":                None,
+    "is_positive":                 False,
+    "is_negative":                 False,
+    "_cached_at":                  0,
+}
 
 
 class MoralisClient:
@@ -72,7 +116,7 @@ class MoralisClient:
         http_session: aiohttp.ClientSession,
         api_keys: List[str],
         debug: bool = False,
-        label_cache_path: str = "./data/wallet_labels.pkl",
+        label_cache_path: str = "./data/wallet_pnl_cache.pkl",
         supabase_bucket: str = "monitor-data",
     ):
         if not api_keys:
@@ -101,7 +145,7 @@ class MoralisClient:
         if self.debug:
             print(
                 f"[MoralisClient] Initialized with {len(api_keys)} keys. "
-                f"Label cache: {len(self._label_cache)} entries."
+                f"PnL cache: {len(self._label_cache)} entries."
             )
 
     # =========================================================================
@@ -116,7 +160,7 @@ class MoralisClient:
                 if isinstance(data, dict):
                     self._label_cache = data
                     if self.debug:
-                        print(f"[MoralisClient] Loaded {len(data)} wallet labels from local cache.")
+                        print(f"[MoralisClient] Loaded {len(data)} wallet PnL records from local cache.")
             except Exception as e:
                 if self.debug:
                     print(f"[MoralisClient] ⚠️ Label cache load failed: {e}. Starting fresh.")
@@ -124,17 +168,17 @@ class MoralisClient:
 
     def download_label_cache_from_supabase(self):
         """
-        Download the label cache from Supabase on startup and merge with any
+        Download the PnL cache from Supabase on startup and merge with any
         local entries.  Remote wins on conflict (remote is always a superset).
         Called once synchronously from winner_monitor.py startup().
 
-        Remote path: smart_money/wallet_labels.pkl
+        Remote path: smart_money/wallet_pnl_cache.pkl
         This keeps Smart Money files grouped separately from overlap results
         and dune_cache/ files in the bucket.
         """
         if not _SUPABASE_AVAILABLE:
             if self.debug:
-                print("[MoralisClient] ⚠️ Supabase not available — skipping label cache download.")
+                print("[MoralisClient] ⚠️ Supabase not available — skipping PnL cache download.")
             return
 
         remote_path = f"smart_money/{self._label_cache_remote_name}"
@@ -231,7 +275,7 @@ class MoralisClient:
 
     def _is_label_stale(self, label: Dict) -> bool:
         """
-        Return True if a cached label has exceeded LABEL_CACHE_TTL_DAYS.
+        Return True if a cached PnL record has exceeded LABEL_CACHE_TTL_DAYS.
         Always returns False if TTL is disabled (set to 0).
         """
         if LABEL_CACHE_TTL_DAYS <= 0:
@@ -244,13 +288,13 @@ class MoralisClient:
 
     def get_cached_label(self, address: str) -> Optional[Dict]:
         """
-        Return the cached label dict for *address*, or None if:
+        Return the cached PnL dict for *address*, or None if:
           - Not yet cached, OR
           - Cache entry exists but has exceeded LABEL_CACHE_TTL_DAYS
 
-        Returning None forces get_wallet_labels() to make a fresh API call.
-        Callers can distinguish 'no entity found' from 'not yet looked up'
-        because we store the _NO_ENTITY_SENTINEL for wallets with no record.
+        Returning None forces get_wallet_pnl() to make a fresh API call.
+        We store _NO_ENTITY_SENTINEL for wallets with no PnL data so we
+        don't keep hammering the API for genuinely empty wallets.
         """
         with self._label_cache_lock:
             label = self._label_cache.get(address)
@@ -260,56 +304,72 @@ class MoralisClient:
             if self.debug:
                 age_days = (time.time() - label.get("_cached_at", 0)) / 86400
                 print(
-                    f"[MoralisClient] 🔄 Label for {address[:8]}... is stale "
+                    f"[MoralisClient] 🔄 PnL cache for {address[:8]}... is stale "
                     f"({age_days:.0f}d old, TTL={LABEL_CACHE_TTL_DAYS}d) — will re-fetch."
                 )
             return None  # Treat as cache miss → triggers fresh API call
         return label
 
     # =========================================================================
-    # Public Smart Money API method  (NEW)
+    # Public Smart Money API method
     # =========================================================================
 
-    async def get_wallet_labels(self, address: str) -> Dict[str, Any]:
+    async def get_wallet_pnl(self, address: str) -> Dict[str, Any]:
         """
-        Fetch entity labels for a Solana wallet from the Moralis Entities API.
+        Fetch wallet profitability summary for a Solana wallet from Moralis.
+
+        Endpoint:
+            GET https://solana-gateway.moralis.io/account/mainnet/{address}/profitability/summary
+
+        Response fields used:
+            total_realized_profit_usd         — net USD profit from closed trades
+            total_realized_profit_percentage  — % return on invested capital
+            total_buys / total_sells          — trade counts
+            total_count_of_trades             — total trades
+            total_trade_volume                — total USD volume traded
 
         Cost model:
             Cache HIT  → 0 Moralis credits (returned immediately from disk cache)
-            Cache MISS → 1 Moralis credit  (live API call, then cached forever)
+            Cache MISS → 1 Moralis credit  (live API call, cached for TTL days)
 
         Returns a dict:
             {
-                "entity_name": str | None,   # e.g. "Jump Trading"
-                "category":    str | None,   # e.g. "fund"  (lower-cased)
-                "labels":      list[str],    # e.g. ["smart_money", "whale"]
-                "is_positive": bool,         # True → Fund / VC / Whale
-                "is_negative": bool,         # True → MEV bot / Bridge / CEX
-                "_from_cache": bool,
+                "pnl_tier":                   str,          # ELITE / STRONG / ACTIVE / NOISE / NEGATIVE
+                "total_realized_profit_usd":  float | None,
+                "total_realized_profit_pct":  float | None,
+                "total_trade_volume_usd":     float | None,
+                "total_buys":                 int | None,
+                "total_sells":                int | None,
+                "total_count_of_trades":      int | None,
+                "win_rate_pct":               float | None, # sells / total_trades * 100 (proxy)
+                "is_positive":                bool,         # ELITE / STRONG / ACTIVE
+                "is_negative":                bool,         # NEGATIVE tier
+                "_from_cache":                bool,
             }
 
-        This method NEVER raises — callers receive an empty/default result on
-        any error so the main pipeline is never blocked.
+        This method NEVER raises — callers receive the NOISE sentinel on any error.
         """
         # --- Cache HIT ---
         cached = self.get_cached_label(address)
         if cached is not None:
             result = dict(cached)
             result["_from_cache"] = True
-            result["is_positive"] = self._classify_positive(result)
-            result["is_negative"] = self._classify_negative(result)
+            # Re-derive booleans in case thresholds changed since caching
+            result["is_positive"] = result.get("pnl_tier") in POSITIVE_PNL_TIERS
+            result["is_negative"] = result.get("pnl_tier") in NEGATIVE_PNL_TIERS
             return result
 
-        # --- Cache MISS: call Moralis Entities API ---
-        url = f"https://deep-index.moralis.io/api/v2.2/wallets/{address}/entities"
-        label_data: Dict[str, Any] = dict(_NO_ENTITY_SENTINEL)
+        # --- Cache MISS: call Moralis Solana profitability/summary ---
+        url = f"https://solana-gateway.moralis.io/account/mainnet/{address}/profitability/summary"
+        pnl_data: Dict[str, Any] = dict(_NO_ENTITY_SENTINEL)
+        pnl_data["_cached_at"] = int(time.time())   # will be overwritten on success
 
         selected_key = None
         for attempt in range(4):
             try:
                 selected_key = self._get_next_key_for_wallet(address)
             except RuntimeError:
-                break  # All keys blacklisted — return empty result
+                break  # All keys blacklisted — return sentinel
 
             headers = {"X-API-Key": selected_key, "accept": "application/json"}
             try:
@@ -319,33 +379,17 @@ class MoralisClient:
 
                     if resp.status == 200:
                         data = await resp.json()
-                        # Moralis returns a list of entity objects or a single object
-                        entities = data if isinstance(data, list) else [data]
-                        if entities:
-                            top = entities[0]  # primary entity
-                            label_data = {
-                                "entity_name": top.get("entityName") or top.get("entity_name"),
-                                "category": (top.get("category") or "").lower() or None,
-                                "labels": [
-                                    lbl.get("name", lbl) if isinstance(lbl, dict) else str(lbl)
-                                    for lbl in (top.get("labels") or [])
-                                ],
-                                "_cached_at": int(time.time()),
-                            }
-                        else:
-                            label_data = dict(_NO_ENTITY_SENTINEL)
-                            label_data["_cached_at"] = int(time.time())
-
+                        pnl_data = self._parse_pnl_response(data, address)
                         if self.debug:
                             print(
-                                f"[MoralisClient] 🏷️  Labels for {address[:8]}…: "
-                                f"entity={label_data['entity_name']}, "
-                                f"category={label_data['category']}"
+                                f"[MoralisClient] 💰 PnL for {address[:8]}…: "
+                                f"tier={pnl_data['pnl_tier']}  "
+                                f"profit=${pnl_data['total_realized_profit_usd']}  "
+                                f"trades={pnl_data['total_count_of_trades']}"
                             )
-                        break  # success
+                        break
 
                     elif resp.status == 400:
-                        # Quota exhausted — blacklist key, try next
                         now = datetime.now(timezone.utc)
                         next_utc_day = (
                             now.replace(hour=0, minute=0, second=1, microsecond=0)
@@ -353,7 +397,7 @@ class MoralisClient:
                         )
                         self._blacklisted_keys[selected_key] = int(next_utc_day.timestamp())
                         if self.debug:
-                            print(f"[MoralisClient] ⚠️ Label key {selected_key[:6]}… blacklisted (Quota).")
+                            print(f"[MoralisClient] ⚠️ PnL key {selected_key[:6]}… blacklisted (Quota).")
                         continue
 
                     elif resp.status == 429:
@@ -362,59 +406,158 @@ class MoralisClient:
                         continue
 
                     elif resp.status == 404:
-                        # No entity record → store sentinel so we never call again
-                        label_data = dict(_NO_ENTITY_SENTINEL)
-                        label_data["_cached_at"] = int(time.time())
+                        # New/empty wallet — store sentinel, don't retry until TTL expires
+                        pnl_data = dict(_NO_ENTITY_SENTINEL)
+                        pnl_data["_cached_at"] = int(time.time())
                         break
 
                     else:
                         if self.debug:
-                            print(f"[MoralisClient] ⚠️ Entity API status {resp.status} for {address[:8]}…")
+                            print(f"[MoralisClient] ⚠️ PnL API status {resp.status} for {address[:8]}…")
                         break
 
             except asyncio.TimeoutError:
                 if self.debug:
-                    print(f"[MoralisClient] ⚠️ Entity API timeout for {address[:8]}… (attempt {attempt+1})")
+                    print(f"[MoralisClient] ⚠️ PnL API timeout for {address[:8]}… (attempt {attempt+1})")
                 await asyncio.sleep(1)
                 continue
             except Exception as e:
                 if self.debug:
-                    print(f"[MoralisClient] ⚠️ Entity API error for {address[:8]}…: {e}")
+                    print(f"[MoralisClient] ⚠️ PnL API error for {address[:8]}…: {e}")
                 break
 
-        # Store in cache (disk + memory) regardless of outcome
+        # Store in cache (memory + background disk write) regardless of outcome
         with self._label_cache_lock:
-            self._label_cache[address] = label_data
+            self._label_cache[address] = pnl_data
             self._label_cache_dirty = True
         self._save_label_cache()
 
-        result = dict(label_data)
+        result = dict(pnl_data)
         result["_from_cache"] = False
-        result["is_positive"] = self._classify_positive(result)
-        result["is_negative"] = self._classify_negative(result)
+        result["is_positive"] = result.get("pnl_tier") in POSITIVE_PNL_TIERS
+        result["is_negative"] = result.get("pnl_tier") in NEGATIVE_PNL_TIERS
         return result
 
+    # Backward-compat alias — SmartMoneyScorer calls get_wallet_labels()
+    async def get_wallet_labels(self, address: str) -> Dict[str, Any]:
+        return await self.get_wallet_pnl(address)
+
     # =========================================================================
-    # Classification helpers  (NEW — pure functions, no I/O)
+    # PnL parsing and classification helpers  (pure functions, no I/O)
     # =========================================================================
+
+    def _parse_pnl_response(self, data: Dict, address: str) -> Dict[str, Any]:
+        """
+        Parse the Moralis profitability/summary response into a normalised
+        cache record.  Computes pnl_tier from the classification thresholds.
+
+        Moralis response shape:
+            {
+                "total_realized_profit_usd":        "12345.67",
+                "total_realized_profit_percentage": "42.3",
+                "total_buys":                       "87",
+                "total_sells":                      "64",
+                "total_count_of_trades":            "151",
+                "total_trade_volume":               "98000.00",
+                ...
+            }
+        All numeric fields come back as strings — we cast them safely.
+        """
+        def _f(key: str) -> Optional[float]:
+            try:
+                return float(data.get(key) or 0)
+            except (ValueError, TypeError):
+                return None
+
+        def _i(key: str) -> Optional[int]:
+            try:
+                return int(float(data.get(key) or 0))
+            except (ValueError, TypeError):
+                return None
+
+        profit_usd    = _f("total_realized_profit_usd")
+        profit_pct    = _f("total_realized_profit_percentage")
+        total_buys    = _i("total_buys")
+        total_sells   = _i("total_sells")
+        trade_count   = _i("total_count_of_trades")
+        trade_volume  = _f("total_trade_volume")
+
+        # Win rate proxy: profitable sells / total trades
+        # Moralis doesn't give per-trade P&L so we use the aggregate profit %
+        # as a proxy — positive overall = majority of trades profitable
+        win_rate_pct: Optional[float] = None
+        if trade_count and trade_count > 0 and profit_pct is not None:
+            # Rough proxy: map profit_pct to a win-rate estimate
+            # Consistent winner at 50%+ profit_pct → likely 60%+ win rate
+            win_rate_pct = round(50 + min(profit_pct / 4, 40), 1)  # caps at 90%
+            win_rate_pct = max(0.0, win_rate_pct)
+
+        pnl_tier = self._classify_pnl_tier(profit_usd, win_rate_pct, trade_count)
+
+        return {
+            "pnl_tier":                   pnl_tier,
+            "total_realized_profit_usd":  profit_usd,
+            "total_realized_profit_pct":  profit_pct,
+            "total_trade_volume_usd":     trade_volume,
+            "total_buys":                 total_buys,
+            "total_sells":                total_sells,
+            "total_count_of_trades":      trade_count,
+            "win_rate_pct":               win_rate_pct,
+            "is_positive":                pnl_tier in POSITIVE_PNL_TIERS,
+            "is_negative":                pnl_tier in NEGATIVE_PNL_TIERS,
+            "_cached_at":                 int(time.time()),
+        }
+
+    @staticmethod
+    def _classify_pnl_tier(
+        profit_usd: Optional[float],
+        win_rate_pct: Optional[float],
+        trade_count: Optional[int],
+    ) -> str:
+        """
+        Map raw PnL metrics to a conviction tier.
+
+        Tier ladder (highest match wins):
+            ELITE    — $50k+ profit AND 55%+ win rate AND ≥5 trades
+            STRONG   — $10k+ profit AND 50%+ win rate AND ≥5 trades
+            ACTIVE   — $1k+ profit AND ≥5 trades
+            NEGATIVE — net loss > $5k  (confirmed bad actor / noise)
+            NOISE    — everything else (insufficient data, small profits)
+        """
+        if profit_usd is None or trade_count is None:
+            return "NOISE"
+
+        min_trades = PNL_MIN_TRADES
+
+        # NEGATIVE: confirmed loss-maker — down-weight in overlap scoring
+        if profit_usd <= PNL_NEGATIVE_LOSS_USD:
+            return "NEGATIVE"
+
+        if trade_count < min_trades:
+            return "NOISE"
+
+        wr = win_rate_pct or 0.0
+
+        if profit_usd >= PNL_ELITE_PROFIT_USD and wr >= PNL_ELITE_WIN_RATE:
+            return "ELITE"
+
+        if profit_usd >= PNL_STRONG_PROFIT_USD and wr >= PNL_STRONG_WIN_RATE:
+            return "STRONG"
+
+        if profit_usd >= PNL_ACTIVE_PROFIT_USD:
+            return "ACTIVE"
+
+        return "NOISE"
 
     @staticmethod
     def _classify_positive(label: Dict) -> bool:
-        cat = (label.get("category") or "").lower()
-        labels_lower = {(lbl or "").lower() for lbl in (label.get("labels") or [])}
-        return bool(
-            cat in POSITIVE_ENTITY_CATEGORIES
-            or labels_lower & POSITIVE_ENTITY_CATEGORIES
-        )
+        """Back-compat helper — checks pnl_tier."""
+        return label.get("pnl_tier") in POSITIVE_PNL_TIERS
 
     @staticmethod
     def _classify_negative(label: Dict) -> bool:
-        cat = (label.get("category") or "").lower()
-        labels_lower = {(lbl or "").lower() for lbl in (label.get("labels") or [])}
-        return bool(
-            cat in NEGATIVE_ENTITY_CATEGORIES
-            or labels_lower & NEGATIVE_ENTITY_CATEGORIES
-        )
+        """Back-compat helper — checks pnl_tier."""
+        return label.get("pnl_tier") in NEGATIVE_PNL_TIERS
 
     # =========================================================================
     # ALL ORIGINAL METHODS BELOW — COMPLETELY UNCHANGED

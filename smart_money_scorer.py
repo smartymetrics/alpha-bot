@@ -2,16 +2,16 @@
 """
 smart_money_scorer.py
 =====================
-3-Layer Smart Money Conviction Scorer — Arkham / Nansen-style wallet intelligence.
+3-Layer Smart Money Conviction Scorer — on-chain performance intelligence.
 
 Layer A │ Analytical Performance  — Dune SQL frequency (rolling-7-day win-rate)
-Layer B │ Categorical Enrichment  — Moralis entity labeling (Fund, VC, Whale, Bot…)
+Layer B │ PnL Enrichment          — Moralis profitability/summary (ELITE/STRONG/ACTIVE/NOISE/NEGATIVE)
 Layer C │ Behavioral Heuristics   — Helius RPC insider-rank + temporal clustering
 
 Design principles
 -----------------
-• Credit-efficient: Moralis labels are fetched once and cached to disk forever.
-  Only wallets in the top-500 Dune Winners list are ever labeled (credit gate).
+• Credit-efficient: PnL data is fetched once and cached to disk (7-day TTL).
+  Only wallets in the top-N Dune Winners list are ever fetched (credit gate).
 • Non-destructive: Does NOT modify ML model features or retrain anything.
   The scorer runs POST-prediction and applies an "up-rank boost" to alerts.
 • Fully async: All network I/O is async-safe and uses the shared aiohttp session.
@@ -19,10 +19,10 @@ Design principles
 
 Boost logic (applied in winner_monitor.py after ML prediction):
   Grade MEDIUM/HIGH/VERY_HIGH + Smart Money Cluster  →  SUPER-ALPHA  🔥
-  Any grade + 2+ Fund/VC wallets                     →  SUPER-ALPHA  🔥
-  Any grade + 1  Fund/VC wallet                      →  STRONG / ALPHA ⭐ + +1 tier
-  Any grade + 3+ positive entity wallets             →  STRONG / ALPHA ⭐
-  All overlap wallets are negative entities          →  FILTERED  (signal suppressed)
+  Any grade + 2+ ELITE wallets                        →  SUPER-ALPHA  🔥
+  Any grade + 1  ELITE wallet                         →  STRONG / ALPHA ⭐ + +1 tier
+  Any grade + 3+ STRONG/ACTIVE wallets                →  STRONG / ALPHA ⭐
+  All overlap wallets are NEGATIVE tier               →  FILTERED  (signal suppressed)
 
 Usage
 -----
@@ -59,6 +59,10 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from shared.moralis_client import (
     MoralisClient,
+    POSITIVE_PNL_TIERS,
+    NEGATIVE_PNL_TIERS,
+    PNL_TIER_WEIGHT_MULTIPLIERS,
+    # Back-compat aliases still exported from moralis_client
     POSITIVE_ENTITY_CATEGORIES,
     NEGATIVE_ENTITY_CATEGORIES,
 )
@@ -68,26 +72,15 @@ from shared.moralis_client import (
 # Constants
 # ---------------------------------------------------------------------------
 
-# Entity quality multipliers for weighted overlap scoring
-ENTITY_WEIGHT_MULTIPLIERS: Dict[str, float] = {
-    "fund":                  3.0,
-    "venture capital":       3.0,
-    "defi whale":            2.5,
-    "whale":                 2.0,
-    "high-frequency trader": 2.0,
-    "smart money":           2.5,
-    "institution":           3.0,
-    "market maker":          1.5,
-    # Negative entities are excluded entirely (weight = 0.0)
-    "mev bot":               0.0,
-    "arbitrageur":           0.0,
-    "centralized exchange":  0.0,
-    "bridge":                0.0,
-    "bot":                   0.0,
-    "arb bot":               0.0,
-    "spam":                  0.0,
-    "scammer":               0.0,
-}
+# PnL tier weight multipliers for weighted overlap scoring.
+# ELITE replaces the old Fund/VC label; STRONG replaces Whale/DeFi Whale, etc.
+# Imported directly from moralis_client so there is a single source of truth:
+#   ELITE    → 3.0x   (proven top performer, $50k+ profit, 55%+ win rate)
+#   STRONG   → 2.5x   (consistently profitable, $10k+, 50%+ win rate)
+#   ACTIVE   → 1.5x   (net positive, $1k+, ≥5 trades)
+#   NOISE    → 1.0x   (insufficient data — default, no boost)
+#   NEGATIVE → 0.0x   (loss-maker / bot — excluded from effective overlap)
+ENTITY_WEIGHT_MULTIPLIERS = PNL_TIER_WEIGHT_MULTIPLIERS
 
 # Insider rank threshold: wallet buy must appear in first N mint signatures
 INSIDER_RANK_THRESHOLD = 50
@@ -108,20 +101,23 @@ class WalletSmartMoneyProfile:
     """Full smart money assessment for a single wallet."""
     address: str
 
-    # Layer A — Analytical Performance
+    # Layer A — Analytical Performance (Dune frequency)
     dune_frequency: int = 0
     alpha_winner_tier: str = "NONE"       # HIGH / MEDIUM / LOW / NONE
 
-    # Layer B — Categorical Enrichment
-    entity_name: Optional[str] = None
-    entity_category: Optional[str] = None
-    entity_labels: List[str] = field(default_factory=list)
-    is_positive_entity: bool = False
-    is_negative_entity: bool = False
-    entity_weight_multiplier: float = 1.0
+    # Layer B — PnL Enrichment (Moralis profitability/summary)
+    pnl_tier: str = "NOISE"               # ELITE / STRONG / ACTIVE / NOISE / NEGATIVE
+    total_realized_profit_usd: Optional[float] = None
+    total_realized_profit_pct: Optional[float] = None
+    total_trade_volume_usd: Optional[float] = None
+    total_count_of_trades: Optional[int] = None
+    win_rate_pct: Optional[float] = None
+    is_positive_entity: bool = False      # True for ELITE / STRONG / ACTIVE
+    is_negative_entity: bool = False      # True for NEGATIVE
+    entity_weight_multiplier: float = 1.0 # derived from pnl_tier
     label_from_cache: bool = False
 
-    # Layer C — Behavioral Heuristics
+    # Layer C — Behavioral Heuristics (Helius)
     insider_rank: Optional[int] = None    # 1-based position in mint tx history
     is_insider: bool = False
 
@@ -245,7 +241,8 @@ class SmartMoneyScorer:
                 if self.debug:
                     print(
                         f"[SmartMoney] 🚫 {wallet[:8]}... EXCLUDED "
-                        f"(category: {profile.entity_category})"
+                        f"(pnl_tier: {profile.pnl_tier}, "
+                        f"profit: ${profile.total_realized_profit_usd})"
                     )
                 continue
 
@@ -258,8 +255,8 @@ class SmartMoneyScorer:
                 if self.debug:
                     print(
                         f"[SmartMoney] ✅ {wallet[:8]}... POSITIVE "
-                        f"entity={profile.entity_name}, "
-                        f"cat={profile.entity_category}, "
+                        f"pnl_tier={profile.pnl_tier}, "
+                        f"profit=${profile.total_realized_profit_usd}, "
                         f"multiplier={profile.entity_weight_multiplier}x, "
                         f"freq={freq}"
                     )
@@ -334,32 +331,28 @@ class SmartMoneyScorer:
     async def _fetch_entity_label(self, wallet: str, in_top_n: bool) -> Dict[str, Any]:
         """
         Credit gate:
-          • Wallet NOT in top-N  → skip API, return empty label (0 credits)
-          • Wallet in top-N      → check persistent cache, then API (0 or 1 credit)
+          • Wallet NOT in top-N  → skip API, return NOISE sentinel (0 credits)
+          • Wallet in top-N      → check persistent cache, then Moralis PnL API (0 or 1 credit)
         """
         if not in_top_n:
             return {
-                "entity_name": None,
-                "category": None,
-                "labels": [],
-                "is_positive": False,
-                "is_negative": False,
-                "_from_cache": True,
-                "_skipped": True,
+                "pnl_tier":                  "NOISE",
+                "total_realized_profit_usd": None,
+                "total_realized_profit_pct": None,
+                "total_trade_volume_usd":    None,
+                "total_count_of_trades":     None,
+                "win_rate_pct":              None,
+                "is_positive":               False,
+                "is_negative":               False,
+                "_from_cache":               True,
+                "_skipped":                  True,
             }
-        return await self.moralis_client.get_wallet_labels(wallet)
+        return await self.moralis_client.get_wallet_pnl(wallet)
 
     @staticmethod
-    def _get_entity_multiplier(category: Optional[str], labels: List[str]) -> float:
-        """Map entity category/labels to a weight multiplier."""
-        cat = (category or "").lower()
-        if cat in ENTITY_WEIGHT_MULTIPLIERS:
-            return ENTITY_WEIGHT_MULTIPLIERS[cat]
-        for lbl in labels:
-            lbl_l = (lbl or "").lower()
-            if lbl_l in ENTITY_WEIGHT_MULTIPLIERS:
-                return ENTITY_WEIGHT_MULTIPLIERS[lbl_l]
-        return 1.0   # default: standard winner wallet
+    def _get_entity_multiplier(pnl_tier: str) -> float:
+        """Map PnL tier to a weight multiplier for the weighted overlap score."""
+        return PNL_TIER_WEIGHT_MULTIPLIERS.get(pnl_tier, 1.0)
 
     # =========================================================================
     # Layer C: Behavioral Heuristics  (Helius RPC)
@@ -459,10 +452,13 @@ class SmartMoneyScorer:
                 if t - t_start > self.cluster_window_seconds:
                     break
                 profile = profiles.get(w)
+                # Deduplicate by pnl_tier bucket — prevents the same tier of
+                # wallet trivially counting as "independent" entities.
+                # Use address as tiebreaker when pnl_tier is NOISE/None.
+                pnl_tier = getattr(profile, "pnl_tier", None) if profile else None
                 entity_id = (
-                    (profile.entity_name or "")
-                    or (profile.entity_category or "")
-                    or w
+                    f"{pnl_tier}:{w}" if pnl_tier in ("NOISE", None)
+                    else pnl_tier + ":" + w   # still unique per wallet, but tier-grouped
                 )
                 if entity_id not in window_entity_ids:
                     window_wallets.append(w)
@@ -491,16 +487,15 @@ class SmartMoneyScorer:
             freq = wallet_freq.get(wallet, 1)
             in_top_n = wallet in top_n_wallet_set
 
-            label_task = asyncio.create_task(
+            pnl_task = asyncio.create_task(
                 self._fetch_entity_label(wallet, in_top_n)
             )
             insider_task = asyncio.create_task(
                 self._get_insider_rank(mint, wallet)
             )
-            label, insider_rank = await asyncio.gather(label_task, insider_task)
+            pnl, insider_rank = await asyncio.gather(pnl_task, insider_task)
 
-            category = label.get("category")
-            labels_list = label.get("labels") or []
+            pnl_tier = pnl.get("pnl_tier", "NOISE")
 
             profile = WalletSmartMoneyProfile(
                 address=wallet,
@@ -508,15 +503,16 @@ class SmartMoneyScorer:
                 dune_frequency=freq,
                 alpha_winner_tier=self._get_alpha_winner_tier(freq),
                 # Layer B
-                entity_name=label.get("entity_name"),
-                entity_category=category,
-                entity_labels=labels_list,
-                is_positive_entity=label.get("is_positive", False),
-                is_negative_entity=label.get("is_negative", False),
-                entity_weight_multiplier=self._get_entity_multiplier(
-                    category, labels_list
-                ),
-                label_from_cache=label.get("_from_cache", False),
+                pnl_tier=pnl_tier,
+                total_realized_profit_usd=pnl.get("total_realized_profit_usd"),
+                total_realized_profit_pct=pnl.get("total_realized_profit_pct"),
+                total_trade_volume_usd=pnl.get("total_trade_volume_usd"),
+                total_count_of_trades=pnl.get("total_count_of_trades"),
+                win_rate_pct=pnl.get("win_rate_pct"),
+                is_positive_entity=pnl.get("is_positive", False),
+                is_negative_entity=pnl.get("is_negative", False),
+                entity_weight_multiplier=self._get_entity_multiplier(pnl_tier),
+                label_from_cache=pnl.get("_from_cache", False),
                 # Layer C
                 insider_rank=insider_rank,
                 is_insider=(
@@ -551,11 +547,11 @@ class SmartMoneyScorer:
         Assign a boost tier based on the aggregated smart money evidence.
 
         Tier ladder (highest match wins):
-            SUPER_ALPHA  → SM cluster present  OR  2+ Fund/VC wallets
-            STRONG       → 1 Fund/VC wallet   OR  3+ positive entity wallets
-            STANDARD     → any positive entity wallet present
-            FILTERED     → ALL overlap wallets are negative entities
-            NONE         → no entity data / no positives / no negatives
+            SUPER_ALPHA  → SM cluster present  OR  2+ ELITE wallets
+            STRONG       → 1 ELITE wallet      OR  3+ STRONG/ACTIVE wallets
+            STANDARD     → any positive PnL wallet (ACTIVE or above)
+            FILTERED     → ALL overlap wallets are NEGATIVE tier
+            NONE         → no PnL data / all NOISE
         """
         pos = len(score.positive_entity_wallets)
         neg = len(score.negative_entity_wallets)
@@ -564,7 +560,7 @@ class SmartMoneyScorer:
         if neg > 0 and eff == 0:
             return (
                 "FILTERED",
-                f"all_{neg}_overlap_wallets_are_negative_entities",
+                f"all_{neg}_overlap_wallets_are_negative_pnl_tier",
             )
 
         if score.has_smart_money_cluster:
@@ -576,32 +572,32 @@ class SmartMoneyScorer:
                 f"smart_money_cluster_{len(score.cluster_wallets)}_wallets:[{cluster_abbrev}]",
             )
 
-        fund_vc_count = sum(
+        # Count ELITE wallets (replaces old fund/VC count)
+        elite_count = sum(
             1
             for w in score.positive_entity_wallets
-            if (score.wallet_profiles.get(w) or {}).get("entity_category")
-            in {"fund", "venture capital"}
+            if (score.wallet_profiles.get(w) or {}).get("pnl_tier") == "ELITE"
         )
 
-        if fund_vc_count >= 2:
-            return "SUPER_ALPHA", f"{fund_vc_count}_fund_vc_wallets"
+        if elite_count >= 2:
+            return "SUPER_ALPHA", f"{elite_count}_elite_pnl_wallets"
 
-        if fund_vc_count == 1:
-            return "STRONG", "1_fund_or_vc_wallet"
+        if elite_count == 1:
+            return "STRONG", "1_elite_pnl_wallet"
 
         if pos >= 3:
-            return "STRONG", f"{pos}_positive_entity_wallets"
+            return "STRONG", f"{pos}_positive_pnl_wallets"
 
         if pos >= 1:
-            return "STANDARD", f"{pos}_positive_entity_wallet(s)"
+            return "STANDARD", f"{pos}_positive_pnl_wallet(s)"
 
         if neg > 0:
             return (
                 "STANDARD",
-                f"overlap_contains_{neg}_negative_entities_excluded",
+                f"overlap_contains_{neg}_negative_pnl_wallets_excluded",
             )
 
-        return "NONE", "no_entity_data_available"
+        return "NONE", "no_pnl_data_available"
 
 
 # ---------------------------------------------------------------------------

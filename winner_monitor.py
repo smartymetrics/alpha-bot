@@ -1824,6 +1824,250 @@ class AlphaTokenAnalyzer:
 
 
 # -----------------------------------------------
+# Conviction Summary Builder
+# -----------------------------------------------
+
+def build_conviction_summary(overlap_result: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Build a professional trader-facing conviction summary from a fully
+    analysed overlap result. Designed to be stored alongside the result
+    and surfaced directly in Telegram alerts or dashboards.
+
+    Aggregates signal quality across:
+      - Overlap wallet quality  (Dune frequency tiers)
+      - Smart Money enrichment  (entity labels, insider rank, cluster)
+      - ML prediction           (probability, confidence, risk tier)
+      - Market data             (price, volume, liquidity, price change)
+      - Security                (LP lock, holder count, liquidity)
+
+    Returns a flat dict that is safe to JSON-serialize.
+    """
+    sm          = overlap_result.get("smart_money", {})
+    ml          = overlap_result.get("ml_prediction") or {}
+    dex_raw     = (overlap_result.get("dexscreener") or {}).get("raw") or {}
+    sec         = overlap_result.get("security") or {}
+    rugcheck    = sec.get("rugcheck") or {} if isinstance(sec, dict) else {}
+    profiles    = sm.get("wallet_profiles") or {}
+
+    # ── Wallet quality breakdown ──────────────────────────────────────────
+    tier_counts = {"HIGH": 0, "MEDIUM": 0, "LOW": 0, "NONE": 0}
+    top_wallets = []   # top-5 by dune_frequency for display
+
+    for addr, p in profiles.items():
+        tier = p.get("alpha_winner_tier", "NONE")
+        tier_counts[tier] = tier_counts.get(tier, 0) + 1
+        top_wallets.append({
+            "address":    addr,
+            "short":      addr[:6] + "..." + addr[-4:],
+            "frequency":  p.get("dune_frequency", 0),
+            "tier":       tier,
+            "is_insider": p.get("is_insider", False),
+            # PnL enrichment fields (None when wallet is outside top-N gate)
+            "pnl_tier":             p.get("pnl_tier"),
+            "realized_profit_usd":  p.get("total_realized_profit_usd"),
+            "realized_profit_pct":  p.get("total_realized_profit_pct"),
+            "trade_count":          p.get("total_count_of_trades"),
+            "win_rate_pct":         p.get("win_rate_pct"),
+        })
+
+    top_wallets.sort(key=lambda x: x["frequency"], reverse=True)
+    top5 = top_wallets[:5]
+
+    # Conviction score: weighted sum of tier frequencies
+    # HIGH=3pts, MEDIUM=2pts, LOW=1pt, NONE=0pts — normalised to 0-100
+    tier_weights = {"HIGH": 3, "MEDIUM": 2, "LOW": 1, "NONE": 0}
+    raw_score    = sum(tier_weights[t] * c for t, c in tier_counts.items())
+    max_possible = tier_weights["HIGH"] * (overlap_result.get("overlap_count", 1) or 1)
+    wallet_conviction_pct = round((raw_score / max_possible * 100) if max_possible else 0, 1)
+
+    # ── Smart money signals ───────────────────────────────────────────────
+    boost_tier     = sm.get("boost_tier", "NONE")
+    alert_label    = sm.get("alert_label", "STANDARD 📊")
+    is_super_alpha = sm.get("is_super_alpha", False)
+    has_cluster    = sm.get("has_cluster", False)
+    cluster_size   = len(sm.get("cluster_wallets") or [])
+    pos_entities   = sm.get("positive_entity_wallets") or []
+    neg_entities   = sm.get("negative_entity_wallets") or []
+    insiders       = sm.get("insider_wallets") or []
+    weighted_score = sm.get("smart_money_weighted_score", 0)
+    eff_overlap    = sm.get("effective_overlap_count", overlap_result.get("overlap_count", 0))
+
+    # ── ML signals ───────────────────────────────────────────────────────
+    ml_prob       = ml.get("probability")
+    ml_confidence = ml.get("confidence", "NONE")
+    ml_risk       = ml.get("risk_tier", "UNKNOWN")
+    ml_action     = ml.get("action", "UNKNOWN")
+    ml_passed     = overlap_result.get("ML_PASSED", False)
+
+    try:
+        ml_prob_pct = f"{float(ml_prob):.1%}" if ml_prob is not None else "N/A"
+    except (ValueError, TypeError):
+        ml_prob_pct = "N/A"
+
+    # ── Market data ───────────────────────────────────────────────────────
+    price_usd   = (overlap_result.get("dexscreener") or {}).get("price_usd")
+    volume      = dex_raw.get("volume") or {}
+    price_chg   = dex_raw.get("priceChange") or {}
+    liquidity   = dex_raw.get("liquidity") or {}
+    txns        = dex_raw.get("txns") or {}
+    mcap        = dex_raw.get("marketCap")
+    fdv         = dex_raw.get("fdv")
+    dex_url     = dex_raw.get("url", "")
+    pair_created = dex_raw.get("pairCreatedAt")  # unix ms
+
+    base_token  = dex_raw.get("baseToken") or {}
+    token_name  = base_token.get("name", "Unknown")
+    token_symbol = base_token.get("symbol", "???")
+    dex_id      = dex_raw.get("dexId", "unknown")
+
+    # Age of pair in minutes
+    pair_age_mins = None
+    if pair_created:
+        try:
+            age_ms    = time.time() * 1000 - int(pair_created)
+            pair_age_mins = round(age_ms / 60000, 1)
+        except Exception:
+            pass
+
+    # Buy/sell pressure (5m and 1h)
+    buys_5m  = (txns.get("m5") or {}).get("buys", 0)
+    sells_5m = (txns.get("m5") or {}).get("sells", 0)
+    buys_1h  = (txns.get("h1") or {}).get("buys", 0)
+    sells_1h = (txns.get("h1") or {}).get("sells", 0)
+    buy_pressure_5m = round(buys_5m / (buys_5m + sells_5m) * 100) if (buys_5m + sells_5m) else None
+    buy_pressure_1h = round(buys_1h / (buys_1h + sells_1h) * 100) if (buys_1h + sells_1h) else None
+
+    # ── Security highlights ────────────────────────────────────────────────
+    lp_locked   = rugcheck.get("lp_locked_pct")
+    holders     = rugcheck.get("holder_count")
+    liq_usd     = rugcheck.get("total_liquidity_usd")
+
+    # ── Overall signal rating ─────────────────────────────────────────────
+    # Combines grade tier + ML probability + wallet conviction into one label
+    grade = overlap_result.get("grade", "NONE")
+    grade_score = {"VERY_HIGH": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2, "UNKNOWN": 1, "NONE": 0}.get(grade, 0)
+
+    ml_score = 0
+    if ml_prob is not None:
+        try:
+            p = float(ml_prob)
+            if p >= 0.70:   ml_score = 3
+            elif p >= 0.55: ml_score = 2
+            elif p >= 0.40: ml_score = 1
+        except Exception:
+            pass
+
+    sm_score = {"SUPER_ALPHA": 4, "STRONG": 3, "STANDARD": 2, "NONE": 1, "FILTERED": 0}.get(boost_tier, 1)
+
+    total_signal = grade_score + ml_score + sm_score  # max = 5+3+4 = 12
+    if total_signal >= 10:   overall_rating = "🔥 ELITE"
+    elif total_signal >= 8:  overall_rating = "⭐ STRONG"
+    elif total_signal >= 6:  overall_rating = "✅ SOLID"
+    elif total_signal >= 4:  overall_rating = "⚠️ SPECULATIVE"
+    else:                    overall_rating = "❌ WEAK"
+
+    # ── Assemble summary ──────────────────────────────────────────────────
+    return {
+        # Identity
+        "token_name":           token_name,
+        "token_symbol":         token_symbol,
+        "mint":                 overlap_result.get("mint"),
+        "dex":                  dex_id,
+        "dex_url":              dex_url,
+
+        # Signal headline
+        "overall_rating":       overall_rating,
+        "alert_label":          alert_label,
+        "grade":                grade,
+        "is_super_alpha":       is_super_alpha,
+
+        # Overlap quality
+        "overlap_count":        overlap_result.get("overlap_count", 0),
+        "effective_overlap":    eff_overlap,
+        "excluded_wallets":     len(neg_entities),
+        "wallet_conviction_pct": wallet_conviction_pct,
+        "tier_breakdown": {
+            "HIGH_freq_wallets":   tier_counts["HIGH"],
+            "MEDIUM_freq_wallets": tier_counts["MEDIUM"],
+            "LOW_freq_wallets":    tier_counts["LOW"],
+            "NOISE_wallets":       tier_counts["NONE"],
+        },
+        "top_wallets": top5,
+
+        # Smart money
+        "sm_boost_tier":        boost_tier,
+        "sm_weighted_score":    round(weighted_score, 2),
+        "sm_positive_wallets":  len(pos_entities),   # ELITE/STRONG/ACTIVE tier wallets
+        "sm_negative_wallets":  len(neg_entities),   # NEGATIVE tier wallets (excluded)
+        "sm_insider_count":     len(insiders),
+        "sm_has_cluster":       has_cluster,
+        "sm_cluster_size":      cluster_size if has_cluster else 0,
+        # PnL tier breakdown across all overlap wallets in top-N gate
+        "pnl_tier_breakdown": {
+            "ELITE":    sum(1 for p in profiles.values() if p.get("pnl_tier") == "ELITE"),
+            "STRONG":   sum(1 for p in profiles.values() if p.get("pnl_tier") == "STRONG"),
+            "ACTIVE":   sum(1 for p in profiles.values() if p.get("pnl_tier") == "ACTIVE"),
+            "NOISE":    sum(1 for p in profiles.values() if p.get("pnl_tier") in ("NOISE", None)),
+            "NEGATIVE": sum(1 for p in profiles.values() if p.get("pnl_tier") == "NEGATIVE"),
+        },
+        # Best single wallet's PnL stats (the top-performing wallet in the overlap)
+        "top_pnl_wallet": next(
+            (
+                {
+                    "short":       w["short"],
+                    "pnl_tier":    w.get("pnl_tier"),
+                    "profit_usd":  w.get("realized_profit_usd"),
+                    "profit_pct":  w.get("realized_profit_pct"),
+                    "trade_count": w.get("trade_count"),
+                    "win_rate":    w.get("win_rate_pct"),
+                }
+                for w in top5
+                if w.get("pnl_tier") in ("ELITE", "STRONG", "ACTIVE")
+            ),
+            None,
+        ),
+
+        # ML
+        "ml_probability":       ml_prob,
+        "ml_probability_pct":   ml_prob_pct,
+        "ml_confidence":        ml_confidence,
+        "ml_risk_tier":         ml_risk,
+        "ml_action":            ml_action,
+        "ml_passed":            ml_passed,
+
+        # Market
+        "price_usd":            price_usd,
+        "market_cap_usd":       mcap,
+        "fdv_usd":              fdv,
+        "pair_age_mins":        pair_age_mins,
+        "liquidity_usd":        liquidity.get("usd"),
+        "volume_5m_usd":        volume.get("m5"),
+        "volume_1h_usd":        volume.get("h1"),
+        "volume_6h_usd":        volume.get("h6"),
+        "volume_24h_usd":       volume.get("h24"),
+        "price_change_5m_pct":  price_chg.get("m5"),
+        "price_change_1h_pct":  price_chg.get("h1"),
+        "price_change_6h_pct":  price_chg.get("h6"),
+        "price_change_24h_pct": price_chg.get("h24"),
+        "buys_5m":              buys_5m,
+        "sells_5m":             sells_5m,
+        "buys_1h":              buys_1h,
+        "sells_1h":             sells_1h,
+        "buy_pressure_5m_pct":  buy_pressure_5m,
+        "buy_pressure_1h_pct":  buy_pressure_1h,
+
+        # Security
+        "lp_locked_pct":        lp_locked,
+        "holder_count":         holders,
+        "security_liquidity_usd": liq_usd,
+
+        # Meta
+        "checked_at":           overlap_result.get("checked_at"),
+        "generated_at":         datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# -----------------------------------------------
 # Component 5: WinnerMonitor (Orchestrator)
 # -----------------------------------------------
 
@@ -1923,13 +2167,17 @@ class WinnerMonitor:
         # THIS IS THE ONLY PATH TO PERSISTENT STORAGE
         if overlap_count > 0 and grade not in ("NONE", "UNKNOWN"):
             
+            # Build conviction summary for trader-facing display
+            conviction = build_conviction_summary(overlap_result)
+
             # Build entry for storage
             entry = {
                 "ts": datetime.now(timezone.utc).isoformat(),
-                "result": overlap_result, # This now contains 'ml_prediction'
+                "result": overlap_result,
                 "check_type": check_type,
-                "security": "passed",  # This is the "passed" status checked by Requirement 2
-                "ML_PASSED": overlap_result.get("ML_PASSED", False)
+                "security": "passed",
+                "ML_PASSED": overlap_result.get("ML_PASSED", False),
+                "conviction_summary": conviction,   # ← trader-facing summary
             }
             
             current_store_state.setdefault(mint, []).append(entry)
