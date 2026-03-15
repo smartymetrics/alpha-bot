@@ -193,6 +193,7 @@ class SmartMoneyScorer:
         mint: str,
         overlap_wallets: List[str],
         wallet_freq: Dict[str, int],
+        ml_passed: bool = False,             # ← NEW: gate PnL lookups on ML_PASSED
     ) -> SmartMoneyTokenScore:
         """
         Main method called by AlphaTokenAnalyzer for every token that passes
@@ -203,6 +204,9 @@ class SmartMoneyScorer:
         mint            : token mint address
         overlap_wallets : wallets from the Dune Winners list that hold this token
         wallet_freq     : {wallet: dune_appearance_frequency}
+        ml_passed       : if False, skip Birdeye PnL lookups (save API credits).
+                          Layer A (Dune frequency) and Layer C (Helius insider)
+                          still run regardless — only Layer B (PnL) is gated.
 
         Returns
         -------
@@ -220,12 +224,13 @@ class SmartMoneyScorer:
             score.boost_reason = "no_overlap_wallets"
             return score
 
-        # Determine which wallets are within the Moralis labeling gate
+        # Determine which wallets are within the Birdeye PnL gate
         top_n_wallet_set = self._get_top_n_wallet_set()
 
-        # Build per-wallet profiles across all 3 layers concurrently
+        # Build per-wallet profiles across all 3 layers concurrently.
+        # ml_passed controls whether Layer B (Birdeye PnL) is called.
         profiles = await self._build_wallet_profiles(
-            overlap_wallets, wallet_freq, top_n_wallet_set, mint
+            overlap_wallets, wallet_freq, top_n_wallet_set, mint, ml_passed
         )
 
         # Aggregate
@@ -328,13 +333,29 @@ class SmartMoneyScorer:
         except Exception:
             return set()
 
-    async def _fetch_entity_label(self, wallet: str, in_top_n: bool) -> Dict[str, Any]:
+    async def _fetch_entity_label(self, wallet: str, in_top_n: bool, ml_passed: bool = False) -> Dict[str, Any]:
         """
-        Credit gate:
-          • Wallet NOT in top-N  → skip API, return NOISE sentinel (0 credits)
-          • Wallet in top-N      → check persistent cache, then Moralis PnL API (0 or 1 credit)
+        Credit gate — two conditions must both be true to call Birdeye:
+          1. Wallet is in the top-N Dune Winners list
+          2. ML_PASSED=True for this token (set by caller)
+
+        If either condition fails → return NOISE sentinel (0 credits).
+        Cache HITs always return immediately regardless of ml_passed.
         """
-        if not in_top_n:
+        # Always check cache first — never skip a cached result
+        cached = self.moralis_client.get_cached_label(wallet)
+        if cached is not None:
+            result = dict(cached)
+            result["_from_cache"] = True
+            result["is_positive"] = result.get("pnl_tier") in POSITIVE_PNL_TIERS
+            result["is_negative"] = result.get("pnl_tier") in NEGATIVE_PNL_TIERS
+            return result
+
+        # Gate: skip API call if outside top-N OR ML didn't pass
+        if not in_top_n or not ml_passed:
+            reason = "not_in_top_n" if not in_top_n else "ml_not_passed"
+            if self.debug and not in_top_n is False:
+                pass  # don't spam logs for every non-top-N wallet
             return {
                 "pnl_tier":                  "NOISE",
                 "total_realized_profit_usd": None,
@@ -344,9 +365,11 @@ class SmartMoneyScorer:
                 "win_rate_pct":              None,
                 "is_positive":               False,
                 "is_negative":               False,
-                "_from_cache":               True,
+                "_from_cache":               True,   # treated as "no API needed"
                 "_skipped":                  True,
+                "_skip_reason":              reason,
             }
+
         return await self.moralis_client.get_wallet_pnl(wallet)
 
     @staticmethod
@@ -480,6 +503,7 @@ class SmartMoneyScorer:
         wallet_freq: Dict[str, int],
         top_n_wallet_set: Set[str],
         mint: str,
+        ml_passed: bool = False,
     ) -> Dict[str, WalletSmartMoneyProfile]:
         """Build a WalletSmartMoneyProfile for each wallet (all 3 layers in parallel)."""
 
@@ -488,7 +512,7 @@ class SmartMoneyScorer:
             in_top_n = wallet in top_n_wallet_set
 
             pnl_task = asyncio.create_task(
-                self._fetch_entity_label(wallet, in_top_n)
+                self._fetch_entity_label(wallet, in_top_n, ml_passed)
             )
             insider_task = asyncio.create_task(
                 self._get_insider_rank(mint, wallet)

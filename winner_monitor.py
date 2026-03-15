@@ -43,6 +43,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 # --- Local Imports ---
 # Assuming these are correct from your environment
 from shared.moralis_client import MoralisClient
+from birdeye_client import BirdeyeClient
 from supabase_utils import (
     download_dune_cache_file, 
     upload_alpha_overlap_results
@@ -82,6 +83,7 @@ TOKEN_MONITORING_WINDOW_HOURS = int(os.getenv("TOKEN_MONITORING_WINDOW_HOURS", "
 SMART_MONEY_ENABLED = os.getenv("SMART_MONEY_ENABLED", "true").lower() == "true"
 SMART_MONEY_TOP_N_LABEL = int(os.getenv("SMART_MONEY_TOP_N_LABEL", "500"))
 SMART_MONEY_CLUSTER_WINDOW_SECONDS = int(os.getenv("SMART_MONEY_CLUSTER_WINDOW_SECONDS", "1800"))
+BIRDEYE_API_KEYS = [k.strip() for k in os.getenv("BIRDEYE_API_KEYS", "").split(",") if k.strip()]
 
 # --- MINIMUM SECURITY REQUIREMENTS ---
 MIN_HOLDER_COUNT = 50
@@ -1715,6 +1717,7 @@ class AlphaTokenAnalyzer:
                     mint=mint,
                     overlap_wallets=list(overlap),
                     wallet_freq=wallet_freq,
+                    ml_passed=ml_passed,       # gates Birdeye PnL lookups
                 )
 
                 # Apply post-prediction grade boost
@@ -2735,6 +2738,27 @@ async def main():
             debug=debug_mode,
             supabase_bucket=SUPABASE_BUCKET,
         )
+
+        # Attach BirdeyeClient — shares moralis_client's PnL cache
+        if SMART_MONEY_ENABLED and BIRDEYE_API_KEYS:
+            birdeye_client = BirdeyeClient(
+                http_session=http_session,
+                api_keys=BIRDEYE_API_KEYS,
+                pnl_cache=moralis_client._label_cache,
+                pnl_cache_lock=moralis_client._label_cache_lock,
+                save_cache_fn=moralis_client._save_label_cache,
+                get_cached_fn=moralis_client.get_cached_label,
+                classify_tier_fn=moralis_client._classify_pnl_tier,
+                no_entity_sentinel=moralis_client._NO_ENTITY_SENTINEL_INSTANCE,
+                positive_tiers=moralis_client.POSITIVE_PNL_TIERS_INSTANCE,
+                negative_tiers=moralis_client.NEGATIVE_PNL_TIERS_INSTANCE,
+                debug=debug_mode,
+            )
+            moralis_client.set_birdeye_client(birdeye_client)
+            print(f"[Main] ✅ BirdeyeClient attached ({len(BIRDEYE_API_KEYS)} key(s))")
+        elif SMART_MONEY_ENABLED:
+            print("[Main] ⚠️  BIRDEYE_API_KEYS not set — PnL layer will return NOISE. "
+                  "Set BIRDEYE_API_KEYS in .env to enable.")
         wallet_ranker = WinnerWalletRanker(
             supabase_bucket=SUPABASE_BUCKET, debug=debug_mode
         )

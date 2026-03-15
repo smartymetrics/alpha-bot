@@ -10,14 +10,14 @@ Client for Moralis API with intelligent key rotation, backoff, and error handlin
 UPDATED: Now uses the /account/.../swaps endpoint to fetch 'buy'
 transactions since 12am UTC of the current day.
 
-SMART MONEY (v2): Replaced broken EVM entities endpoint with Solana-native
-wallet profitability/summary endpoint.
-  Endpoint: GET https://solana-gateway.moralis.io/account/mainnet/{address}/profitability/summary
-  Response: total_realized_profit_usd, total_realized_profit_percentage,
-            total_buys, total_sells, total_trade_volume, total_count_of_trades
-  - PnL data is cached to disk (joblib) with a configurable TTL.
-  - Only wallets in the top-N Dune Winners list are ever fetched (credit gate).
-  - Cache is synced to Supabase on a 5-minute throttle.
+SMART MONEY (v3): Wallet PnL sourced from Birdeye API (confirmed working).
+  Endpoint: GET https://public-api.birdeye.so/wallet/v2/pnl/summary
+  Real response fields: data.summary.pnl.realized_profit_usd,
+                        data.summary.counts.win_rate (decimal),
+                        data.summary.counts.total_trade
+  - BirdeyeClient handles all PnL API calls with its own key rotation.
+  - This client owns the shared PnL cache (disk + Supabase sync).
+  - PnL lookups are gated on ML_PASSED=True (enforced by SmartMoneyScorer).
   - ALL original trading/swap methods are completely unchanged.
 """
 
@@ -126,16 +126,25 @@ class MoralisClient:
         self.debug = debug
         self.supabase_bucket = supabase_bucket
 
-        # ---- Smart Money label cache ----
+        # ---- Smart Money PnL cache ----
         self._label_cache_path = label_cache_path
-        self._label_cache_remote_name = os.path.basename(label_cache_path)  # wallet_labels.pkl
+        self._label_cache_remote_name = os.path.basename(label_cache_path)  # wallet_pnl_cache.pkl
         self._label_cache: Dict[str, Dict] = {}
-        self._label_cache_lock = threading.Lock()
+        self._label_cache_lock = threading.Lock()        # guards in-memory dict reads/writes
+        self._supabase_upload_lock = threading.Lock()   # ensures only 1 thread does remove+upload at a time
         self._label_cache_dirty = False
         self._last_supabase_upload: float = 0.0
         self._supabase_upload_interval: float = 300.0  # 5 minutes
         os.makedirs(os.path.dirname(self._label_cache_path), exist_ok=True)
         self._load_label_cache()
+
+        # ---- BirdeyeClient (attached after construction via set_birdeye_client) ----
+        self._birdeye_client = None
+
+        # Instance-level aliases for module constants — passed into BirdeyeClient
+        self._NO_ENTITY_SENTINEL_INSTANCE = _NO_ENTITY_SENTINEL
+        self.POSITIVE_PNL_TIERS_INSTANCE  = POSITIVE_PNL_TIERS
+        self.NEGATIVE_PNL_TIERS_INSTANCE  = NEGATIVE_PNL_TIERS
 
         # ---- Original state tracking ----
         self._current_key_index: int = 0
@@ -222,14 +231,26 @@ class MoralisClient:
 
     def _save_label_cache(self, force_supabase: bool = False):
         """
-        Persist label cache to disk (immediate, background thread).
+        Persist PnL cache to disk (immediate, background thread).
         Also uploads to Supabase if 5 minutes have elapsed since last upload,
         or if force_supabase=True.
 
-        Remote path: smart_money/wallet_labels.pkl
-        upload_file() deletes the old file first, then uploads the new one
-        (same behaviour as all other files in supabase_utils).
+        Race-safety:
+          - _label_cache_lock guards in-memory snapshot reads.
+          - _supabase_upload_lock ensures only ONE thread runs remove()+upload()
+            at a time, preventing 409 Duplicate errors on the free Supabase tier.
+          - _last_supabase_upload is stamped BEFORE the thread is spawned so that
+            rapid back-to-back calls don't each decide to upload concurrently.
         """
+        now = time.time()
+        elapsed = now - self._last_supabase_upload
+        should_upload = force_supabase or (elapsed >= self._supabase_upload_interval)
+
+        # Stamp immediately (in the calling thread) so no second caller
+        # can pass the throttle check before the first upload finishes.
+        if should_upload and _SUPABASE_AVAILABLE:
+            self._last_supabase_upload = now
+
         def _write():
             with self._label_cache_lock:
                 snapshot = dict(self._label_cache)
@@ -240,36 +261,41 @@ class MoralisClient:
                 self._label_cache_dirty = False
             except Exception as e:
                 if self.debug:
-                    print(f"[MoralisClient] ⚠️ Label cache local save failed: {e}")
+                    print(f"[MoralisClient] ⚠️ PnL cache local save failed: {e}")
                 return
 
-            # Throttled Supabase upload
-            now = time.time()
-            elapsed = now - self._last_supabase_upload
-            should_upload = force_supabase or (elapsed >= self._supabase_upload_interval)
+            if not (should_upload and _SUPABASE_AVAILABLE):
+                return
 
-            if should_upload and _SUPABASE_AVAILABLE:
-                remote_path = f"smart_money/{self._label_cache_remote_name}"
-                try:
-                    # upload_file(file_path, bucket, remote_path)
-                    # Internally does: remove(remote_path) then upload(remote_path, data)
-                    success = _supabase_upload_file(
-                        self._label_cache_path,
-                        self.supabase_bucket,
-                        remote_path,
-                    )
-                    if success:
-                        self._last_supabase_upload = now
-                        if self.debug:
-                            print(
-                                f"[MoralisClient] ☁️  Label cache uploaded to "
-                                f"Supabase ({remote_path}, {len(snapshot)} entries)."
-                            )
-                    elif self.debug:
-                        print("[MoralisClient] ⚠️ Label cache Supabase upload failed.")
-                except Exception as e:
+            remote_path = f"smart_money/{self._label_cache_remote_name}"
+
+            # Only one thread may do remove()+upload() at a time.
+            # If another upload is already in progress, skip — the cache
+            # is already being written and we'll catch the next cycle.
+            if not self._supabase_upload_lock.acquire(blocking=False):
+                if self.debug:
+                    print("[MoralisClient] ⏭️  PnL cache upload skipped — another upload in progress.")
+                return
+
+            try:
+                success = _supabase_upload_file(
+                    self._label_cache_path,
+                    self.supabase_bucket,
+                    remote_path,
+                )
+                if success:
                     if self.debug:
-                        print(f"[MoralisClient] ⚠️ Label cache Supabase upload error: {e}")
+                        print(
+                            f"[MoralisClient] ☁️  PnL cache uploaded to "
+                            f"Supabase ({remote_path}, {len(snapshot)} entries)."
+                        )
+                elif self.debug:
+                    print("[MoralisClient] ⚠️ PnL cache Supabase upload failed.")
+            except Exception as e:
+                if self.debug:
+                    print(f"[MoralisClient] ⚠️ PnL cache Supabase upload error: {e}")
+            finally:
+                self._supabase_upload_lock.release()
 
         threading.Thread(target=_write, daemon=True).start()
 
@@ -314,199 +340,52 @@ class MoralisClient:
     # Public Smart Money API method
     # =========================================================================
 
+    def set_birdeye_client(self, birdeye_client: Any) -> None:
+        """
+        Attach a BirdeyeClient instance after construction.
+        Called from winner_monitor.py once both clients are initialised.
+        SmartMoneyScorer calls get_wallet_pnl() which delegates here.
+        """
+        self._birdeye_client = birdeye_client
+
     async def get_wallet_pnl(self, address: str) -> Dict[str, Any]:
         """
-        Fetch wallet profitability summary for a Solana wallet from Moralis.
+        Fetch PnL summary for a Solana wallet via Birdeye.
 
-        Endpoint:
-            GET https://solana-gateway.moralis.io/account/mainnet/{address}/profitability/summary
-
-        Response fields used:
-            total_realized_profit_usd         — net USD profit from closed trades
-            total_realized_profit_percentage  — % return on invested capital
-            total_buys / total_sells          — trade counts
-            total_count_of_trades             — total trades
-            total_trade_volume                — total USD volume traded
+        Delegates to BirdeyeClient which owns the actual API call,
+        key rotation, and 429 handling. This method owns the cache.
 
         Cost model:
-            Cache HIT  → 0 Moralis credits (returned immediately from disk cache)
-            Cache MISS → 1 Moralis credit  (live API call, cached for TTL days)
+            Cache HIT  → 0 credits  (served from disk/memory cache)
+            Cache MISS → 1 Birdeye API call (ML_PASSED gate enforced upstream)
 
-        Returns a dict:
-            {
-                "pnl_tier":                   str,          # ELITE / STRONG / ACTIVE / NOISE / NEGATIVE
-                "total_realized_profit_usd":  float | None,
-                "total_realized_profit_pct":  float | None,
-                "total_trade_volume_usd":     float | None,
-                "total_buys":                 int | None,
-                "total_sells":                int | None,
-                "total_count_of_trades":      int | None,
-                "win_rate_pct":               float | None, # sells / total_trades * 100 (proxy)
-                "is_positive":                bool,         # ELITE / STRONG / ACTIVE
-                "is_negative":                bool,         # NEGATIVE tier
-                "_from_cache":                bool,
-            }
-
-        This method NEVER raises — callers receive the NOISE sentinel on any error.
+        Returns a dict with keys:
+            pnl_tier, total_realized_profit_usd, total_realized_profit_pct,
+            total_trade_volume_usd, total_buys, total_sells,
+            total_count_of_trades, total_win, total_loss,
+            win_rate_pct, is_positive, is_negative, _from_cache
         """
-        # --- Cache HIT ---
-        cached = self.get_cached_label(address)
-        if cached is not None:
-            result = dict(cached)
-            result["_from_cache"] = True
-            # Re-derive booleans in case thresholds changed since caching
-            result["is_positive"] = result.get("pnl_tier") in POSITIVE_PNL_TIERS
-            result["is_negative"] = result.get("pnl_tier") in NEGATIVE_PNL_TIERS
-            return result
+        birdeye = getattr(self, "_birdeye_client", None)
+        if birdeye is None:
+            # BirdeyeClient not attached yet — return NOISE sentinel
+            sentinel = dict(_NO_ENTITY_SENTINEL)
+            sentinel["_cached_at"] = int(time.time())
+            sentinel["_from_cache"] = False
+            sentinel["is_positive"] = False
+            sentinel["is_negative"] = False
+            if self.debug:
+                print(f"[MoralisClient] ⚠️ BirdeyeClient not attached — returning NOISE for {address[:8]}…")
+            return sentinel
 
-        # --- Cache MISS: call Moralis Solana profitability/summary ---
-        url = f"https://solana-gateway.moralis.io/account/mainnet/{address}/profitability/summary"
-        pnl_data: Dict[str, Any] = dict(_NO_ENTITY_SENTINEL)
-        pnl_data["_cached_at"] = int(time.time())   # will be overwritten on success
-
-        selected_key = None
-        for attempt in range(4):
-            try:
-                selected_key = self._get_next_key_for_wallet(address)
-            except RuntimeError:
-                break  # All keys blacklisted — return sentinel
-
-            headers = {"X-API-Key": selected_key, "accept": "application/json"}
-            try:
-                async with self.http_session.get(
-                    url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)
-                ) as resp:
-
-                    if resp.status == 200:
-                        data = await resp.json()
-                        pnl_data = self._parse_pnl_response(data, address)
-                        if self.debug:
-                            print(
-                                f"[MoralisClient] 💰 PnL for {address[:8]}…: "
-                                f"tier={pnl_data['pnl_tier']}  "
-                                f"profit=${pnl_data['total_realized_profit_usd']}  "
-                                f"trades={pnl_data['total_count_of_trades']}"
-                            )
-                        break
-
-                    elif resp.status == 400:
-                        now = datetime.now(timezone.utc)
-                        next_utc_day = (
-                            now.replace(hour=0, minute=0, second=1, microsecond=0)
-                            + timedelta(days=1)
-                        )
-                        self._blacklisted_keys[selected_key] = int(next_utc_day.timestamp())
-                        if self.debug:
-                            print(f"[MoralisClient] ⚠️ PnL key {selected_key[:6]}… blacklisted (Quota).")
-                        continue
-
-                    elif resp.status == 429:
-                        delay = (2 ** attempt) + random.uniform(0.3, 0.8)
-                        await asyncio.sleep(delay)
-                        continue
-
-                    elif resp.status == 404:
-                        # New/empty wallet — store sentinel, don't retry until TTL expires
-                        pnl_data = dict(_NO_ENTITY_SENTINEL)
-                        pnl_data["_cached_at"] = int(time.time())
-                        break
-
-                    else:
-                        if self.debug:
-                            print(f"[MoralisClient] ⚠️ PnL API status {resp.status} for {address[:8]}…")
-                        break
-
-            except asyncio.TimeoutError:
-                if self.debug:
-                    print(f"[MoralisClient] ⚠️ PnL API timeout for {address[:8]}… (attempt {attempt+1})")
-                await asyncio.sleep(1)
-                continue
-            except Exception as e:
-                if self.debug:
-                    print(f"[MoralisClient] ⚠️ PnL API error for {address[:8]}…: {e}")
-                break
-
-        # Store in cache (memory + background disk write) regardless of outcome
-        with self._label_cache_lock:
-            self._label_cache[address] = pnl_data
-            self._label_cache_dirty = True
-        self._save_label_cache()
-
-        result = dict(pnl_data)
-        result["_from_cache"] = False
-        result["is_positive"] = result.get("pnl_tier") in POSITIVE_PNL_TIERS
-        result["is_negative"] = result.get("pnl_tier") in NEGATIVE_PNL_TIERS
-        return result
+        return await birdeye.get_wallet_pnl(address)
 
     # Backward-compat alias — SmartMoneyScorer calls get_wallet_labels()
     async def get_wallet_labels(self, address: str) -> Dict[str, Any]:
         return await self.get_wallet_pnl(address)
 
     # =========================================================================
-    # PnL parsing and classification helpers  (pure functions, no I/O)
+    # PnL classification  (BirdeyeClient calls this via injected classify_tier_fn)
     # =========================================================================
-
-    def _parse_pnl_response(self, data: Dict, address: str) -> Dict[str, Any]:
-        """
-        Parse the Moralis profitability/summary response into a normalised
-        cache record.  Computes pnl_tier from the classification thresholds.
-
-        Moralis response shape:
-            {
-                "total_realized_profit_usd":        "12345.67",
-                "total_realized_profit_percentage": "42.3",
-                "total_buys":                       "87",
-                "total_sells":                      "64",
-                "total_count_of_trades":            "151",
-                "total_trade_volume":               "98000.00",
-                ...
-            }
-        All numeric fields come back as strings — we cast them safely.
-        """
-        def _f(key: str) -> Optional[float]:
-            try:
-                return float(data.get(key) or 0)
-            except (ValueError, TypeError):
-                return None
-
-        def _i(key: str) -> Optional[int]:
-            try:
-                return int(float(data.get(key) or 0))
-            except (ValueError, TypeError):
-                return None
-
-        profit_usd    = _f("total_realized_profit_usd")
-        profit_pct    = _f("total_realized_profit_percentage")
-        total_buys    = _i("total_buys")
-        total_sells   = _i("total_sells")
-        trade_count   = _i("total_count_of_trades")
-        trade_volume  = _f("total_trade_volume")
-
-        # Win rate proxy: profitable sells / total trades
-        # Moralis doesn't give per-trade P&L so we use the aggregate profit %
-        # as a proxy — positive overall = majority of trades profitable
-        win_rate_pct: Optional[float] = None
-        if trade_count and trade_count > 0 and profit_pct is not None:
-            # Rough proxy: map profit_pct to a win-rate estimate
-            # Consistent winner at 50%+ profit_pct → likely 60%+ win rate
-            win_rate_pct = round(50 + min(profit_pct / 4, 40), 1)  # caps at 90%
-            win_rate_pct = max(0.0, win_rate_pct)
-
-        pnl_tier = self._classify_pnl_tier(profit_usd, win_rate_pct, trade_count)
-
-        return {
-            "pnl_tier":                   pnl_tier,
-            "total_realized_profit_usd":  profit_usd,
-            "total_realized_profit_pct":  profit_pct,
-            "total_trade_volume_usd":     trade_volume,
-            "total_buys":                 total_buys,
-            "total_sells":                total_sells,
-            "total_count_of_trades":      trade_count,
-            "win_rate_pct":               win_rate_pct,
-            "is_positive":                pnl_tier in POSITIVE_PNL_TIERS,
-            "is_negative":                pnl_tier in NEGATIVE_PNL_TIERS,
-            "_cached_at":                 int(time.time()),
-        }
 
     @staticmethod
     def _classify_pnl_tier(
