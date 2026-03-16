@@ -633,3 +633,56 @@ class MoralisClient:
             return []
 
         return list(mints)
+
+    async def extract_tokens_with_timestamps(
+        self, transactions: List[Dict]
+    ) -> Dict[str, str]:
+        """
+        Parse Moralis /swaps response and return a mapping of
+        token_mint → earliest_buy_blockTimestamp (ISO string).
+
+        Used by SmartMoneyScorer to detect early buyers by comparing
+        the wallet's first buy time against the token's pair launch time.
+
+        Format of blockTimestamp from Moralis: "2024-11-21T09:22:28.000Z"
+
+        Returns: { "mint_address": "2024-11-21T09:22:28.000Z", ... }
+        Only includes buy transactions. For wallets that bought the same
+        token multiple times, keeps the EARLIEST timestamp.
+        """
+        if not transactions or not isinstance(transactions, list):
+            return {}
+
+        mint_ts: Dict[str, str] = {}
+
+        try:
+            for tx in transactions:
+                if not isinstance(tx, dict):
+                    continue
+                if tx.get("transactionType") != "buy":
+                    continue
+
+                bought_data = tx.get("bought")
+                if not isinstance(bought_data, dict):
+                    continue
+
+                mint = bought_data.get("address")
+                ts   = tx.get("blockTimestamp")  # "2024-11-21T09:22:28.000Z"
+
+                if not mint or not ts:
+                    continue
+                if len(mint) <= 30:
+                    continue
+                if mint == "So11111111111111111111111111111111111111112":
+                    continue
+
+                # Keep the earliest timestamp if wallet bought multiple times
+                if mint not in mint_ts or ts < mint_ts[mint]:
+                    mint_ts[mint] = ts
+
+        except Exception as e:
+            if self.debug:
+                print(f"[MoralisClient] ❌ Error parsing timestamps: {e}")
+            return {}
+
+        return mint_ts

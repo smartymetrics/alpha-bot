@@ -1193,12 +1193,19 @@ class AlphaTokenAnalyzer:
             "raw": p0
         }
 
-    async def analyze_token(self, mint: str) -> Dict[str, Any]:
+    async def analyze_token(
+        self,
+        mint: str,
+        wallet_buy_timestamps: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
         """
         Comprehensive token analysis.
         FIXED: Handle zero supply edge case in security requirements check
         FIXED: Only fallback to RPC when creator_balance is None (missing), not 0 (valid zero)
         FIXED: Properly calculate creator balance percentage from raw amounts
+
+        wallet_buy_timestamps: {wallet_address: ISO_timestamp} — when the discovering
+            wallet first bought this token. Used for early buyer insider detection.
         """
         if self.debug:
             print(f"[TokenAnalyzer] 🔬 Analyzing token: {mint}")
@@ -1717,7 +1724,18 @@ class AlphaTokenAnalyzer:
                     mint=mint,
                     overlap_wallets=list(overlap),
                     wallet_freq=wallet_freq,
-                    ml_passed=ml_passed,       # gates Birdeye PnL lookups
+                    ml_passed=ml_passed,
+                    pair_created_at_ms=int(
+                        (result.get("dexscreener") or {})
+                        .get("raw", {})
+                        .get("pairCreatedAt") or 0
+                    ) or None,
+                    wallet_buy_timestamps=wallet_buy_timestamps,
+                    rugcheck_raw=(
+                        (result.get("security") or {})
+                        .get("rugcheck_raw", {})
+                        .get("raw")
+                    ),
                 )
 
                 # Apply post-prediction grade boost
@@ -1794,12 +1812,31 @@ class AlphaTokenAnalyzer:
 
         return result
 
-    async def batch_analyze_tokens(self, mints: List[str]) -> List[Dict[str, Any]]:
-        """Process multiple tokens with semaphore-controlled concurrency."""
+    async def batch_analyze_tokens(
+        self,
+        mints: List[str],
+        wallet_buy_context: Optional[Dict[str, Dict[str, str]]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Process multiple tokens with semaphore-controlled concurrency.
+
+        wallet_buy_context: { mint: { wallet_address: ISO_timestamp } }
+            Tells score_token when the discovering wallet first bought each token.
+            Used for early buyer / insider detection at zero extra API cost.
+        """
         if not mints:
             return []
-            
-        tasks = [asyncio.create_task(self.analyze_token(m)) for m in mints]
+
+        wallet_buy_context = wallet_buy_context or {}
+        tasks = [
+            asyncio.create_task(
+                self.analyze_token(
+                    m,
+                    wallet_buy_timestamps=wallet_buy_context.get(m),
+                )
+            )
+            for m in mints
+        ]
         results: List[Dict[str, Any]] = []
         
         api_results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -1864,17 +1901,24 @@ def build_conviction_summary(overlap_result: Dict[str, Any]) -> Dict[str, Any]:
     profits_with_data: List[float] = []    # realized profit USD for wallets with PnL data
     win_rates_with_data: List[float] = []  # win rate % for wallets with PnL data
     trade_counts_with_data: List[int] = [] # trade counts for wallets with PnL data
-    insider_count = 0
+    insider_count  = 0
+    sniper_count   = 0    # bought within SM_SNIPER_WINDOW_MINUTES
+    early_buy_count = 0   # bought within SM_INSIDER_WINDOW_MINUTES
 
     for addr, p in profiles.items():
-        freq_tier = p.get("alpha_winner_tier", "NONE")
-        pnl_tier  = p.get("pnl_tier") or "NOISE"
+        freq_tier    = p.get("alpha_winner_tier", "NONE")
+        pnl_tier     = p.get("pnl_tier") or "NOISE"
+        insider_type = p.get("insider_type")
 
         tier_counts[freq_tier] = tier_counts.get(freq_tier, 0) + 1
         pnl_counts[pnl_tier]   = pnl_counts.get(pnl_tier, 0) + 1
 
         if p.get("is_insider"):
             insider_count += 1
+            if insider_type == "SNIPER":
+                sniper_count += 1
+            elif insider_type in ("EARLY_BUYER", "RUGCHECK"):
+                early_buy_count += 1
 
         # Only include wallets with real PnL data in aggregates
         profit = p.get("total_realized_profit_usd")
@@ -1908,6 +1952,8 @@ def build_conviction_summary(overlap_result: Dict[str, Any]) -> Dict[str, Any]:
             "trade_count":         tc,
             "win_rate_pct":        wr,
             "is_insider":          p.get("is_insider", False),
+            "insider_type":        insider_type,         # "SNIPER" / "EARLY_BUYER" / "RUGCHECK"
+            "insider_rank":        p.get("insider_rank"), # minutes after launch
             "label_from_cache":    p.get("label_from_cache", False),
         })
 
@@ -2056,7 +2102,8 @@ def build_conviction_summary(overlap_result: Dict[str, Any]) -> Dict[str, Any]:
     sm_pts = {"SUPER_ALPHA": 20, "STRONG": 14, "STANDARD": 8, "NONE": 4, "FILTERED": 0}.get(boost_tier, 4)
 
     # Component 5: insider detection (0-10)
-    insider_pts = min(10, insider_count * 4)   # 3+ insiders = max 10pts
+    # Snipers (≤5 min) = 5 pts each, early buyers (≤30 min) = 2 pts each, max 10
+    insider_pts = min(10, sniper_count * 5 + early_buy_count * 2)
 
     alpha_score = grade_pts + wr_pts + ml_pts + sm_pts + insider_pts   # 0-100
 
@@ -2135,8 +2182,11 @@ def build_conviction_summary(overlap_result: Dict[str, Any]) -> Dict[str, Any]:
         },
 
         # ── Insider / sniper detection ─────────────────────────────────────────
-        "insider_count":        insider_count,          # wallets in first 50 mint txns
-        "sniper_detected":      insider_count >= 1,
+        "insider_count":        insider_count,          # total insiders (all types)
+        "sniper_count":         sniper_count,           # bought within SM_SNIPER_WINDOW_MINUTES
+        "early_buyer_count":    early_buy_count,        # bought within SM_INSIDER_WINDOW_MINUTES
+        "sniper_detected":      sniper_count >= 1,
+        "early_buyer_detected": early_buy_count >= 1,
 
         # ── Best single wallet (AlphaScan-style: proof of competence) ─────────
         "best_wallet":          best_wallet,            # None if no PnL data in top-N gate
@@ -2389,6 +2439,9 @@ class WinnerMonitor:
                         key_used = self.moralis_client._last_key_per_wallet.get(wallet)
                         
                         mints = await self.moralis_client.extract_unique_tokens(txs)
+                        # Extract buy timestamps for insider detection — {mint: ISO_ts}
+                        # Tells us when THIS wallet first bought each token
+                        mint_buy_timestamps = await self.moralis_client.extract_tokens_with_timestamps(txs)
                         
                         if not mints:
                             self.wallet_scheduler.mark_wallet_checked(wallet, 0, key_used)
@@ -2411,7 +2464,19 @@ class WinnerMonitor:
                         if self.debug:
                             print(f"[PollLoop] 💎 Wallet {wallet[:6]}... found {len(new_mints_to_check)} NEW tokens.")
 
-                        results = await self.token_analyzer.batch_analyze_tokens(new_mints_to_check)
+                        # Build a per-token wallet buy context:
+                        # { mint: { wallet_address: ISO_timestamp } }
+                        # so score_token knows when THIS wallet first bought each token
+                        token_wallet_buy_context: Dict[str, Dict[str, str]] = {}
+                        for m in new_mints_to_check:
+                            ts = mint_buy_timestamps.get(m)
+                            if ts:
+                                token_wallet_buy_context[m] = {wallet: ts}
+
+                        results = await self.token_analyzer.batch_analyze_tokens(
+                            new_mints_to_check,
+                            wallet_buy_context=token_wallet_buy_context,
+                        )
                         
                         self.wallet_scheduler.mark_wallet_checked(wallet, len(mints), key_used)
                         
@@ -2817,8 +2882,6 @@ async def main():
             smart_money_scorer=(
                 SmartMoneyScorer(
                     moralis_client=moralis_client,
-                    helius_api_key=HELIUS_API_KEY or "",
-                    http_session=http_session,
                     wallet_ranker=wallet_ranker,
                     top_n_label_threshold=SMART_MONEY_TOP_N_LABEL,
                     cluster_window_seconds=SMART_MONEY_CLUSTER_WINDOW_SECONDS,
