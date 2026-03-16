@@ -29,10 +29,66 @@ class SolanaMemeTokenClassifier:
         print(f"   Test AUC: {self.metadata['performance']['test_auc']:.4f}")
         print(f"   Selected features: {len(self.selected_features)}")
     
-    def engineer_features(self, df):
-        """Apply same feature engineering as training"""
+    def engineer_features(self, df, smart_money_features: dict = None):
+        """
+        Apply same feature engineering as training.
+
+        Parameters
+        ----------
+        df : pd.DataFrame or dict
+            Token features from the real-time pipeline.
+        smart_money_features : dict, optional
+            The `smart_money_features` dict produced by FeatureComputer
+            (collector.py) or directly from SmartMoneyTokenScore fields.
+            When provided, all sm_* columns are injected into the dataframe
+            before feature selection so the models can use PnL conviction.
+
+            Expected keys (all optional, safe-defaulted):
+                sm_weighted_score, sm_elite_wallets, sm_strong_wallets,
+                sm_active_wallets, sm_positive_wallets, sm_negative_wallets,
+                sm_has_cluster, sm_cluster_size,
+                sm_sniper_count, sm_early_buyer_count,
+                sm_sniper_detected, sm_early_buyer_detected,
+                sm_alpha_score, sm_wallet_conviction_pct,
+                sm_cluster_avg_win_rate_pct,
+                sm_boost_tier (categorical — not used in numeric features)
+        """
         df = df.copy()
-        
+
+        # ── Inject Smart Money features ────────────────────────────────────
+        sm = smart_money_features or {}
+
+        # Raw SM fields (safe-defaulted)
+        df['sm_weighted_score']       = float(sm.get('sm_weighted_score', 0.0))
+        df['sm_elite_wallets']        = int(sm.get('sm_elite_wallets', 0))
+        df['sm_strong_wallets']       = int(sm.get('sm_strong_wallets', 0))
+        df['sm_active_wallets']       = int(sm.get('sm_active_wallets', 0))
+        df['sm_positive_wallets']     = int(sm.get('sm_positive_wallets', 0))
+        df['sm_negative_wallets']     = int(sm.get('sm_negative_wallets', 0))
+        df['sm_has_cluster']          = int(bool(sm.get('sm_has_cluster', False)))
+        df['sm_cluster_size']         = int(sm.get('sm_cluster_size', 0))
+        df['sm_sniper_count']         = int(sm.get('sm_sniper_count', 0))
+        df['sm_early_buyer_count']    = int(sm.get('sm_early_buyer_count', 0))
+        df['sm_sniper_detected']      = int(bool(sm.get('sm_sniper_detected', False)))
+        df['sm_early_buyer_detected'] = int(bool(sm.get('sm_early_buyer_detected', False)))
+        df['sm_alpha_score']          = int(sm.get('sm_alpha_score', 0))
+        df['sm_wallet_conviction_pct']= float(sm.get('sm_wallet_conviction_pct', 0.0))
+        df['sm_cluster_avg_win_rate_pct'] = float(
+            sm.get('sm_cluster_avg_win_rate_pct') or 0.0
+        )
+
+        # Derived SM features (must mirror train_model_signal_aware.py)
+        df['log_sm_weighted_score']   = np.log1p(df['sm_weighted_score'])
+
+        # signal_type_alpha must already be in df (set by caller from signal_source)
+        signal_alpha = df.get('signal_type_alpha', pd.Series([0.0] * len(df), index=df.index))
+        if isinstance(signal_alpha, (int, float)):
+            signal_alpha = float(signal_alpha)
+        df['sm_weighted_x_alpha']     = df['sm_weighted_score'] * signal_alpha
+        df['sm_elite_x_alpha']        = df['sm_elite_wallets']  * signal_alpha
+        df['sm_cluster_x_alpha']      = df['sm_has_cluster']    * signal_alpha
+
+        # ── Standard feature engineering (unchanged from training) ──────────
         # Basic features
         df['token_age_hours'] = df['token_age_at_signal_seconds'] / 3600
         df['token_age_hours_capped'] = df['token_age_hours'].clip(0, 24)
@@ -110,16 +166,21 @@ class SolanaMemeTokenClassifier:
         
         return df
     
-    def predict(self, token_data, threshold=0.70):
+    def predict(self, token_data, threshold=0.70, smart_money_features: dict = None):
         """
-        Predict if token will reach 50% gain
-        
+        Predict if token will reach 50% gain.
+
         Args:
-            token_data: dict or DataFrame with token features
-            threshold: probability threshold for BUY signal (default 0.70 for high precision)
-        
+            token_data             : dict or DataFrame with token features.
+            threshold              : probability threshold for BUY signal (default 0.70).
+            smart_money_features   : dict from FeatureComputer / SmartMoneyTokenScore.
+                                     Keys: sm_weighted_score, sm_elite_wallets,
+                                     sm_strong_wallets, sm_active_wallets,
+                                     sm_has_cluster, sm_sniper_count, etc.
+                                     Pass None / omit if SM is disabled.
+
         Returns:
-            dict with prediction, probability, and recommendation
+            dict with prediction, probability, and recommendation.
         """
         # Convert to DataFrame if dict
         if isinstance(token_data, dict):
@@ -127,8 +188,8 @@ class SolanaMemeTokenClassifier:
         else:
             df = token_data.copy()
         
-        # Engineer features
-        df = self.engineer_features(df)
+        # Engineer features — injects Smart Money columns before feature selection
+        df = self.engineer_features(df, smart_money_features=smart_money_features)
         
         # Select features
         X = df[self.all_features].copy()
@@ -212,9 +273,9 @@ class SolanaMemeTokenClassifier:
         
         return results[0] if len(results) == 1 else results
     
-    def batch_predict(self, tokens_df, threshold=0.70):
-        """Predict for multiple tokens at once"""
-        results = self.predict(tokens_df, threshold)
+    def batch_predict(self, tokens_df, threshold=0.70, smart_money_features: dict = None):
+        """Predict for multiple tokens at once."""
+        results = self.predict(tokens_df, threshold, smart_money_features=smart_money_features)
         
         # Add to DataFrame
         tokens_df = tokens_df.copy()
@@ -234,6 +295,7 @@ if __name__ == "__main__":
     # Example token data
     example_token = {
         'signal_source': 'alpha',
+        'signal_type_alpha': 1.0,
         'grade': 'CRITICAL',
         'liquidity_usd': 50000,
         'volume_h24_usd': 150000,
@@ -249,9 +311,32 @@ if __name__ == "__main__":
         'winner_wallet_density': 0.6,
         'token_age_at_signal_seconds': 1800,  # 30 minutes old
     }
+
+    # Smart Money features from SmartMoneyTokenScore / FeatureComputer
+    example_sm_features = {
+        'sm_weighted_score':          289.0,   # sum(dune_freq × pnl_multiplier)
+        'sm_elite_wallets':           2,        # $50k+ profit, 55%+ WR
+        'sm_strong_wallets':          3,
+        'sm_active_wallets':          1,
+        'sm_positive_wallets':        6,
+        'sm_negative_wallets':        0,
+        'sm_has_cluster':             True,
+        'sm_cluster_size':            4,
+        'sm_sniper_count':            1,        # wallet bought < 5 min after launch
+        'sm_early_buyer_count':       2,
+        'sm_sniper_detected':         True,
+        'sm_early_buyer_detected':    True,
+        'sm_alpha_score':             78,
+        'sm_wallet_conviction_pct':   0.75,
+        'sm_cluster_avg_win_rate_pct': 62.5,
+    }
     
-    # Get prediction
-    result = classifier.predict(example_token, threshold=0.70)
+    # Get prediction — pass SM features so the model gets full conviction context
+    result = classifier.predict(
+        example_token,
+        threshold=0.70,
+        smart_money_features=example_sm_features,
+    )
     
     print("\n" + "="*60)
     print("PREDICTION RESULT")

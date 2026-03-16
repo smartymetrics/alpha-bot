@@ -1,0 +1,1173 @@
+"""
+Enhanced token monitor with persistent scheduling and hierarchical overlap scoring.
+Now using CoinGecko Pro API for new token discovery.
+Features:
+ - SchedulingStore: Persistent scheduling state using joblib
+ - Enhanced overlap grading with CRITICAL/HIGH/MEDIUM/LOW classifications
+ - Concentration-based grading
+ - Startup recovery logic
+ - Persistent timestamp tracking to avoid refetching
+ - 24-hour token expiration
+"""
+import asyncio
+import aiohttp
+import joblib
+import os
+import time
+import json
+from dataclasses import dataclass, asdict
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Set, Tuple
+from collections import defaultdict
+import pandas as pd
+import traceback
+import math
+
+# NOTE: keep dune_client import guarded
+try:
+    from dune_client.client import DuneClient
+except Exception:
+    DuneClient = None
+
+# -----------------------
+# Sanitizer utilities
+# -----------------------
+def _sanitize_dict(d: Dict[Any, Any]) -> Dict[str, Any]:
+    """
+    Recursively sanitize a dictionary so all keys are strings (replace None with "null"),
+    and nested dicts/lists are processed. This prevents joblib/pickle errors like
+    "Cannot serialize non-str key None".
+    """
+    clean: Dict[str, Any] = {}
+    for k, v in d.items():
+        key = "null" if k is None else str(k)
+        if isinstance(v, dict):
+            v = _sanitize_dict(v)
+        elif isinstance(v, list):
+            v = [_sanitize_dict(x) if isinstance(x, dict) else x for x in v]
+        clean[key] = v
+    return clean
+
+def _sanitize_maybe(obj: Any) -> Any:
+    """Sanitize objects that may contain dicts/lists/TradingStart."""
+    if isinstance(obj, dict):
+        return _sanitize_dict(obj)
+    if isinstance(obj, list):
+        return [_sanitize_maybe(x) for x in obj]
+    if isinstance(obj, TradingStart):
+        d = asdict(obj)
+        d["extra"] = _sanitize_dict(d.get("extra") or {})
+        return d
+    return obj
+
+# Re-usable lightweight Solana RPC client
+class SolanaAlphaClient:
+    def __init__(self, rpc_url: str):
+        self.rpc_url = rpc_url
+        self.headers = {"Content-Type": "application/json"}
+
+    async def make_rpc_call(self, method: str, params: List[Any]) -> Dict[str, Any]:
+        payload = {"jsonrpc": "2.0", "id": "1", "method": method, "params": params}
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.post(self.rpc_url, json=payload, headers=self.headers, timeout=40) as resp:
+                    resp.raise_for_status()
+                    return await resp.json()
+            except Exception as e:
+                return {"error": str(e)}
+
+    async def test_connection(self) -> bool:
+        r = await self.make_rpc_call("getHealth", [])
+        return r.get("result") == "ok"
+
+@dataclass
+class TradingStart:
+    mint: Optional[str] = None
+    block_time: Optional[int] = None
+    program_id: Optional[str] = None
+    detected_via: Optional[str] = None
+    extra: Optional[Dict[str, Any]] = None
+    fdv_usd: Optional[float] = None
+    volume_usd: Optional[float] = None
+    source_dex: Optional[str] = None
+    price_change_percentage: Optional[float] = None
+
+class TokenDiscovery:
+    def __init__(
+        self,
+        client: Optional[Any] = None,
+        *,
+        coingecko_pro_api_key: Optional[str] = None,
+        dune_api_key: Optional[str] = None,
+        dune_query_id: Optional[int] = None,
+        dune_cache_file: str = "./data/dune_recent.pkl",
+        timestamp_cache_file: str = "./data/last_timestamp.pkl",
+        debug: bool = False,
+    ):
+        self.client = client
+        self.debug = bool(debug)
+        # CoinGecko
+        self.coingecko_pro_api_key = coingecko_pro_api_key or os.environ.get("GECKO_API")
+        self.coingecko_url = "https://pro-api.coingecko.com/api/v3/onchain/networks/solana/new_pools"
+        self.last_processed_timestamp = self._load_last_timestamp(timestamp_cache_file)
+        self.timestamp_cache_file = timestamp_cache_file
+        # Dune
+        self.dune_api_key = dune_api_key or os.environ.get("DUNE_API_KEY")
+        self.dune_query_id = dune_query_id
+        if DuneClient and self.dune_api_key:
+            try:
+                self.dune_client = DuneClient(self.dune_api_key)
+            except Exception:
+                self.dune_client = None
+        else:
+            self.dune_client = None
+        self.dune_cache_file = dune_cache_file
+        if self.debug:
+            print("TokenDiscovery initialized with CoinGecko Pro")
+
+    def _load_last_timestamp(self, cache_file: str) -> Optional[int]:
+        if os.path.exists(cache_file):
+            try:
+                return joblib.load(cache_file)
+            except Exception:
+                pass
+        return None
+
+    def _save_last_timestamp(self):
+        try:
+            joblib.dump(self.last_processed_timestamp, self.timestamp_cache_file)
+        except Exception as e:
+            if self.debug:
+                print(f"Failed to save last timestamp: {e}")
+
+    # ---------------- Dune helpers ----------------
+    def _rows_from_dune_payload(self, payload: Any) -> List[Dict[str, Any]]:
+        if payload is None:
+            return []
+        if hasattr(payload, "result"):
+            try:
+                r = getattr(payload, "result")
+                if isinstance(r, dict) and "rows" in r and isinstance(r["rows"], list):
+                    return r["rows"]
+                if hasattr(r, "rows"):
+                    return list(getattr(r, "rows") or [])
+            except Exception:
+                pass
+        if isinstance(payload, dict):
+            if "result" in payload and isinstance(payload["result"], dict) and "rows" in payload["result"]:
+                return payload["result"]["rows"]
+            if "rows" in payload and isinstance(payload["rows"], list):
+                return payload["rows"]
+            if "data" in payload and isinstance(payload["data"], list):
+                return payload["data"]
+        if isinstance(payload, list):
+            return payload
+        if hasattr(payload, "rows"):
+            r = getattr(payload, "rows")
+            if isinstance(r, list):
+                return r
+        return []
+
+    def fetch_dune_latest_rows(self) -> List[Dict[str, Any]]:
+        if not self.dune_client or not self.dune_query_id:
+            raise RuntimeError("Dune client or query_id not configured")
+        if self.debug:
+            print(f"[Dune] fetching latest result for query {self.dune_query_id}")
+        payload = self.dune_client.get_latest_result(self.dune_query_id)
+        rows = self._rows_from_dune_payload(payload)
+        if self.debug:
+            print(f"[Dune] extracted {len(rows)} rows")
+        return rows
+
+    def fetch_dune_force_refresh(self) -> list[dict]:
+        """Force a new execution of the Dune query instead of relying on cached results."""
+        if not self.dune_client or not self.dune_query_id:
+            raise RuntimeError("Dune client or query_id not configured")
+        if self.debug:
+            print(f"[Dune] forcing new execution for query {self.dune_query_id}")
+        execution = self.dune_client.execute_query(self.dune_query_id)
+        # Poll until completion
+        while True:
+            status = self.dune_client.get_execution_status(execution.execution_id)
+            if status.state in ("QUERY_STATE_COMPLETED", "QUERY_STATE_FAILED", "QUERY_STATE_CANCELLED"):
+                break
+            time.sleep(5)
+        if status.state != "QUERY_STATE_COMPLETED":
+            raise RuntimeError(f"Dune query failed with state {status.state}")
+        payload = self.dune_client.get_result(execution.execution_id)
+        rows = self._rows_from_dune_payload(payload)
+        if self.debug:
+            print(f"[Dune] forced refresh -> {len(rows)} rows")
+        return rows
+
+
+    def get_tokens_launched_yesterday_cached(self, cache_max_age_days: int = 7) -> List[TradingStart]:
+        cache_path = self.dune_cache_file
+
+        def rows_to_trading_starts(rows: List[Dict[str, Any]], target_yesterday: datetime.date) -> List[TradingStart]:
+            if not rows:
+                return []
+            df = pd.DataFrame(rows)
+            date_col = None
+            mint_col = None
+            for c in ("first_buy_date", "first_buy_date_utc", "block_date", "first_trade_date"):
+                if c in df.columns:
+                    date_col = c
+                    break
+            for c in ("mint_address", "mint", "token_bought_mint_address"):
+                if c in df.columns:
+                    mint_col = c
+                    break
+            if date_col is None or mint_col is None:
+                return []
+            df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+            filtered = df[df[date_col].dt.date == target_yesterday]
+            out = []
+            for _, row in filtered.iterrows():
+                try:
+                    dt = pd.to_datetime(row[date_col])
+                    if pd.isna(dt):
+                        continue
+                    if dt.tzinfo is None:
+                        dt = dt.tz_localize("UTC")
+                    ts = int(dt.tz_convert("UTC").timestamp())
+                except Exception:
+                    continue
+                out.append(
+                    TradingStart(mint=row[mint_col], block_time=ts, program_id="dune", detected_via="dune", extra={date_col: str(row[date_col])})
+                )
+            return out
+
+        current_yesterday = (datetime.now(timezone.utc).date() - timedelta(days=1))
+
+        # --- New: check cached first_buy_date against yesterday ---
+        if os.path.exists(cache_path):
+            try:
+                cache_obj = joblib.load(cache_path)
+                cached_rows = cache_obj.get("rows", [])
+                if cached_rows:
+                    df = pd.DataFrame(cached_rows)
+                    if "first_buy_date" in df.columns:
+                        try:
+                            first_buy = pd.to_datetime(df["first_buy_date"].iloc[0]).date()
+                            if first_buy == current_yesterday:
+                                if self.debug:
+                                    print(f"[Dune/cache] cached first_buy_date {first_buy} matches yesterday, using cache")
+                                return rows_to_trading_starts(cached_rows, current_yesterday)
+                            else:
+                                if self.debug:
+                                    print(f"[Dune/cache] cached first_buy_date {first_buy} != yesterday {current_yesterday} -> force refresh")
+                        except Exception as e:
+                            if self.debug:
+                                print(f"[Dune/cache] failed to parse first_buy_date: {e}")
+            except Exception as e:
+                if self.debug:
+                    print(f"[Dune/cache] error reading cache for first_buy_date: {e}")
+        need_fetch = True
+        if os.path.exists(cache_path):
+            try:
+                cache_obj = joblib.load(cache_path)
+                if isinstance(cache_obj, dict) and "rows" in cache_obj and "fetched_at" in cache_obj:
+                    fetched_at = None
+                    cached_yesterday = None
+                    try:
+                        fetched_at = datetime.fromisoformat(cache_obj["fetched_at"])
+                        if fetched_at.tzinfo is None:
+                            fetched_at = fetched_at.replace(tzinfo=timezone.utc)
+                        cached_yesterday = (fetched_at.date() - timedelta(days=1))
+                    except Exception:
+                        fetched_at = None
+                        cached_yesterday = None
+                    rows = cache_obj.get("rows", [])
+                    if cached_yesterday == current_yesterday and fetched_at:
+                        starts = rows_to_trading_starts(rows, current_yesterday)
+                        if starts:
+                            if self.debug:
+                                print(f"[Dune/cache] using cached data for yesterday={current_yesterday}, found {len(starts)} tokens")
+                            need_fetch = False
+                            return starts
+                        elif self.debug:
+                            print(f"[Dune/cache] cached data for yesterday={current_yesterday} but no tokens found")
+                    else:
+                        if self.debug:
+                            if cached_yesterday != current_yesterday:
+                                print(f"[Dune/cache] cached yesterday={cached_yesterday} != current yesterday={current_yesterday} -> need fresh data")
+                            else:
+                                print("[Dune/cache] cache date calculation failed -> need fresh data")
+                    if fetched_at:
+                        age_days = (datetime.now(timezone.utc) - fetched_at).days
+                        if age_days > cache_max_age_days:
+                            if self.debug:
+                                print(f"[Dune/cache] cache age {age_days} days > max {cache_max_age_days} days -> need fresh data")
+            except Exception as e:
+                if self.debug:
+                    print(f"[Dune/cache] load failed: {e}")
+        if need_fetch:
+            try:
+                rows = self.fetch_dune_force_refresh()
+            except Exception as e:
+                if self.debug:
+                    print(f"[Dune] fetch failure: {e}")
+                return []
+            try:
+                cache_obj = {
+                    "rows": rows,
+                    "fetched_at": datetime.now(timezone.utc).isoformat(),
+                    "target_yesterday": current_yesterday.isoformat()
+                }
+                joblib.dump(cache_obj, cache_path)
+                if self.debug:
+                    print(f"[Dune/cache] cached fresh data for yesterday={current_yesterday}")
+            except Exception as e:
+                if self.debug:
+                    print(f"[Dune/cache] write failed: {e}")
+            starts = rows_to_trading_starts(rows, current_yesterday)
+            if self.debug:
+                print(f"[Dune] found {len(starts)} tokens for yesterday={current_yesterday} after fresh fetch")
+            return starts
+        return []
+
+    # ---------------- CoinGecko ----------------
+    async def _fetch_coingecko_new_pools(self, limit: int = 500, timeout: int = 15) -> List[Dict[str, Any]]:
+        """Fetch the latest 20 pools from CoinGecko and print their mint addresses, ignoring cache."""
+        headers = {"accept": "application/json", "x-cg-pro-api-key": self.coingecko_pro_api_key}
+        url = self.coingecko_url  # No pagination
+
+        if self.debug:
+            print("[CoinGecko] Fetching latest 20 pools (ignoring cache)")
+
+        async with aiohttp.ClientSession() as sess:
+            async with sess.get(url, headers=headers, timeout=timeout) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+                pools = data.get("data", [])
+
+        if not pools:
+            if self.debug:
+                print("[CoinGecko] No pools returned")
+            return []
+
+        all_pools = []
+        for pool in pools:
+            # Extract mint address
+            base_token = pool["relationships"]["base_token"]["data"]
+            mint = base_token["id"].replace("eth_", "").replace("solana_", "")
+
+            # Extract timestamp
+            block_time = self._parse_pool_created_at(pool["attributes"]["pool_created_at"])
+
+            if self.debug:
+                print(f"  - Mint: {mint} | Created: {pool['attributes']['pool_created_at']} | TS: {block_time}")
+
+            all_pools.append(pool)
+
+        if self.debug:
+            print(f"[CoinGecko] Total pools fetched: {len(all_pools)}")
+
+        return all_pools
+
+
+    @staticmethod
+    def _parse_pool_created_at(val: Any) -> Optional[int]:
+        if not val:
+            return None
+        try:
+            ts_str = str(val).replace("Z", "+00:00")
+            dt = datetime.fromisoformat(ts_str)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return int(dt.timestamp())
+        except Exception as e:
+            print(f"[ParseError] Could not parse timestamp {val}: {e}")
+            return None
+
+    @staticmethod
+    def _utc_day_bounds_for_date(dt: Optional[datetime] = None) -> Tuple[int, int]:
+        d = (dt or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        start = datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=timezone.utc)
+        end = start + timedelta(days=1) - timedelta(seconds=1)
+        return int(start.timestamp()), int(end.timestamp())
+
+    def _parse_coingecko_pool(self, pool: Dict[str, Any]) -> TradingStart:
+        attributes = pool["attributes"]
+        base_token = pool["relationships"]["base_token"]["data"]
+        mint = base_token["id"].replace("eth_", "").replace("solana_", "")  # Handle both ETH and Solana
+        block_time = self._parse_pool_created_at(attributes["pool_created_at"])
+        return TradingStart(
+            mint=mint,
+            block_time=block_time,
+            program_id="coingecko",
+            detected_via="coingecko",
+            extra={
+                "name": attributes["name"].split(" / ")[0],
+                "fdv_usd": attributes["fdv_usd"],
+                "market_cap_usd": attributes.get("market_cap_usd") or attributes["fdv_usd"],
+                "volume_usd": attributes["volume_usd"]["h24"],
+                "source_dex": pool["relationships"]["dex"]["data"]["id"],
+                "price_change_percentage": attributes["price_change_percentage"]["h24"],
+            },
+            fdv_usd=attributes["fdv_usd"],
+            volume_usd=attributes["volume_usd"]["h24"],
+            source_dex=pool["relationships"]["dex"]["data"]["id"],
+            price_change_percentage=attributes["price_change_percentage"]["h24"],
+        )
+
+    async def get_tokens_created_today(self, limit: int = 500) -> List[TradingStart]:
+        pools = await self._fetch_coingecko_new_pools(limit=limit)
+        out = []
+        now = int(datetime.now(timezone.utc).timestamp())
+        cutoff = now - 24 * 3600  # only include pools launched in last 24 hours
+
+        for pool in pools:
+            block_time = self._parse_pool_created_at(pool["attributes"]["pool_created_at"])
+            if not block_time:
+                continue
+
+            # ✅ filter: only pools created in last 24 hours
+            if block_time < cutoff:
+                continue
+
+            ts = self._parse_coingecko_pool(pool)
+            out.append(ts)
+
+            # update last processed timestamp
+            if self.last_processed_timestamp is None or block_time > self.last_processed_timestamp:
+                self.last_processed_timestamp = block_time
+
+        if out:
+            self._save_last_timestamp()
+
+        if self.debug:
+            print(f"[CoinGecko] {len(out)} tokens launched")
+
+        return out
+
+
+class HolderAggregator:
+    def __init__(self, client: SolanaAlphaClient):
+        self.client = client
+
+    async def get_token_holders(self, token_mint: str, *, sleep_between: float = 0.15, limit: int = 1000, max_pages: Optional[int] = None, decimals: Optional[int] = None) -> List[Dict[str, Any]]:
+        page = 1
+        owner_balances = defaultdict(int)
+        owner_token_account_counts = defaultdict(int)
+        while True:
+            payload_params = {"mint": token_mint, "page": page, "limit": limit, "displayOptions": {}}
+            data = await self.client.make_rpc_call("getTokenAccounts", payload_params)
+            token_accounts = data.get("result", {}).get("token_accounts", [])
+            if not token_accounts:
+                break
+            for ta in token_accounts:
+                owner = ta.get("owner") or ta.get("address")
+                amt_raw = ta.get("amount", 0)
+                if "account" in ta and isinstance(ta["account"], dict):
+                    acct = ta["account"]
+                    owner = owner or acct.get("owner")
+                    amt_raw = acct.get("amount", 0)
+                if isinstance(amt_raw, dict):
+                    amt_raw = int(float(amt_raw.get("amount") or amt_raw.get("uiAmount", 0)))
+                else:
+                    try:
+                        amt_raw = int(amt_raw)
+                    except Exception:
+                        amt_raw = int(float(amt_raw)) if amt_raw else 0
+                if owner:
+                    owner_balances[owner] += amt_raw
+                    owner_token_account_counts[owner] += 1
+            page += 1
+            if max_pages and page > max_pages:
+                break
+            await asyncio.sleep(sleep_between)
+        holders = []
+        for owner, raw in owner_balances.items():
+            human_balance = raw / (10 ** decimals) if decimals else None
+            holders.append({"wallet": owner, "balance_raw": raw, "balance": human_balance, "balance_formatted": (f"{human_balance:,.{decimals}f}" if human_balance is not None and decimals is not None else str(raw)), "num_token_accounts": owner_token_account_counts[owner]})
+        holders.sort(key=lambda x: x["balance_raw"], reverse=True)
+        return holders
+    
+def _normalize(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        return {("null" if k is None else str(k)): _normalize(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_normalize(v) for v in obj]
+    elif isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
+        return None
+    elif isinstance(obj, TradingStart):
+        d = asdict(obj)
+        d["extra"] = _normalize(d.get("extra") or {})
+        return _normalize(d)
+    else:
+        return obj
+
+class JobLibTokenUpdater:
+    def __init__(self, data_dir: str = "./data/token_data", expiry_hours: int = 24, debug: bool = False):
+        self.data_dir = os.path.abspath(data_dir)
+        os.makedirs(self.data_dir, exist_ok=True)
+        self.tokens_file = os.path.join(self.data_dir, "tokens.pkl")
+        self.expiry_hours = expiry_hours
+        self.debug = debug
+
+    def _load_tokens(self) -> List[Any]:
+        if os.path.exists(self.tokens_file):
+            try:
+                data = joblib.load(self.tokens_file)
+                if isinstance(data, list):
+                    return data
+            except Exception as e:
+                if self.debug:
+                    print("JobLibTokenUpdater: load error", e)
+        return []
+
+    def _save_tokens(self, tokens: List[Any]):
+        try:
+            safe_tokens = [_normalize(t) for t in tokens]
+            joblib.dump(safe_tokens, self.tokens_file)
+        except Exception as e:
+            print("JobLibTokenUpdater: save error", e)
+            traceback.print_exc()
+
+            # Write a debug snapshot so we can inspect the bad data
+            debug_path = self.tokens_file + ".debug.json"
+            try:
+                import json
+                with open(debug_path, "w", encoding="utf-8") as f:
+                    json.dump([asdict(t) if isinstance(t, TradingStart) else str(t) for t in tokens], f, indent=2, default=str)
+                print(f"Saved debug snapshot to {debug_path}")
+            except Exception as ee:
+                print("Also failed to dump debug snapshot:", ee)
+
+
+    async def save_trading_starts_async(self, trading_starts: List[TradingStart], skip_existing: bool = True) -> Dict[str, int]:
+        existing = self._load_tokens()
+        # Existing may be list of dicts or TradingStart (if older saves). Normalize to dicts for checking.
+        existing_mints: Set[str] = set()
+        for t in existing:
+            if isinstance(t, dict):
+                m = t.get("mint")
+            elif isinstance(t, TradingStart):
+                m = t.mint
+            else:
+                m = None
+            if m:
+                existing_mints.add(m)
+
+        saved = 0
+        skipped = 0
+        errors = 0
+        for s in trading_starts:
+            try:
+                if skip_existing and s.mint in existing_mints:
+                    skipped += 1
+                    continue
+                existing.append(s)
+                saved += 1
+            except Exception:
+                errors += 1
+        self._save_tokens(existing)
+        if self.debug:
+            print(f"JobLibTokenUpdater: saved={saved} skipped={skipped} errors={errors} total_now={len(existing)}")
+        return {"saved": saved, "skipped": skipped, "errors": errors}
+
+    async def cleanup_old_tokens_async(self) -> int:
+        tokens = self._load_tokens()
+        if not tokens:
+            return 0
+        now = datetime.now(timezone.utc)
+        cutoff = int((now - timedelta(hours=self.expiry_hours)).timestamp())
+        kept: List[Any] = []
+        for t in tokens:
+            ts = 0
+            if isinstance(t, dict):
+                ts = int(t.get("block_time", 0) or 0)
+            elif isinstance(t, TradingStart):
+                ts = int(t.block_time or 0)
+            if ts > cutoff:
+                kept.append(t)
+        deleted = len(tokens) - len(kept)
+        if deleted:
+            self._save_tokens(kept)
+            if self.debug:
+                print(f"JobLibTokenUpdater: cleaned {deleted} tokens older than {self.expiry_hours} hours")
+        return deleted
+
+    async def get_tracked_tokens_async(self, limit: Optional[int] = None) -> List[TradingStart]:
+        tokens = self._load_tokens()
+        # convert dicts to TradingStart
+        norm: List[TradingStart] = []
+        for t in tokens:
+            if isinstance(t, TradingStart):
+                norm.append(t)
+            elif isinstance(t, dict):
+                try:
+                    norm.append(TradingStart(**t))
+                except Exception:
+                    # if dict contains extra unexpected keys, pop them
+                    allowed = {"mint","block_time","program_id","detected_via","extra","fdv_usd","volume_usd","source_dex","price_change_percentage"}
+                    clean = {k:v for k,v in t.items() if k in allowed}
+                    norm.append(TradingStart(**clean))
+        norm.sort(key=lambda x: x.block_time or 0, reverse=True)
+        if limit:
+            norm = norm[:limit]
+        return norm
+
+class DuneHolderCache:
+    def __init__(self, cache_file: str = "./data/dune_holders.pkl", cache_max_days: int = 7, debug: bool = False):
+        self.cache_file = cache_file
+        self.cache_max_days = cache_max_days
+        self.debug = debug
+        os.makedirs(os.path.dirname(self.cache_file), exist_ok=True)
+
+    def _load_cache(self) -> Dict[str, Any]:
+        if os.path.exists(self.cache_file):
+            try:
+                return joblib.load(self.cache_file)
+            except Exception as e:
+                if self.debug:
+                    print("DuneHolderCache: load failed", e)
+        return {}
+
+    def _save_cache(self, obj: Dict[str, Any]):
+        try:
+            joblib.dump(_sanitize_maybe(obj), self.cache_file)
+        except Exception as e:
+            if self.debug:
+                print("DuneHolderCache: save failed", e)
+
+    async def build_cache(self, token_discovery: TokenDiscovery, holder_agg: HolderAggregator, top_n_per_token: int = 500) -> Dict[str, Set[str]]:
+        starts = token_discovery.get_tokens_launched_yesterday_cached()
+        if self.debug:
+            print(f"DuneHolderCache: found {len(starts)} dune tokens")
+        mapping: Dict[str, Set[str]] = {}
+        for s in starts:
+            if not s.mint:
+                continue
+            try:
+                holders = await holder_agg.get_token_holders(s.mint, limit=1000, max_pages=2, decimals=None)
+                top_wallets = {h["wallet"] for h in holders[:top_n_per_token]}
+                mapping[s.mint] = top_wallets
+                if self.debug:
+                    print(f"DuneHolderCache: token {s.mint} -> {len(top_wallets)} top holders")
+            except Exception as e:
+                if self.debug:
+                    print(f"DuneHolderCache: error fetching holders for {s.mint}: {e}")
+                mapping[s.mint] = set()
+        cache_obj = {"mapping": mapping, "fetched_at": datetime.now(timezone.utc).isoformat()}
+        self._save_cache(cache_obj)
+        return mapping
+
+    def load_mapping(self) -> Tuple[Dict[str, Set[str]], Optional[datetime]]:
+        obj = self._load_cache()
+        if not obj:
+            return {}, None
+        mapping = obj.get("mapping", {})
+        fetched_at = None
+        try:
+            fetched_at = datetime.fromisoformat(obj.get("fetched_at"))
+            if fetched_at.tzinfo is None:
+                fetched_at = fetched_at.replace(tzinfo=timezone.utc)
+        except Exception:
+            fetched_at = None
+        return mapping, fetched_at
+
+class OverlapStore:
+    def __init__(self, filepath: str = "./data/overlap_results.pkl", debug: bool = False):
+        self.filepath = filepath
+        self.debug = debug
+        os.makedirs(os.path.dirname(self.filepath), exist_ok=True)
+
+    def load(self) -> Dict[str, Any]:
+        if os.path.exists(self.filepath):
+            try:
+                return joblib.load(self.filepath)
+            except Exception as e:
+                if self.debug:
+                    print("OverlapStore: load failed", e)
+        return {}
+
+    def save(self, obj: Dict[str, Any]):
+        try:
+            joblib.dump(_sanitize_maybe(obj), self.filepath)
+        except Exception as e:
+            if self.debug:
+                print("OverlapStore: save failed", e)
+
+class SchedulingStore:
+    def __init__(self, filepath: str = "./data/scheduling_state.pkl", debug: bool = False):
+        self.filepath = filepath
+        self.debug = debug
+        os.makedirs(os.path.dirname(self.filepath), exist_ok=True)
+
+    def load(self) -> Dict[str, Any]:
+        if os.path.exists(self.filepath):
+            try:
+                return joblib.load(self.filepath)
+            except Exception as e:
+                if self.debug:
+                    print("SchedulingStore: load failed", e)
+        return {}
+
+    def save(self, obj: Dict[str, Any]):
+        try:
+            joblib.dump(_sanitize_maybe(obj), self.filepath)
+        except Exception as e:
+            if self.debug:
+                print("SchedulingStore: save failed", e)
+
+    def update_token_state(self, token_mint: str, state_update: Dict[str, Any]):
+        current_state = self.load()
+        if token_mint not in current_state:
+            current_state[token_mint] = {}
+        current_state[token_mint].update(state_update)
+        self.save(current_state)
+
+    def get_token_state(self, token_mint: str) -> Dict[str, Any]:
+        current_state = self.load()
+        return current_state.get(token_mint, {})
+
+    def cleanup_old_states(self, cutoff_timestamp: int = None):
+        current_state = self.load()
+        now = datetime.now(timezone.utc)
+        cutoff = cutoff_timestamp or int((now - timedelta(hours=24)).timestamp())
+        cleaned_state = {}
+        for token_mint, state in current_state.items():
+            launch_time = state.get("launch_time", 0)
+            if launch_time > cutoff:
+                cleaned_state[token_mint] = state
+        removed_count = len(current_state) - len(cleaned_state)
+        if removed_count > 0:
+            self.save(cleaned_state)
+            if self.debug:
+                print(f"SchedulingStore: cleaned {removed_count} old scheduling states")
+        return removed_count
+
+def calculate_overlap_grade(overlap_count: int, overlap_percentage: float, concentration: float, total_new_holders: int, total_winner_wallets: int) -> str:
+    if (overlap_percentage >= 50 and overlap_count >= 100) or \
+       (overlap_percentage >= 60 and overlap_count >= 50) or \
+       (concentration >= 30 and overlap_count >= 75) or \
+       (concentration >= 40 and overlap_count >= 50):
+        return "CRITICAL"
+    elif (overlap_percentage >= 30 and overlap_count >= 50) or \
+         (overlap_percentage >= 40 and overlap_count >= 25) or \
+         (concentration >= 20 and overlap_count >= 40) or \
+         (concentration >= 25 and overlap_count >= 30):
+        return "HIGH"
+    elif (overlap_percentage >= 15 and overlap_count >= 25) or \
+         (overlap_percentage >= 20 and overlap_count >= 15) or \
+         (concentration >= 10 and overlap_count >= 20) or \
+         (concentration >= 15 and overlap_count >= 15):
+        return "MEDIUM"
+    elif (overlap_percentage >= 5 and overlap_count >= 10) or \
+         (overlap_count >= 5) or \
+         (concentration >= 5 and overlap_count >= 8) or \
+         (concentration >= 8 and overlap_count >= 5):
+        return "LOW"
+    else:
+        return "NONE"
+
+class Monitor:
+    def __init__(
+        self,
+        sol_client: SolanaAlphaClient,
+        token_discovery: TokenDiscovery,
+        holder_agg: HolderAggregator,
+        updater: JobLibTokenUpdater,
+        dune_cache: DuneHolderCache,
+        overlap_store: OverlapStore,
+        scheduling_store: SchedulingStore,
+        *,
+        coingecko_poll_interval_seconds: int = 30,
+        initial_check_delay_seconds: int = 2 * 3600,
+        repeat_interval_seconds: int = 6 * 3600,
+        debug: bool = False,
+    ):
+        self.sol_client = sol_client
+        self.token_discovery = token_discovery
+        self.holder_agg = holder_agg
+        self.updater = updater
+        self.dune_cache = dune_cache
+        self.overlap_store = overlap_store
+        self.scheduling_store = scheduling_store
+        self.coingecko_poll_interval_seconds = coingecko_poll_interval_seconds
+        self.initial_check_delay_seconds = initial_check_delay_seconds
+        self.repeat_interval_seconds = repeat_interval_seconds
+        self.debug = debug
+        self._scheduled: Set[str] = set()
+        self.last_cleanup = 0
+
+    async def ensure_dune_holders(self):
+        mapping, fetched_at = self.dune_cache.load_mapping()
+        need_build = True
+        if fetched_at:
+            age_hours = (datetime.now(timezone.utc) - fetched_at).total_seconds() / 3600
+            if age_hours <= 24:
+                need_build = False
+        if need_build:
+            if self.debug:
+                print("Monitor: (re)building dune holders cache")
+            await self.dune_cache.build_cache(self.token_discovery, self.holder_agg)
+
+    async def startup_recovery(self):
+        if self.debug:
+            print("Monitor: performing startup recovery")
+        scheduling_state = self.scheduling_store.load()
+        current_time = int(datetime.now(timezone.utc).timestamp())
+        cutoff_time = current_time - (24 * 3600)
+        self.scheduling_store.cleanup_old_states(cutoff_time)
+        await self.updater.cleanup_old_tokens_async()
+        recovery_tasks = []
+        for token_mint, state in scheduling_state.items():
+            if token_mint in self._scheduled:
+                continue
+            launch_time = state.get("launch_time", 0)
+            if current_time - launch_time > 24 * 3600:
+                continue
+            status = state.get("status", "unknown")
+            if status == "pending_first":
+                first_check_time = launch_time + self.initial_check_delay_seconds
+                delay = max(0, first_check_time - current_time)
+                if self.debug:
+                    print(f"Recovery: scheduling first check for {token_mint} in {delay}s")
+                task = asyncio.create_task(self._schedule_first_check_only(token_mint, delay))
+                recovery_tasks.append(task)
+            elif status == "active":
+                next_scheduled = state.get("next_scheduled_check", 0)
+                delay = max(0, next_scheduled - current_time)
+                if delay <= 300:
+                    delay = 0
+                if self.debug:
+                    print(f"Recovery: scheduling repeat check for {token_mint} in {delay}s")
+                task = asyncio.create_task(self._schedule_repeat_check_only(token_mint, delay))
+                recovery_tasks.append(task)
+            self._scheduled.add(token_mint)
+        if recovery_tasks:
+            if self.debug:
+                print(f"Monitor: started {len(recovery_tasks)} recovery tasks")
+
+    async def _schedule_first_check_only(self, token_mint: str, delay_seconds: float):
+        if delay_seconds > 0:
+            await asyncio.sleep(delay_seconds)
+        tokens = await self.updater.get_tracked_tokens_async()
+        token_start = None
+        for t in tokens:
+            if t.mint == token_mint:
+                token_start = t
+                break
+        if not token_start:
+            if self.debug:
+                print(f"_schedule_first_check_only: token {token_mint} not found in tracked tokens")
+            return
+        try:
+            res = await self.check_holders_overlap(token_start)
+            obj = self.overlap_store.load() or {}
+            obj.setdefault(token_start.mint, []).append({
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "result": res,
+                "check_type": "first_check"
+            })
+            self.overlap_store.save(obj)
+            current_time = int(datetime.now(timezone.utc).timestamp())
+            next_check = current_time + self.repeat_interval_seconds
+            self.scheduling_store.update_token_state(token_mint, {
+                "status": "active",
+                "last_completed_check": current_time,
+                "next_scheduled_check": next_check,
+                "total_checks_completed": 1
+            })
+            asyncio.create_task(self._schedule_repeat_checks_for_token(token_start, next_check))
+            if self.debug:
+                print(f"_schedule_first_check_only: completed first check for {token_mint}, grade: {res.get('grade', 'N/A')}")
+        except Exception as e:
+            if self.debug:
+                print(f"_schedule_first_check_only: error for {token_mint}: {e}")
+            self.scheduling_store.update_token_state(token_mint, {
+                "status": "failed",
+                "last_error": str(e),
+                "last_error_at": datetime.now(timezone.utc).isoformat()
+            })
+
+    async def _schedule_repeat_check_only(self, token_mint: str, delay_seconds: float):
+        if delay_seconds > 0:
+            await asyncio.sleep(delay_seconds)
+        tokens = await self.updater.get_tracked_tokens_async()
+        token_start = None
+        for t in tokens:
+            if t.mint == token_mint:
+                token_start = t
+                break
+        if not token_start:
+            if self.debug:
+                print(f"_schedule_repeat_only: token {token_mint} not found in tracked tokens")
+            return
+        current_time = int(datetime.now(timezone.utc).timestamp())
+        launch_time = token_start.block_time or current_time
+        if current_time - launch_time > 24 * 3600:
+            if self.debug:
+                print(f"_schedule_repeat_check_only: token {token_mint} past 24h -> marking completed")
+            self.scheduling_store.update_token_state(token_mint, {
+                "status": "completed",
+                "completed_at": datetime.now(timezone.utc).isoformat()
+            })
+            return
+        try:
+            res = await self.check_holders_overlap(token_start)
+            obj = self.overlap_store.load() or {}
+            obj.setdefault(token_start.mint, []).append({
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "result": res,
+                "check_type": "repeat_check"
+            })
+            self.overlap_store.save(obj)
+            next_check = current_time + self.repeat_interval_seconds
+            state = self.scheduling_store.get_token_state(token_mint)
+            check_count = state.get("total_checks_completed", 0) + 1
+            self.scheduling_store.update_token_state(token_mint, {
+                "last_completed_check": current_time,
+                "next_scheduled_check": next_check,
+                "total_checks_completed": check_count
+            })
+            asyncio.create_task(self._schedule_repeat_checks_for_token(token_start, next_check))
+            if self.debug:
+                print(f"_schedule_repeat_check_only: completed repeat check #{check_count} for {token_mint}, grade: {res.get('grade', 'N/A')}")
+        except Exception as e:
+            if self.debug:
+                print(f"_schedule_repeat_check_only: error for {token_mint}: {e}")
+
+    async def _schedule_repeat_checks_for_token(self, start: TradingStart, first_check_at: int):
+        current_time = int(datetime.now(timezone.utc).timestamp())
+        launch_time = start.block_time or current_time
+        stop_after = launch_time + 24 * 3600
+        check_time = first_check_at
+        while check_time < stop_after:
+            delay = max(0, check_time - int(datetime.now(timezone.utc).timestamp()))
+            if delay > 0:
+                await asyncio.sleep(delay)
+            now = int(datetime.now(timezone.utc).timestamp())
+            if now >= stop_after:
+                if self.debug:
+                    print(f"_schedule_repeat_checks: token {start.mint} past 24h -> stopping")
+                self.scheduling_store.update_token_state(start.mint, {
+                    "status": "completed",
+                    "completed_at": datetime.now(timezone.utc).isoformat()
+                })
+                break
+            try:
+                res = await self.check_holders_overlap(start)
+                obj = self.overlap_store.load() or {}
+                obj.setdefault(start.mint, []).append({
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "result": res,
+                    "check_type": "repeat_check"
+                })
+                self.overlap_store.save(obj)
+                state = self.scheduling_store.get_token_state(start.mint)
+                check_count = state.get("total_checks_completed", 0) + 1
+                next_check_time = now + self.repeat_interval_seconds
+                self.scheduling_store.update_token_state(start.mint, {
+                    "last_completed_check": now,
+                    "next_scheduled_check": next_check_time,
+                    "total_checks_completed": check_count
+                })
+                if self.debug:
+                    print(f"_schedule_repeat_checks: completed check #{check_count} for {start.mint}, grade: {res.get('grade', 'N/A')}")
+                check_time = next_check_time
+            except Exception as e:
+                if self.debug:
+                    print(f"_schedule_repeat_checks: error for {start.mint}: {e}")
+                check_time = now + self.repeat_interval_seconds
+
+    async def poll_coingecko_loop(self):
+        if self.debug:
+            print("Monitor: starting CoinGecko poll loop")
+        await self.startup_recovery()
+        while True:
+            try:
+                starts = await self.token_discovery.get_tokens_created_today(limit=500)
+                if self.debug:
+                    print(f"Monitor: CoinGecko returned {len(starts)} tokens")
+                new_tokens_scheduled = 0
+                for s in starts:
+                    if not s.mint:
+                        continue
+                    if s.mint in self._scheduled:
+                        continue
+                    existing_state = self.scheduling_store.get_token_state(s.mint)
+                    if existing_state:
+                        if self.debug:
+                            print(f"Monitor: token {s.mint} already has scheduling state, skipping")
+                        continue
+                    asyncio.create_task(self._schedule_overlap_checks_for_token(s))
+                    self._scheduled.add(s.mint)
+                    new_tokens_scheduled += 1
+                    current_time = int(datetime.now(timezone.utc).timestamp())
+                    self.scheduling_store.update_token_state(s.mint, {
+                        "launch_time": s.block_time or current_time,
+                        "first_check_at": (s.block_time or current_time) + self.initial_check_delay_seconds,
+                        "status": "pending_first",
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                        "total_checks_completed": 0
+                    })
+                if new_tokens_scheduled > 0 and self.debug:
+                    print(f"Monitor: scheduled overlap checks for {new_tokens_scheduled} new tokens")
+                try:
+                    await self.updater.save_trading_starts_async(starts, skip_existing=True)
+                except Exception as e:
+                    if self.debug:
+                        print("Monitor: updater save error", e)
+                current_time = time.time()
+                if current_time - self.last_cleanup > 3600:
+                    await self.updater.cleanup_old_tokens_async()
+                    self.scheduling_store.cleanup_old_states()
+                    self.last_cleanup = current_time
+            except Exception as e:
+                if self.debug:
+                    print("Monitor: CoinGecko poll error", e)
+                    traceback.print_exc()
+            await asyncio.sleep(self.coingecko_poll_interval_seconds)
+
+    async def _schedule_overlap_checks_for_token(self, start: TradingStart):
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        block_ts = int(start.block_time or now_ts)
+        first_run_at = block_ts + self.initial_check_delay_seconds
+        to_sleep = max(0, first_run_at - now_ts)
+        if self.debug:
+            print(f"_schedule: token={start.mint} will first run in {to_sleep}s (at {datetime.fromtimestamp(first_run_at, timezone.utc)})")
+        await asyncio.sleep(to_sleep)
+        self.scheduling_store.update_token_state(start.mint, {"status": "running_first_check"})
+        stop_after = block_ts + 24 * 3600
+        check_count = 0
+        while True:
+            now_ts2 = int(datetime.now(timezone.utc).timestamp())
+            if now_ts2 > stop_after:
+                if self.debug:
+                    print(f"_schedule: token={start.mint} past 24h -> stopping scheduled checks")
+                self.scheduling_store.update_token_state(start.mint, {
+                    "status": "completed",
+                    "completed_at": datetime.now(timezone.utc).isoformat()
+                })
+                break
+            try:
+                res = await self.check_holders_overlap(start)
+                check_count += 1
+                obj = self.overlap_store.load() or {}
+                obj.setdefault(start.mint, []).append({
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "result": res,
+                    "check_type": "first_check" if check_count == 1 else "repeat_check"
+                })
+                self.overlap_store.save(obj)
+                next_check_time = now_ts2 + self.repeat_interval_seconds
+                self.scheduling_store.update_token_state(start.mint, {
+                    "status": "active",
+                    "last_completed_check": now_ts2,
+                    "next_scheduled_check": next_check_time,
+                    "total_checks_completed": check_count
+                })
+                if self.debug:
+                    print(f"_schedule: completed check #{check_count} for {start.mint}, grade: {res.get('grade', 'N/A')}, overlap: {res.get('overlap_count', 0)} wallets")
+            except Exception as e:
+                if self.debug:
+                    print(f"_schedule: overlap check error for {start.mint}: {e}")
+                self.scheduling_store.update_token_state(start.mint, {
+                    "last_error": str(e),
+                    "last_error_at": datetime.now(timezone.utc).isoformat()
+                })
+            await asyncio.sleep(self.repeat_interval_seconds)
+
+    async def check_holders_overlap(self, start: TradingStart, top_k_holders: int = 500) -> Dict[str, Any]:
+        if self.debug:
+            print(f"check_holders_overlap: computing for {start.mint}")
+        await self.ensure_dune_holders()
+        mapping, _ = self.dune_cache.load_mapping()
+        union_yesterday_wallets: Set[str] = set()
+        for holders in mapping.values():
+            union_yesterday_wallets.update(holders)
+        if self.debug:
+            print(f"check_holders_overlap: union of yesterday winners has {len(union_yesterday_wallets)} unique wallets")
+        try:
+            holders_list = await self.holder_agg.get_token_holders(start.mint, limit=1000, max_pages=2, decimals=None)
+        except Exception as e:
+            if self.debug:
+                print(f"check_holders_overlap: failed to fetch holders for {start.mint}: {e}")
+            return {"error": "fetch_holders_failed", "error_details": str(e)}
+        top_holders = [h.get("wallet") for h in holders_list[:top_k_holders] if h.get("wallet")]
+        top_set = set(top_holders)
+        overlap = top_set.intersection(union_yesterday_wallets)
+        overlap_count = len(overlap)
+        top_count = len(top_set)
+        total_winner_wallets = len(union_yesterday_wallets)
+        overlap_pct = (overlap_count / top_count * 100.0) if top_count > 0 else 0.0
+        concentration = (overlap_count / total_winner_wallets * 100.0) if total_winner_wallets > 0 else 0.0
+        grade = calculate_overlap_grade(overlap_count, overlap_pct, concentration, top_count, total_winner_wallets)
+        summary = {
+            "token": start.mint,
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+            "top_holders_checked": top_count,
+            "overlap_count": overlap_count,
+            "overlap_percentage": round(overlap_pct, 2),
+            "concentration": round(concentration, 2),
+            "total_winner_wallets": total_winner_wallets,
+            "grade": grade,
+            "sample_overlap": list(overlap)[:20],
+            "detected_via": start.detected_via,
+            "block_time": start.block_time,
+            "token_metadata": {
+                k: v for k, v in {
+                    "name": start.extra.get("name") if start.extra else None,
+                    "fdv_usd": start.fdv_usd,
+                    "volume_usd": start.volume_usd,
+                    "source_dex": start.source_dex,
+                    "price_change_percentage": start.price_change_percentage,
+                }.items() if v is not None
+            }
+        }
+        if self.debug:
+            print(f"check_holders_overlap: {start.mint} overlap {overlap_count}/{top_count} ({overlap_pct:.2f}%) concentration {concentration:.2f}% grade={grade}")
+        return summary
+
+async def main_loop():
+    from dotenv import load_dotenv
+    load_dotenv()
+    HELIUS_API_KEY = os.environ.get("HELIUS_API_KEY")
+    COINGECKO_PRO_API_KEY = os.environ.get("GECKO_API")
+    # COINGECKO_PRO_API_KEY=
+    DUNE_API_KEY = os.environ.get("DUNE_API_KEY")
+    DUNE_QUERY_ID = int(os.environ.get("DUNE_QUERY_ID") or 5668844)
+    BASE_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+    sol_client = SolanaAlphaClient(BASE_URL)
+    ok = await sol_client.test_connection()
+    print("Solana RPC ok:", ok)
+    td = TokenDiscovery(
+        client=sol_client,
+        coingecko_pro_api_key=COINGECKO_PRO_API_KEY,
+        dune_api_key=DUNE_API_KEY,
+        dune_query_id=DUNE_QUERY_ID,
+        dune_cache_file="./data/dune_recent.pkl",
+        timestamp_cache_file="./data/last_timestamp.pkl",
+        debug=True
+    )
+    holder_agg = HolderAggregator(sol_client)
+    updater = JobLibTokenUpdater(data_dir="./data/token_data", expiry_hours=24, debug=True)
+    dune_cache = DuneHolderCache(cache_file="./data/dune_holders.pkl", cache_max_days=7, debug=True)
+    overlap_store = OverlapStore(filepath="./data/overlap_results.pkl", debug=True)
+    scheduling_store = SchedulingStore(filepath="./data/scheduling_state.pkl", debug=True)
+    monitor = Monitor(
+        sol_client=sol_client,
+        token_discovery=td,
+        holder_agg=holder_agg,
+        updater=updater,
+        dune_cache=dune_cache,
+        overlap_store=overlap_store,
+        scheduling_store=scheduling_store,
+        coingecko_poll_interval_seconds=30,
+        initial_check_delay_seconds=2 * 3600,
+        repeat_interval_seconds=6 * 3600,
+        debug=True,
+    )
+    await monitor.ensure_dune_holders()
+    await monitor.poll_coingecko_loop()
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main_loop())
+    except KeyboardInterrupt:
+        print("Interrupted, exiting")

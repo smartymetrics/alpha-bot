@@ -222,6 +222,61 @@ print(f"   signal_type_alpha distribution:")
 print(f"     - Alpha (1.0): {(df['signal_type_alpha'] == 1.0).sum()}")
 print(f"     - Discovery (0.0): {(df['signal_type_alpha'] == 0.0).sum()}")
 
+# === SMART MONEY FEATURES ===
+print(" Creating Smart Money conviction features...")
+
+# Pull from the nested smart_money_features dict if the dataset was built
+# from collector.py snapshots. Flat columns are preferred if already present
+# (e.g. after a CSV export that flattened the dict).
+def _sm(col: str, default=0.0):
+    """Return the column if it exists, else fill with default."""
+    if col in df.columns:
+        return df[col]
+    # Try the nested path sm_features.<col> (if the CSV was not flattened)
+    return pd.Series([default] * len(df), index=df.index)
+
+# PnL weighted score — log-transform to reduce skew from extreme Dune frequencies
+df['sm_weighted_score']        = _sm('sm_weighted_score').fillna(0.0)
+df['log_sm_weighted_score']    = np.log1p(df['sm_weighted_score'])
+
+# Institutional presence counts
+df['sm_elite_wallets']         = _sm('sm_elite_wallets').fillna(0).astype(int)
+df['sm_strong_wallets']        = _sm('sm_strong_wallets').fillna(0).astype(int)
+df['sm_active_wallets']        = _sm('sm_active_wallets').fillna(0).astype(int)
+df['sm_positive_wallets']      = _sm('sm_positive_wallets').fillna(0).astype(int)
+df['sm_negative_wallets']      = _sm('sm_negative_wallets').fillna(0).astype(int)
+
+# Cluster signal
+df['sm_has_cluster']           = _sm('sm_has_cluster', False).fillna(False).astype(int)
+df['sm_cluster_size']          = _sm('sm_cluster_size').fillna(0).astype(int)
+
+# Early-buyer heuristics
+df['sm_sniper_count']          = _sm('sm_sniper_count').fillna(0).astype(int)
+df['sm_early_buyer_count']     = _sm('sm_early_buyer_count').fillna(0).astype(int)
+df['sm_sniper_detected']       = _sm('sm_sniper_detected', False).fillna(False).astype(int)
+df['sm_early_buyer_detected']  = _sm('sm_early_buyer_detected', False).fillna(False).astype(int)
+
+# Alpha score (0-100) from conviction_summary
+df['sm_alpha_score']           = _sm('sm_alpha_score').fillna(0).astype(int)
+
+# Conviction %  (fraction of profiled wallets that are positive-tier)
+df['sm_wallet_conviction_pct'] = _sm('sm_wallet_conviction_pct').fillna(0.0).clip(0, 1)
+
+# Cluster PnL aggregates (nullable — fill with 0 for training)
+df['sm_cluster_combined_profit_usd'] = _sm('sm_cluster_combined_profit_usd').fillna(0.0)
+df['sm_cluster_avg_win_rate_pct']    = _sm('sm_cluster_avg_win_rate_pct').fillna(0.0)
+
+# === SMART MONEY × SIGNAL-TYPE INTERACTION FEATURES ===
+# These teach the model that the SAME wallet count means different things
+# for alpha (Dune-sourced winner wallets) vs discovery (fresh token finds).
+df['sm_weighted_x_alpha']      = df['sm_weighted_score'] * df['signal_type_alpha']
+df['sm_elite_x_alpha']         = df['sm_elite_wallets']  * df['signal_type_alpha']
+df['sm_cluster_x_alpha']       = df['sm_has_cluster']    * df['signal_type_alpha']
+
+print(f"   sm_weighted_score  — non-zero rows: {(df['sm_weighted_score'] > 0).sum()}")
+print(f"   sm_elite_wallets   — non-zero rows: {(df['sm_elite_wallets']  > 0).sum()}")
+print(f"   sm_has_cluster     — True rows:     {df['sm_has_cluster'].sum()}")
+
 # ============================================================================
 # FEATURE LISTS
 # ============================================================================
@@ -283,7 +338,38 @@ DERIVED_FEATURES = [
     
     # Other
     'creator_sold_out',
-    'is_high_volume'
+    'is_high_volume',
+
+    # ── SMART MONEY CONVICTION ──────────────────────────────────────────────
+    # PnL-weighted score (log-transformed to handle extreme Dune frequencies)
+    'log_sm_weighted_score',
+
+    # Institutional presence
+    'sm_elite_wallets',
+    'sm_strong_wallets',
+    'sm_active_wallets',
+    'sm_positive_wallets',
+
+    # Cluster (3+ positive wallets buying within 30 min window)
+    'sm_has_cluster',
+    'sm_cluster_size',
+
+    # Early-buyer heuristics
+    'sm_sniper_count',
+    'sm_early_buyer_count',
+    'sm_sniper_detected',
+    'sm_early_buyer_detected',
+
+    # Conviction summary
+    'sm_alpha_score',
+    'sm_wallet_conviction_pct',
+    'sm_cluster_avg_win_rate_pct',
+
+    # Signal-type × Smart Money interaction features
+    # Teach the model PnL tier influence differs for alpha vs discovery signals
+    'sm_weighted_x_alpha',
+    'sm_elite_x_alpha',
+    'sm_cluster_x_alpha',
 ]
 
 ALL_FEATURES = CORE_FEATURES + DERIVED_FEATURES
@@ -313,8 +399,43 @@ X_temp = df[ALL_FEATURES].copy()
 corr_matrix = X_temp.corr().abs()
 
 upper_tri = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
-# EXEMPT signal_type_alpha from being dropped (Required for signal-awareness)
-to_drop = [column for column in upper_tri.columns if any(upper_tri[column] > 0.90) and column != 'signal_type_alpha']
+
+# Features that must never be dropped regardless of correlation:
+#   signal_type_alpha   — required for signal-type-aware learning
+#   log_sm_weighted_score — the primary SM conviction signal; if it correlates
+#                           with overlap_count the SM score wins (it carries more
+#                           information: it is freq × pnl_multiplier, not raw count)
+PROTECTED_FEATURES = {
+    'signal_type_alpha',
+    'log_sm_weighted_score',
+    'sm_elite_wallets',
+    'sm_has_cluster',
+    'sm_alpha_score',
+    'sm_weighted_x_alpha',
+    'sm_cluster_x_alpha',
+}
+
+# If log_sm_weighted_score and overlap_count (or a proxy) are highly correlated,
+# drop overlap_count not log_sm_weighted_score.
+DEPRIORITISED_FEATURES = {
+    'total_insider_token_amount',   # proxied by insider_supply_pct
+    'largest_insider_network_size', # proxied by insider_risk_score
+}
+
+to_drop = []
+for column in upper_tri.columns:
+    if column in PROTECTED_FEATURES:
+        continue
+    if any(upper_tri[column] > 0.90):
+        # If this column is correlated with a PROTECTED feature, drop it
+        # (i.e. overlap_count correlated with log_sm_weighted_score → drop overlap_count)
+        to_drop.append(column)
+
+# Also always drop deprioritised features if they have any high correlation
+for column in DEPRIORITISED_FEATURES:
+    if column in ALL_FEATURES and column not in to_drop:
+        if column in upper_tri.columns and any(upper_tri[column] > 0.90):
+            to_drop.append(column)
 
 if to_drop:
     print(f" Removing {len(to_drop)} highly correlated features (corr > 0.90):")
